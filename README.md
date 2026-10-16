@@ -66,6 +66,14 @@ DATASTORE_QMD_PACKAGE=/path/to/qmd DATASTORE_QMD_SEMANTIC_TEST=1 npm test
 PI_CODING_AGENT_PACKAGE=/path/to/pi-coding-agent npm run test:package
 ```
 
+To keep private terms and secrets out of commits, run `npm run hooks:install`
+once per clone. Commits and pushes are then refused when an added line or a
+commit message contains a line of `~/.pii` (one term per line, matched
+case-insensitively; `#` lines are comments) or a value of 8 or more characters
+from `~/.env`. `PRIVATE_TERMS_FILE` and `PRIVATE_SECRETS_FILE` select other
+files. `npm run check:private -- --all` checks every staged file, including
+unchanged ones.
+
 Only compiled JS/declarations, the worker asset, generic docs, README, LICENSE,
 and package metadata ship. Original public history and extracted-code MIT
 attribution are preserved.

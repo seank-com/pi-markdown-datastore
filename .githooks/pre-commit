@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Refuse to commit staged files that contain private terms or secret values.
+exec node scripts/check-private-terms.ts
