@@ -17,7 +17,9 @@
     "check": "tsc --noEmit -p tsconfig.json",
     "test": "node scripts/test.ts",
     "build": "node scripts/clean-build.ts && tsc -p tsconfig.json && node scripts/copy-assets.ts",
-    "test:package": "npm run build && node --test tests/package.test.ts"
+    "test:package": "npm run build && node --test tests/package.test.ts",
+    "check:private": "node scripts/check-private-terms.ts",
+    "hooks:install": "git config core.hooksPath .githooks"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

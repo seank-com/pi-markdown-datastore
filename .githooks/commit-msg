@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Refuse commit messages that contain private terms or secret values.
+exec node scripts/check-private-terms.ts --message "$1"
