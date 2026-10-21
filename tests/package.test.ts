@@ -23,12 +23,14 @@ test("actual tarball loads standalone, imports helpers, and runs its adjacent wo
   // this test cannot depend on metadata left by previous local installations.
   execFileSync("npm", ["install", "--cache", join(consumer, "npm-cache"), "--ignore-scripts", "--legacy-peer-deps", "--no-audit", "--no-fund", join(consumer, packed.filename)], { cwd: consumer, stdio: "pipe", timeout: 30_000 });
   await writeFile(join(consumer, "types.ts"), `
-import type { NoteRef, MarkdownDatastoreCapability } from "@seank/pi-markdown-datastore/contract";
+import type { NoteRef, MarkdownDatastoreCapability, MarkdownDatastorePolicyV1 } from "@seank/pi-markdown-datastore/contract";
 import { createMarkdownDatastoreClient, queryMarkdownDatastoreCapability, type MarkdownDatastoreCapabilityBus } from "@seank/pi-markdown-datastore/client";
 const note: NoteRef = {store:"notes",path:"one.md"};
 declare const bus: MarkdownDatastoreCapabilityBus;
 const capability: MarkdownDatastoreCapability | undefined = queryMarkdownDatastoreCapability(bus);
-void createMarkdownDatastoreClient(bus).read({note}); void capability;
+void createMarkdownDatastoreClient(bus).read({note});
+const policy: MarkdownDatastorePolicyV1 = createMarkdownDatastoreClient(bus, { capability });
+void policy.roots({}); void policy.validateDestination({ path: "/example/new.md" });
 `);
   execFileSync(process.execPath, [join(root, "node_modules/typescript/bin/tsc"), "--noEmit", "--strict", "--module", "NodeNext", "--target", "ES2023", "types.ts"], { cwd: consumer, stdio: "pipe", timeout: 30_000 });
   const configDir = join(consumer, ".pi/markdown-datastore");
@@ -68,6 +70,11 @@ await start(loaded);
 assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(),["datastore_find","datastore_read","datastore_refresh","datastore_search","datastore_status"]);
 const capability = queryMarkdownDatastoreCapability(bus)!;
 assert.equal(capability.ready,true);assert.deepEqual(capability.stores,["notes"]);
+assert.equal(capability.policyVersion,1);
+const policy = createMarkdownDatastoreClient(bus,{capability,timeoutMs:1000});
+assert.equal((await policy.roots({})).data.roots[0].path,join(process.cwd(),"notes"));
+assert.equal((await policy.validateDestination({path:join(process.cwd(),"notes/new/deep.md")})).data.owned,true);
+assert.equal((await policy.validateDestination({path:join(process.cwd(),"beside.md")})).data.owned,false);
 const client = createMarkdownDatastoreClient(bus,{timeoutMs:1000});
 const read = await client.read({note:{store:"notes",path:"one.md"}});
 assert.match(read.data.content,/Packed source text/);
@@ -76,15 +83,16 @@ await assert.rejects(client.read({note:{store:"other",path:"one.md"}}),error=>er
 await assert.rejects(client.search({store:"notes",query:"source"}),error=>error.code==="CAPABILITY_UNAVAILABLE");
 assert.equal((await client.refresh({store:"notes",mode:"direct"})).operation,"refresh");
 await stop(loaded);assert.equal(capability.ready,false);assert.deepEqual(capability.stores,[]);
+await assert.rejects(policy.roots({}),error=>error.code==="CAPABILITY_UNAVAILABLE");
 assert.equal(queryMarkdownDatastoreCapability(bus),undefined);
 
 // Resolve capabilities at the real post-start discovery event, in both load orders.
 const consumerEntry = join(process.cwd(),"consumer.ts");
-writeFileSync(consumerEntry,'import {queryMarkdownDatastoreCapability} from "@seank/pi-markdown-datastore/client";export default function(pi){pi.on("resources_discover",()=>{const capability=queryMarkdownDatastoreCapability(pi.events);pi.events.emit("fixture:ready",{ready:capability?.ready,stores:capability?.stores});});}');
+writeFileSync(consumerEntry,'import {join} from "node:path";import {queryMarkdownDatastoreCapability,createMarkdownDatastoreClient} from "@seank/pi-markdown-datastore/client";export default function(pi){pi.on("resources_discover",async()=>{const capability=queryMarkdownDatastoreCapability(pi.events);if(!capability?.ready||capability.policyVersion!==1)throw new Error("policy unavailable");const client=createMarkdownDatastoreClient(pi.events,{capability});const roots=(await client.roots({})).data.roots;const owned=(await client.validateDestination({path:join(process.cwd(),"notes/new.md")})).data.owned;const outside=(await client.validateDestination({path:join(process.cwd(),"beside.md")})).data.owned;pi.events.emit("fixture:ready",{ready:capability.ready,stores:capability.stores,roots:roots.map(root=>root.path),owned,outside});});}');
 for (const order of [[consumerEntry,entry],[entry,consumerEntry]]) {
   clearExtensionCache();const pair=await loadExtensions(order,process.cwd(),bus);assert.deepEqual(pair.errors,[]);
   let observed;const unsubscribe=bus.on("fixture:ready",data=>{observed=data;});
-  await start(pair);assert.deepEqual(observed,{ready:true,stores:["notes"]});
+  await start(pair);assert.deepEqual(observed,{ready:true,stores:["notes"],roots:[join(process.cwd(),"notes")],owned:true,outside:false});
   await stop(pair);unsubscribe();assert.equal(queryMarkdownDatastoreCapability(bus),undefined);
 }
 

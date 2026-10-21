@@ -23,8 +23,12 @@ npm run test:package
 Create a project-local configuration as described in [setup](docs/setup.md),
 then start Pi with `-e /path/to/pi-markdown-datastore/dist/index.js`. Load this
 entry once. It registers `datastore_search`, `datastore_find`, `datastore_read`,
-`datastore_status`, and `datastore_refresh` in a trusted, configured project.
-Missing/invalid configuration or an untrusted project disables the service.
+`datastore_status`, and `datastore_refresh` consistently, even without valid
+configuration. Missing/invalid configuration or an untrusted project disables
+service operation, not tool visibility. Calls report the specific configuration
+error or `PROJECT_UNTRUSTED`; fix the configuration/trust and start a new session.
+Configured roots must be real directories, not symlink aliases. Descendant
+symlinks and hard-linked notes cannot be read; source data is never repaired.
 
 Markdown is authoritative. The extension never edits source notes. Derived
 indexes are disposable. Each qmd worker retains its public SDK store and native
@@ -44,6 +48,25 @@ Consumers call `queryMarkdownDatastoreCapability(pi.events)` at
 configured service is available, not that an optional search backend or
 index is ready; `status` reports those capabilities separately. Clear references
 on teardown/reload. Absence returns immediately, without the operation timeout.
+
+For datastore-owned destination policy, require `policyVersion: 1`, then bind a
+client to the discovered capability:
+
+```ts
+const capability = queryMarkdownDatastoreCapability(pi.events);
+if (!capability?.ready || capability.policyVersion !== 1) throw new Error("Datastore policy unavailable");
+const client = createMarkdownDatastoreClient(pi.events, { capability });
+const roots = (await client.roots({})).data.roots;
+const policy = (await client.validateDestination({ path: absoluteDestination })).data;
+if (policy.owned) throw new Error("Destination belongs to a datastore");
+```
+
+These supported APIs use the effective configuration and captured root identities,
+not consumer-side config parsing. They work without qmd, accept new destinations,
+and fail explicitly on unsafe aliases, unavailable roots, or stale instances.
+Recheck the actual destination at publication. This is datastore ownership, not a
+write grant; other consumer restrictions still apply. See the
+[policy contract](docs/design.md#public-root-and-destination-policy).
 
 ## Tests
 

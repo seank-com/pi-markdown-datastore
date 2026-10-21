@@ -115,6 +115,10 @@ test("safe open rejects traversal, descendant symlinks, and hard links", async (
 	await assert.rejects(() => safeOpenNote(store, "../safe.md"), (error) => code(error) === "INVALID_NOTE_REF");
 	await symlink(join(current.storeRoot, "safe.md"), join(current.storeRoot, "alias.md"));
 	await assert.rejects(() => safeOpenNote(store, "alias.md"), (error) => code(error) === "SYMLINK_REJECTED");
+	await mkdir(join(current.storeRoot, "folder"));
+	await writeFile(join(current.storeRoot, "folder/child.md"), "# Child\n");
+	await symlink(join(current.storeRoot, "folder"), join(current.storeRoot, "linked-folder"));
+	await assert.rejects(() => safeOpenNote(store, "linked-folder/child.md"), (error) => code(error) === "SYMLINK_REJECTED");
 	await link(join(current.storeRoot, "safe.md"), join(current.storeRoot, "hard.md"));
 	await assert.rejects(() => safeOpenNote(store, "hard.md"), (error) => code(error) === "UNSAFE_FILE_TYPE");
 });
