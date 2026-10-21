@@ -100,9 +100,33 @@ test("qmd startup reconciliation is enqueued without blocking startup", { timeou
 	assert.equal(started, true); assert.ok(Date.now() - before < 100); assert.equal(app.tools.length, 5); await app.fire("session_shutdown");
 });
 
-test("missing configuration and untrusted projects register no datastore tools", async (t) => {
-	const current = await fixture(t); const missing = harness(current.project); createMarkdownDatastoreExtension({ projectRoot: current.project, configPath: join(current.project, ".pi", "markdown-datastore", "absent.json") })(missing.pi); await missing.fire("session_start"); assert.equal(missing.tools.length, 0);
-	const untrusted = harness(current.project, false); createMarkdownDatastoreExtension({ projectRoot: current.project, configPath: current.configPath })(untrusted.pi); await untrusted.fire("session_start"); assert.equal(untrusted.tools.length, 0);
+test("five tools remain visible across initial failures, recovery, and valid-to-invalid transitions", async t => {
+	const current = await fixture(t); const original = await readFile(current.configPath);
+	const app = harness(current.project); let backendStarts = 0;
+	createMarkdownDatastoreExtension({ projectRoot: current.project, createQmd: async () => { backendStarts++; throw new Error("not installed"); } })(app.pi);
+	assert.equal(app.tools.length, 5, "registration does not wait for session_start");
+	const inputs: Record<string, unknown> = { datastore_search: { store: "memory", query: "body" }, datastore_find: { store: "memory", selectors: [{ kind: "path", path: "one.md" }] }, datastore_read: { note: { store: "memory", path: "one.md" } }, datastore_status: {}, datastore_refresh: {} };
+	const fails = async (code: string) => {
+		assert.equal(app.tools.length, 5);
+		for (const tool of app.tools) await assert.rejects(tool.execute("id", inputs[tool.name]), (error: any) => error.code === code);
+	};
+	await rm(current.configPath); await app.fire("session_start"); await fails("CONFIG_MISSING");
+	await writeFile(current.configPath, "{", { mode: 0o600 }); await app.fire("session_start"); await fails("CONFIG_INVALID");
+	await writeFile(current.configPath, JSON.stringify({ schemaVersion: 1 }), { mode: 0o600 }); await app.fire("session_start"); await fails("CONFIG_INVALID");
+	for (let cycle = 0; cycle < 2; cycle++) {
+		const config = JSON.parse(original.toString()); config.qmd.enabled = true;
+		await writeFile(current.configPath, JSON.stringify(config)); await app.fire("session_start");
+		assert.match((await app.tools.find(tool => tool.name === "datastore_read").execute("id", inputs.datastore_read)).content[0].text, /Body/);
+		await writeFile(current.configPath, '{"schemaVersion":1}'); await app.fire("session_start"); await fails("CONFIG_INVALID");
+	}
+	assert.equal(backendStarts, 2, "invalid configuration never constructs a backend");
+	await writeFile(current.configPath, original);
+	const untrusted = harness(current.project, false);
+	createMarkdownDatastoreExtension({ projectRoot: current.project, createQmd: async () => { throw new Error("trust bypassed"); } })(untrusted.pi);
+	await untrusted.fire("session_start"); assert.equal(untrusted.tools.length, 5);
+	for (const tool of untrusted.tools) await assert.rejects(tool.execute("id", inputs[tool.name]), (error: any) => error.code === "PROJECT_UNTRUSTED");
+	await assert.rejects((await import("node:fs/promises")).stat(join(current.project, ".pi/markdown-datastore/state")), { code: "ENOENT" });
+	await app.fire("session_shutdown"); await untrusted.fire("session_shutdown");
 });
 
 test("event RPC rejects unknown fields, malformed inputs, and expired deadlines", { timeout: 5000 }, async (t) => {

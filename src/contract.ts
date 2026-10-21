@@ -9,6 +9,9 @@ export interface MarkdownDatastoreCapability {
 	readonly contractVersion: 1;
 	readonly ready: boolean;
 	readonly stores: readonly string[];
+	/** Optional additive capability. Policy requests must bind to this instance. */
+	readonly policyVersion?: 1;
+	readonly instanceId?: string;
 }
 export interface MarkdownDatastoreCapabilityRequest { version: 1; requestId: string }
 export interface MarkdownDatastoreCapabilityReply {
@@ -24,7 +27,7 @@ export type ReadView = "content" | "section" | "outline" | "metadata" | "links" 
 
 export type MarkdownDatastoreErrorCode =
 	| "CONFIG_MISSING" | "CONFIG_INVALID" | "CONFIG_VERSION_UNSUPPORTED"
-	| "STORE_UNKNOWN" | "STORE_UNAVAILABLE" | "CAPABILITY_UNAVAILABLE"
+	| "STORE_UNKNOWN" | "STORE_UNAVAILABLE" | "CAPABILITY_UNAVAILABLE" | "PROJECT_UNTRUSTED"
 	| "INVALID_NOTE_REF" | "PATH_ESCAPE" | "SYMLINK_REJECTED" | "UNSAFE_FILE_TYPE" | "FILE_TOO_LARGE"
 	| "NOTE_NOT_FOUND" | "AMBIGUOUS_NOTE" | "AMBIGUOUS_SECTION"
 	| "INVALID_UTF8" | "MARKDOWN_PARSE_ERROR" | "FRONTMATTER_INVALID"
@@ -93,13 +96,26 @@ export type RefreshInput =
 	| { action: "cancel"; refreshId: string };
 export type RefreshResult = ResultEnvelope<Record<string, unknown>>;
 
+export type RootsInput = Record<string, never>;
+export interface DatastoreRoot { store: string; path: string; device: number; inode: number }
+export type RootsResult = ResultEnvelope<{ roots: DatastoreRoot[] }>;
+export interface DestinationInput { path: string }
+export type DestinationResult = ResultEnvelope<{ path: string; owned: boolean; stores: string[] }>;
+
 export type MarkdownDatastoreRequest =
+	| { operation: "roots"; input: RootsInput }
+	| { operation: "validateDestination"; input: DestinationInput }
 	| { operation: "search"; input: SearchInput }
 	| { operation: "find"; input: FindInput }
 	| { operation: "read"; input: ReadInput }
 	| { operation: "status"; input: StatusInput }
 	| { operation: "refresh"; input: RefreshInput };
-export type MarkdownDatastoreResult = SearchResult | FindResult | ReadResult | StatusResult | RefreshResult;
+export type MarkdownDatastoreResult = SearchResult | FindResult | ReadResult | StatusResult | RefreshResult | RootsResult | DestinationResult;
+
+export interface MarkdownDatastorePolicyV1 {
+	roots(input: RootsInput, signal?: AbortSignal): Promise<RootsResult>;
+	validateDestination(input: DestinationInput, signal?: AbortSignal): Promise<DestinationResult>;
+}
 
 export interface MarkdownDatastoreServiceV1 {
 	search(input: SearchInput, signal?: AbortSignal): Promise<SearchResult>;
@@ -113,6 +129,8 @@ export interface MarkdownDatastoreRpcEnvelope {
 	contractVersion: 1;
 	requestId: string;
 	request: MarkdownDatastoreRequest;
+	/** Required for policy operations; binds requests to a discovered instance. */
+	instanceId?: string;
 	deadline: number;
 	signal?: AbortSignal;
 	resolve(result: MarkdownDatastoreResult): void;

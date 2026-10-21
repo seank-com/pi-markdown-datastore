@@ -45,14 +45,23 @@ parents must be current-user-owned, regular directories/files with the existing
 safe-mode contract. Root directories must exist; relative roots resolve against
 this project, and deliberately configured absolute roots are allowed. Store names,
 canonical roots, and qmd collections must be unique. Unknown/duplicate config
-keys are rejected. Enabling qmd currently requires exactly one include pattern.
+keys are rejected. Roots must name real directories without symlink aliases,
+including in their ancestry. Descendant symlinks and hard-linked notes are not
+accepted by direct reads. The extension does not move, copy, unlink, chmod, or
+repair operator data. Enabling qmd currently requires exactly one include pattern.
+The normal pattern is `**/*.md`; include/exclude patterns select scanning/indexing,
+not direct access. Otherwise valid excluded Markdown remains accessible to exact
+find/read within the root.
 
 Build the candidate with `npm ci && npm run build` and start Pi with
 `-e /path/to/pi-markdown-datastore/dist/index.js`. Load it once. Status should
 report ready direct capabilities, unavailable optional backends, and unsupported
 mutations. Try an exact-path find and a bounded read of a synthetic note before
-using a real collection. Missing/invalid configuration or untrusted projects
-register no datastore tools; check the persistent UI status for the error code.
+using a real collection. All five tools remain registered with missing/invalid
+configuration or an untrusted project. Calls report the specific configuration
+failure or `PROJECT_UNTRUSTED`; check the persistent UI status too. Correct the
+configuration or project trust and start a new session to load it. No backend or
+derived state is started from missing/invalid or untrusted configuration.
 
 ## Optional qmd 2.8.3
 
@@ -77,7 +86,11 @@ when selecting an already prepared model. Keep qmd's default expansion/reranker
 models prepared in its model cache for hybrid searches. Credential variables,
 Node injection options and global collection configuration are not inherited.
 
-`datastore_refresh` lexical/semantic/all starts return a durable `refreshId`.
+Omitting `datastore_refresh` mode selects `direct`, which only revalidates
+captured root identities: no note scan or index update. It returns its bounded
+root-check result. `lexical` queues update and schedules semantic batching after
+success. `semantic` queues update plus embedding; `all` uses that same path.
+Lexical/semantic/all starts return a durable `refreshId` before completion.
 Poll `datastore_status` for completion and use
 `{ "action": "cancel", "refreshId": "..." }` to cancel a job. Explicit lexical
 refresh runs immediately through the serialized maintenance queue. Startup
@@ -97,8 +110,12 @@ Derived state resides below `.pi/markdown-datastore/state/`, in a directory
 specific to the qmd release and configured source identities. Directory/file
 permissions are 0700/0600. Use qmd to build these indexes from source, rather than
 copying a global index. Search failure does not prevent direct reads. Native
-embedding has qmd's SDK session cap; the parent also enforces a 35-minute
-maintenance deadline. Partial or failed jobs remain observable and require an
+embedding has qmd's SDK session cap; native update/embed worker requests also
+have a 35-minute deadline excluding prior maintenance queueing and metadata
+scanning. Before update, preflight checks selected-file filesystem metadata,
+containment/types/links, per-file sizes and aggregate document/byte limits. It
+does not open and decode every note; later content reads and result validation
+are separate. Partial or failed jobs remain observable and require an
 explicit retry. Do not assume that an interrupted refresh preserves an unchanged
 previous index.
 
@@ -109,6 +126,21 @@ Use `/client`'s synchronous capability query at `resources_discover`, after all
 service; require your configured store name too. Backend capability/index
 readiness comes from `status`. Absence is prompt; do not probe it by waiting on
 an ordinary operation timeout. Clear capabilities across shutdown/reload.
+
+Policy consumers additionally require `policyVersion: 1` and pass the discovered
+`capability` to `createMarkdownDatastoreClient`. `roots({})` enumerates canonical
+unredacted effective roots; `validateDestination({ path })` reports ownership of
+the actual absolute destination, including nonexistent suffixes. Reject owned
+writes and fail closed on errors. A file beside a store is not owned merely
+because its parent contains that store. Recheck at publication; policy is not a
+write grant or reservation. See [the API contract](design.md#public-root-and-destination-policy).
+
+Timeout scopes are separate: service operations have a 15-minute ceiling;
+`operationTimeoutMs` bounds dispatched qmd reader requests, excluding queue wait.
+The cross-extension client defaults to 15 minutes and allows overrides in its
+existing 1-900000 ms range. The maintenance-worker deadline above applies to the
+background native request, not a refresh receipt waiter. Cancelling a waiter does
+not cancel the shared job; use explicit refresh cancellation for that.
 
 `STORE_UNKNOWN` means the name is outside this configuration. `PATH_ESCAPE`,
 `SYMLINK_REJECTED`, or identity errors require fixing the caller/reference or

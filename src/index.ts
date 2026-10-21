@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { truncateHead } from "@earendil-works/pi-coding-agent";
@@ -29,6 +30,10 @@ const Selector = Type.Union([
 const ReadIdentity = { store: Type.Optional(Type.String()), note: Type.Optional(Note), uri: Type.Optional(Type.String()) };
 const ReadBounds = { maxBytes: Type.Optional(Type.Integer({ minimum: 4, maximum: HARD_MAX_RESULT_BYTES })), maxLines: Type.Optional(Type.Integer({ minimum: 1, maximum: HARD_MAX_RESULT_LINES })) };
 const forbidden = (...keys: string[]) => ({ not: { anyOf: keys.map((key) => ({ required: [key] })) } });
+const PolicySchemas = {
+	roots: Type.Object({}, { additionalProperties: false }),
+	validateDestination: Type.Object({ path: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
+};
 const Schemas = {
 	search: Type.Object({ store: Type.String(), query: Type.String({ minLength: 1, maxLength: 4096 }), mode: Type.Optional(StringEnum(["lexical", "semantic", "hybrid"] as const)), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })), minScore: Type.Optional(Type.Number()), freshness: Type.Optional(StringEnum(["allow-stale", "require-current-lexical", "require-current-semantic"] as const)), includeContent: Type.Optional(Type.Boolean()) }, { additionalProperties: false }),
 	find: Type.Object({ store: Type.String(), selectors: Type.Array(Selector, { minItems: 1, maxItems: 8 }), match: Type.Optional(StringEnum(["all", "any"] as const)), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })) }, { additionalProperties: false }),
@@ -88,8 +93,9 @@ function exactKeys(value: unknown, allowed: readonly string[]): value is Record<
 	return typeof value === "object" && value !== null && !Array.isArray(value) && Object.keys(value).every((key) => allowed.includes(key));
 }
 function validRpcRequest(value: unknown): value is MarkdownDatastoreRequest {
-	if (!exactKeys(value, ["operation", "input"]) || Object.keys(value).length !== 2 || typeof value.operation !== "string" || !(value.operation in Schemas)) return false;
-	return checkSchema(Schemas[value.operation as keyof typeof Schemas], value.input);
+	if (!exactKeys(value, ["operation", "input"]) || Object.keys(value).length !== 2 || typeof value.operation !== "string") return false;
+	const schema = { ...Schemas, ...PolicySchemas };
+	return Object.hasOwn(schema, value.operation) && checkSchema(schema[value.operation as keyof typeof schema], value.input);
 }
 
 function toolText(result: MarkdownDatastoreResult): string {
@@ -103,12 +109,15 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 	const configPath = resolve(options.configPath ?? projectDatastoreConfigPath(projectRoot));
 	return function markdownDatastoreExtension(pi: ExtensionAPI): void {
 		let service: MarkdownDatastoreService | undefined; let registered = false; let rpcUnsubscribe: (() => void) | undefined; let generation = 0;
+		let instanceId = randomUUID();
+		let unavailable = new DatastoreError("STORE_UNAVAILABLE");
 		const subscribeCapability = () => pi.events.on(MARKDOWN_DATASTORE_CAPABILITY_REQUEST, (payload) => {
 			const request = payload as Partial<MarkdownDatastoreCapabilityRequest> | null;
 			if (!request || request.version !== 1 || typeof request.requestId !== "string" || request.requestId.length < 1 || request.requestId.length > 128) return;
 			const ownGeneration = generation;
 			const capability: MarkdownDatastoreCapability = {
-				version: 1, contractVersion: MARKDOWN_DATASTORE_CONTRACT_VERSION,
+				version: 1, contractVersion: MARKDOWN_DATASTORE_CONTRACT_VERSION, policyVersion: 1,
+				get instanceId() { return generation === ownGeneration ? instanceId : undefined; },
 				get ready() { return generation === ownGeneration && service !== undefined; },
 				get stores() { return generation === ownGeneration && service ? [...service.config.stores.keys()] : []; },
 			};
@@ -129,8 +138,10 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 			return { candidateCount, returnedCount, returnedBytes: result.bounds.returnedBytes, returnedLines: result.bounds.returnedLines, maxBytes: result.bounds.maxBytes, maxLines: result.bounds.maxLines, truncated: result.bounds.truncated, backendSelection, freshnessStates, warningCodes: result.warnings.map((warning) => warning.code), refreshCount, processExitCategories, requestedMode: data.requestedMode, effectiveMode: data.effectiveMode, queueMs: data.queueMs, operationMs: data.operationMs, workerId: data.workerId, outputSchema: "valid" };
 		};
 		const dispatch = async (request: MarkdownDatastoreRequest, signal?: AbortSignal): Promise<MarkdownDatastoreResult> => {
-			if (!service) throw new DatastoreError("STORE_UNAVAILABLE");
+			if (!service) throw unavailable;
 			switch (request.operation) {
+				case "roots": return service.roots(request.input, signal);
+				case "validateDestination": return service.validateDestination(request.input, signal);
 				case "search": return service.search(request.input, signal);
 				case "find": return service.find(request.input, signal);
 				case "read": return service.read(request.input, signal);
@@ -140,6 +151,7 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 			}
 		};
 		const run = async (request: MarkdownDatastoreRequest, signal?: AbortSignal): Promise<MarkdownDatastoreResult> => {
+			if (request.operation === "roots" || request.operation === "validateDestination") return dispatch(request, signal);
 			const started = Date.now(); const store = "store" in request.input ? request.input.store : undefined; observe(request.operation, store, "start", started);
 			try { const result = await dispatch(request, signal); observe(request.operation, store, "end", started, structuralMetrics(result)); return result; }
 			catch (error) { const safe = datastoreError(error); observe(request.operation, store, "end", started, { errorCode: safe.code, warningCodes: [], processExitCategory: safe.code === "BACKEND_FAILED" || safe.code === "BACKEND_OUTPUT_INVALID" ? "backend-failure" : undefined, outputSchema: safe.code === "BACKEND_OUTPUT_INVALID" ? "invalid" : undefined }); throw safe; }
@@ -155,37 +167,52 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 			pi.registerTool({ name: "datastore_status", label: "Datastore status", description: "Report configured Markdown store capabilities, protected backend readiness, freshness, counts, and permission warnings without note contents.", parameters: Schemas.status, execute: (_id, input, signal) => execute({ operation: "status", input }, signal) });
 			pi.registerTool({ name: "datastore_refresh", label: "Datastore refresh", description: "Start or cancel read-only derived datastore maintenance. Lexical, semantic, and all return prompt durable job receipts; direct performs only bounded root revalidation. Status reports progress. Never mutates source Markdown or runs source synchronization.", parameters: Schemas.refresh, executionMode: "sequential", execute: (_id, input, signal) => execute({ operation: "refresh", input }, signal) });
 		};
+		registerTools();
 		const removeRpc = (): void => { rpcUnsubscribe?.(); rpcUnsubscribe = undefined; };
 		const rpcMetric = (outcome: "accepted" | "success" | "error" | "invalid" | "expired" | "duplicate-responder", operation?: string, started?: number, code?: string): void => {
 			pi.appendEntry("markdown-datastore-rpc", { version: 1, outcome, operation, durationMs: started === undefined ? undefined : Math.max(0, Date.now() - started), code, timestamp: new Date().toISOString() });
 		};
+		const rpcListener = (payload: unknown) => {
+			let reject: ((error: unknown) => void) | undefined; let policy = false;
+			try {
+				if (typeof payload === "object" && payload !== null) {
+					const candidate = payload as Partial<MarkdownDatastoreRpcEnvelope>;
+					if (typeof candidate.reject === "function") reject = candidate.reject;
+					policy = candidate.request?.operation === "roots" || candidate.request?.operation === "validateDestination";
+				}
+			} catch { return; }
+			// Policy checks, including rejected requests, never append session entries.
+			const metric: typeof rpcMetric = (...args) => { if (!policy) rpcMetric(...args); };
+			if (!exactKeys(payload, ["contractVersion", "requestId", "request", "instanceId", "deadline", "signal", "resolve", "reject"]) || payload.contractVersion !== MARKDOWN_DATASTORE_CONTRACT_VERSION || typeof payload.requestId !== "string" || payload.requestId.length < 1 || payload.requestId.length > 128 || typeof payload.deadline !== "number" || !Number.isFinite(payload.deadline) || typeof payload.resolve !== "function" || typeof payload.reject !== "function" || (payload.signal !== undefined && (!(payload.signal instanceof AbortSignal))) || !validRpcRequest(payload.request)) {
+				metric("invalid"); reject?.(new DatastoreError("CONFIG_INVALID")); return;
+			}
+			const envelope = payload as unknown as MarkdownDatastoreRpcEnvelope;
+			if (policy && envelope.instanceId !== instanceId) { envelope.reject(new DatastoreError("STORE_UNAVAILABLE")); return; }
+			if (claimedRpcEnvelopes.has(payload)) { metric("duplicate-responder", envelope.request.operation); return; }
+			claimedRpcEnvelopes.add(payload);
+			if (Date.now() >= envelope.deadline) { metric("expired", envelope.request.operation, undefined, "TIMEOUT"); envelope.reject(new DatastoreError("TIMEOUT")); return; }
+			const started = Date.now(); metric("accepted", envelope.request.operation);
+			const deadline = new AbortController(); const timer = setTimeout(() => deadline.abort(new DatastoreError("TIMEOUT")), Math.max(1, envelope.deadline - Date.now()));
+			const signal = envelope.signal ? AbortSignal.any([envelope.signal, deadline.signal]) : deadline.signal;
+			void run(envelope.request, signal).then((result) => { metric("success", envelope.request.operation, started); envelope.resolve(result); }, (error) => { const safe = datastoreError(error); metric("error", envelope.request.operation, started, safe.code); envelope.reject(safe); }).finally(() => clearTimeout(timer));
+		};
+		const subscribeRpc = () => pi.events.on(MARKDOWN_DATASTORE_REQUEST_EVENT, rpcListener);
+		rpcUnsubscribe = subscribeRpc();
 		pi.on("session_start", async (_event, ctx) => {
 			capabilityUnsubscribe ??= subscribeCapability();
-			generation += 1; const ownGeneration = generation; removeRpc(); const previous = service; service = undefined; await previous?.shutdown();
+			rpcUnsubscribe ??= subscribeRpc();
+			generation += 1; instanceId = randomUUID(); unavailable = new DatastoreError("STORE_UNAVAILABLE");
+			const ownGeneration = generation; const previous = service; service = undefined; await previous?.shutdown();
 			if (generation !== ownGeneration) return;
-			if (!ctx.isProjectTrusted()) { ctx.ui.setStatus("markdown-datastore", "datastore: disabled (project untrusted)"); return; }
-			let config; try { config = await loadMarkdownDatastoreConfig(projectRoot, configPath); } catch (error) { const safe = datastoreError(error, "CONFIG_INVALID"); ctx.ui.setStatus("markdown-datastore", `datastore: disabled (${safe.code})`); return; }
+			if (!ctx.isProjectTrusted()) { unavailable = new DatastoreError("PROJECT_UNTRUSTED"); ctx.ui.setStatus("markdown-datastore", "datastore: disabled (project untrusted)"); return; }
+			let config; try { config = await loadMarkdownDatastoreConfig(projectRoot, configPath); } catch (error) { if (generation !== ownGeneration) return; unavailable = datastoreError(error, "CONFIG_INVALID"); ctx.ui.setStatus("markdown-datastore", `datastore: disabled (${unavailable.code})`); return; }
+			if (generation !== ownGeneration) return;
 			let qmd: QmdAdapter | undefined;
 			if (config.qmd.enabled) try { qmd = await (options.createQmd ?? createQmd)(config); } catch {}
 			if (generation !== ownGeneration) { await Promise.allSettled([qmd?.shutdown()].filter((operation): operation is Promise<void> => operation !== undefined)); return; }
-			service = new MarkdownDatastoreService(config, undefined, qmd); registerTools();
+			service = new MarkdownDatastoreService(config, undefined, qmd);
 			if (qmd) void qmd.startupReconcile([...config.stores.values()]).catch(() => undefined);
-			const rpcListener = (payload: unknown) => {
-				let reject: ((error: unknown) => void) | undefined;
-				try { if (typeof payload === "object" && payload !== null && typeof (payload as Record<string, unknown>).reject === "function") reject = (payload as Record<string, unknown>).reject as (error: unknown) => void; } catch { return; }
-				if (!exactKeys(payload, ["contractVersion", "requestId", "request", "deadline", "signal", "resolve", "reject"]) || payload.contractVersion !== MARKDOWN_DATASTORE_CONTRACT_VERSION || typeof payload.requestId !== "string" || payload.requestId.length < 1 || payload.requestId.length > 128 || typeof payload.deadline !== "number" || !Number.isFinite(payload.deadline) || typeof payload.resolve !== "function" || typeof payload.reject !== "function" || (payload.signal !== undefined && (!(payload.signal instanceof AbortSignal))) || !validRpcRequest(payload.request)) {
-					rpcMetric("invalid"); reject?.(new DatastoreError("CONFIG_INVALID")); return;
-				}
-				const envelope = payload as unknown as MarkdownDatastoreRpcEnvelope;
-				if (claimedRpcEnvelopes.has(payload)) { rpcMetric("duplicate-responder", envelope.request.operation); return; }
-				claimedRpcEnvelopes.add(payload);
-				if (Date.now() >= envelope.deadline) { rpcMetric("expired", envelope.request.operation, undefined, "TIMEOUT"); envelope.reject(new DatastoreError("TIMEOUT")); return; }
-				const started = Date.now(); rpcMetric("accepted", envelope.request.operation);
-				const deadline = new AbortController(); const timer = setTimeout(() => deadline.abort(new DatastoreError("TIMEOUT")), Math.max(1, envelope.deadline - Date.now()));
-				const signal = envelope.signal ? AbortSignal.any([envelope.signal, deadline.signal]) : deadline.signal;
-				void run(envelope.request, signal).then((result) => { rpcMetric("success", envelope.request.operation, started); envelope.resolve(result); }, (error) => { const safe = datastoreError(error); rpcMetric("error", envelope.request.operation, started, safe.code); envelope.reject(safe); }).finally(() => clearTimeout(timer));
-			};
-			rpcUnsubscribe = pi.events.on(MARKDOWN_DATASTORE_REQUEST_EVENT, rpcListener); ctx.ui.setStatus("markdown-datastore", "datastore: ready");
+			ctx.ui.setStatus("markdown-datastore", "datastore: ready");
 		});
 		pi.on("session_shutdown", async (_event, ctx) => { generation += 1; removeRpc(); capabilityUnsubscribe?.(); capabilityUnsubscribe = undefined; const current = service; service = undefined; await current?.shutdown(); ctx.ui.setStatus("markdown-datastore", undefined); });
 	};

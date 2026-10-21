@@ -110,3 +110,23 @@ test("default RPC budget permits a 19-second query and aborts work at its deadli
 	assert.equal(envelope!.signal?.aborted, true, "timeout must reach the backend, not only reject the caller");
 	assert.equal((envelope!.signal!.reason as any).code, "TIMEOUT");
 });
+
+test("policy clients fail closed on malformed, empty, or truncated scope results", async () => {
+	const capability = { version: 1, contractVersion: 1, ready: true, stores: ["notes"], policyVersion: 1, instanceId: "fixture" } as const;
+	for (const [operation, data, truncated] of [
+		["roots", { roots: [] }, false],
+		["roots", { roots: [{ store: "notes", path: "relative", device: 1, inode: 2 }] }, false],
+		["roots", { roots: [{ store: "notes", path: "/notes", device: 1, inode: 2 }] }, true],
+		["validateDestination", { path: "/outside", owned: false, stores: ["notes"] }, false],
+		["validateDestination", { path: "/outside", stores: [] }, false],
+		["validateDestination", { path: "/outside", owned: false, stores: [] }, true],
+	] as const) {
+		const emitter = new EventEmitter();
+		emitter.on(MARKDOWN_DATASTORE_REQUEST_EVENT, payload => {
+			assert.equal(payload.instanceId, "fixture");
+			payload.resolve({ ...result(), operation, data, bounds: { ...result().bounds, truncated } });
+		});
+		const client = createMarkdownDatastoreClient(bus(emitter), { capability });
+		await assert.rejects(operation === "roots" ? client.roots({}) : client.validateDestination({ path: "/outside" }), (error: any) => error.code === "BACKEND_OUTPUT_INVALID");
+	}
+});

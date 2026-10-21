@@ -7,6 +7,7 @@ import {
 	type MarkdownDatastoreCapability,
 	type MarkdownDatastoreCapabilityReply,
 	MARKDOWN_DATASTORE_REQUEST_EVENT,
+	type MarkdownDatastorePolicyV1, type RootsResult, type DestinationResult,
 	type FindInput,
 	type FindResult,
 	type MarkdownDatastoreRequest,
@@ -55,11 +56,13 @@ export const DEFAULT_MARKDOWN_DATASTORE_CLIENT_TIMEOUT_MS = 15 * 60_000;
 
 export interface MarkdownDatastoreClientOptions {
 	timeoutMs?: number;
+	/** Bind policy requests to a capability discovered for this effective instance. */
+	capability?: MarkdownDatastoreCapability;
 	createRequestId?: () => string;
 	now?: () => number;
 }
 
-export type MarkdownDatastoreClientErrorCode = "TIMEOUT" | "CANCELLED" | "BACKEND_OUTPUT_INVALID";
+export type MarkdownDatastoreClientErrorCode = "TIMEOUT" | "CANCELLED" | "BACKEND_OUTPUT_INVALID" | "CAPABILITY_UNAVAILABLE";
 
 export class MarkdownDatastoreClientError extends Error {
 	readonly code: MarkdownDatastoreClientErrorCode;
@@ -73,6 +76,14 @@ export class MarkdownDatastoreClientError extends Error {
 function validResult(value: unknown, operation: MarkdownDatastoreRequest["operation"]): value is MarkdownDatastoreResult {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const result = value as Record<string, unknown>;
+	if (operation === "roots" || operation === "validateDestination") {
+		const data = result.data as Record<string, unknown> | null;
+		if (!data || typeof data !== "object" || Array.isArray(data) || (result.bounds as { truncated?: unknown } | null)?.truncated !== false) return false;
+		const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every(item => typeof item === "string");
+		if (operation === "roots") {
+			if (!Array.isArray(data.roots) || data.roots.length === 0 || !data.roots.every(root => root && typeof root === "object" && typeof root.store === "string" && typeof root.path === "string" && root.path.startsWith("/") && Number.isInteger(root.device) && Number.isInteger(root.inode))) return false;
+		} else if (typeof data.path !== "string" || !data.path.startsWith("/") || typeof data.owned !== "boolean" || !strings(data.stores) || data.owned !== (data.stores.length > 0)) return false;
+	}
 	return result.contractVersion === MARKDOWN_DATASTORE_CONTRACT_VERSION
 		&& result.operation === operation
 		&& typeof result.store === "string"
@@ -85,7 +96,7 @@ function validResult(value: unknown, operation: MarkdownDatastoreRequest["operat
 export function createMarkdownDatastoreClient(
 	events: MarkdownDatastoreEventBus,
 	options: MarkdownDatastoreClientOptions = {},
-): MarkdownDatastoreServiceV1 {
+): MarkdownDatastoreServiceV1 & MarkdownDatastorePolicyV1 {
 	const timeoutMs = options.timeoutMs ?? DEFAULT_MARKDOWN_DATASTORE_CLIENT_TIMEOUT_MS;
 	if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 900_000) {
 		throw new RangeError("Markdown datastore client timeoutMs must be an integer from 1 to 900000");
@@ -94,6 +105,8 @@ export function createMarkdownDatastoreClient(
 	const now = options.now ?? Date.now;
 
 	const request = <T extends MarkdownDatastoreResult>(value: MarkdownDatastoreRequest, signal?: AbortSignal): Promise<T> => {
+		const policy = value.operation === "roots" || value.operation === "validateDestination";
+		if (policy && (options.capability?.policyVersion !== 1 || !options.capability.instanceId)) return Promise.reject(new MarkdownDatastoreClientError("CAPABILITY_UNAVAILABLE"));
 		if (signal?.aborted) return Promise.reject(new MarkdownDatastoreClientError("CANCELLED"));
 		const startedAt = now();
 		const deadline = startedAt + timeoutMs;
@@ -123,6 +136,7 @@ export function createMarkdownDatastoreClient(
 				contractVersion: MARKDOWN_DATASTORE_CONTRACT_VERSION,
 				requestId: createRequestId(),
 				request: value,
+				...(policy ? { instanceId: options.capability!.instanceId } : {}),
 				deadline,
 				signal: cancellation.signal,
 				resolve: (result) => finish(() => {
@@ -140,6 +154,8 @@ export function createMarkdownDatastoreClient(
 	};
 
 	return {
+		roots: (input, signal) => request<RootsResult>({ operation: "roots", input }, signal),
+		validateDestination: (input, signal) => request<DestinationResult>({ operation: "validateDestination", input }, signal),
 		search: (input: SearchInput, signal?: AbortSignal) => request<SearchResult>({ operation: "search", input }, signal),
 		find: (input: FindInput, signal?: AbortSignal) => request<FindResult>({ operation: "find", input }, signal),
 		read: (input: ReadInput, signal?: AbortSignal) => request<ReadResult>({ operation: "read", input }, signal),

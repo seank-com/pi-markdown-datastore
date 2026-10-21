@@ -192,6 +192,7 @@ export async function loadMarkdownDatastoreConfig(projectRootInput: string, conf
 		const rootInput = isAbsolute(configuredRoot) ? configuredRoot : resolve(projectRoot, configuredRoot);
 		const rootLstat = await lstat(rootInput).catch(() => { throw new DatastoreError("CONFIG_INVALID"); });
 		const root = await realpath(rootInput).catch(() => { throw new DatastoreError("CONFIG_INVALID"); });
+		if (rootLstat.isSymbolicLink() || root !== resolve(rootInput)) throw new DatastoreError("SYMLINK_REJECTED");
 		const rootStat = await stat(root).catch(() => { throw new DatastoreError("CONFIG_INVALID"); });
 		if (!rootStat.isDirectory() || canonicalRoots.has(root)) throw new DatastoreError("CONFIG_INVALID");
 		canonicalRoots.add(root);

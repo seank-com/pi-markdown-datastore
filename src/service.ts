@@ -1,11 +1,11 @@
-import { lstat } from "node:fs/promises";
 import type {
 	FindInput, FindResult, MarkdownDatastoreServiceV1, ReadInput, ReadResult, RefreshInput, RefreshResult,
 	ResultEnvelope, SearchHit, SearchInput, SearchResult, StatusInput, StatusResult,
+	RootsInput, RootsResult, DestinationInput, DestinationResult, MarkdownDatastorePolicyV1,
 } from "./contract.ts";
 import type { MarkdownDatastoreConfig, StoreConfig } from "./config.ts";
 import { HARD_MAX_RESULT_BYTES, HARD_MAX_RESULT_LINES } from "./config.ts";
-import { noteUriToRef, redactedRoot, safeOpenNote, validateRelativeNotePath } from "./containment.ts";
+import { assertRootIdentity, inspectDestination, ownsDestination, noteUriToRef, redactedRoot, safeOpenNote, validateRelativeNotePath } from "./containment.ts";
 import { ContinuationRegistry, type ContinuationDescriptor } from "./continuations.ts";
 import { DatastoreError, throwIfAborted } from "./errors.ts";
 import { boundedPage, contentWithoutSections, parseMarkdown, sectionText, selectSection, type SectionDescriptor } from "./markdown.ts";
@@ -20,7 +20,7 @@ function boundedArrays(first: unknown[], second: unknown[], firstKey: string, se
 	const text = JSON.stringify({ ...base, [firstKey]: selectedFirst, [secondKey]: selectedSecond }); return { first: selectedFirst, second: selectedSecond, text, returnedLines: Math.max(1, selectedFirst.length + selectedSecond.length), truncated };
 }
 
-export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1 {
+export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, MarkdownDatastorePolicyV1 {
 	readonly config: MarkdownDatastoreConfig;
 	readonly continuations: ContinuationRegistry;
 	readonly qmd?: QmdAdapter;
@@ -39,6 +39,33 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1 {
 	read(input: ReadInput, signal?: AbortSignal): Promise<ReadResult> { return this.runOperation(signal, (activeSignal) => this.readInner(input, activeSignal)); }
 	status(input: StatusInput, signal?: AbortSignal): Promise<StatusResult> { return this.runOperation(signal, (activeSignal) => this.statusInner(input, activeSignal)); }
 	refresh(input: RefreshInput, signal?: AbortSignal): Promise<RefreshResult> { return this.runOperation(signal, (activeSignal) => this.refreshInner(input, activeSignal)); }
+	roots(_input: RootsInput, signal?: AbortSignal): Promise<RootsResult> {
+		return this.runOperation(signal, async activeSignal => {
+			const started = Date.now();
+			const roots = await this.policyRoots(activeSignal);
+			return this.envelope("roots", "*", { roots }, started, JSON.stringify(roots));
+		});
+	}
+	validateDestination(input: DestinationInput, signal?: AbortSignal): Promise<DestinationResult> {
+		return this.runOperation(signal, async activeSignal => {
+			const started = Date.now();
+			await this.policyRoots(activeSignal);
+			const path = await inspectDestination(input.path, activeSignal);
+			const roots = await this.policyRoots(activeSignal);
+			const stores = roots.filter(root => ownsDestination(root.path, path)).map(root => root.store);
+			const data = { path, owned: stores.length > 0, stores };
+			return this.envelope("validateDestination", "*", data, started, JSON.stringify(data));
+		});
+	}
+	private async policyRoots(signal: AbortSignal) {
+		const roots = [];
+		for (const store of this.config.stores.values()) {
+			throwIfAborted(signal); await assertRootIdentity(store);
+			roots.push({ store: store.name, path: store.root, device: store.rootDev, inode: store.rootIno });
+		}
+		throwIfAborted(signal);
+		return roots;
+	}
 	private store(name: string | undefined): StoreConfig {
 		if (!name) throw new DatastoreError("STORE_UNKNOWN");
 		const store = this.config.stores.get(name);
@@ -222,7 +249,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1 {
 			if (!this.qmd) throw new DatastoreError("CAPABILITY_UNAVAILABLE"); const qmd = await this.qmd.startSemanticRefresh(stores); const data = { action: "start", mode, qmd, backgroundOwnership: "explicit-maintenance", durationMs: elapsed(started) }; return this.envelope("refresh", input.store ?? "*", data, started, JSON.stringify(data), false, undefined, [], [], undefined, 1) as RefreshResult;
 		}
 		if (mode === "lexical") { if (!this.qmd) throw new DatastoreError("CAPABILITY_UNAVAILABLE"); const qmd = await this.qmd.startLexicalRefresh(stores); const data = { action: "start", mode, qmd, backgroundOwnership: "explicit-maintenance", durationMs: elapsed(started) }; return this.envelope("refresh", input.store ?? "*", data, started, JSON.stringify(data), false, undefined, [], [], undefined, 1) as RefreshResult; }
-		const roots: Record<string, string> = {}; for (const store of stores) { const info = await lstat(store.root).catch(() => { throw new DatastoreError("STORE_UNAVAILABLE"); }); if (!info.isDirectory() || info.dev !== store.rootDev || info.ino !== store.rootIno) throw new DatastoreError("STORE_UNAVAILABLE"); roots[store.name] = "available"; }
+		const roots: Record<string, string> = {}; for (const store of stores) { await assertRootIdentity(store); roots[store.name] = "available"; }
 		const data = { action: "start", mode, roots, semantics: "bounded-root-revalidation-only", durationMs: elapsed(started) }; return this.envelope("refresh", input.store ?? "*", data, started, JSON.stringify(data), false, undefined, [], [], undefined, Math.max(1, Object.keys(roots).length)) as RefreshResult;
 	}
 	async shutdown(): Promise<void> {

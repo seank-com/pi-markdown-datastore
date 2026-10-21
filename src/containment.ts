@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, open, readdir, realpath, stat } from "node:fs/promises";
+import { lstat, open, readdir, realpath } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import type { NoteRef } from "./contract.ts";
 import type { StoreConfig } from "./config.ts";
@@ -60,13 +60,43 @@ function contained(root: string, target: string): boolean {
 	return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
+/** Revalidate the captured real directory, including aliases introduced in its ancestry. */
+export async function assertRootIdentity(store: StoreConfig): Promise<void> {
+	const info = await lstat(store.root).catch(() => { throw new DatastoreError("STORE_UNAVAILABLE"); });
+	const canonical = await realpath(store.root).catch(() => { throw new DatastoreError("STORE_UNAVAILABLE"); });
+	if (!info.isDirectory() || info.isSymbolicLink() || canonical !== store.root || info.dev !== store.rootDev || info.ino !== store.rootIno) throw new DatastoreError("STORE_UNAVAILABLE");
+}
+
+/** Inspect existing ancestry only. Missing suffixes are allowed; no filesystem state is created. */
+export async function inspectDestination(path: string, signal?: AbortSignal): Promise<string> {
+	if (typeof path !== "string" || !isAbsolute(path) || CONTROL.test(path) || path.includes("\\") || path.split(sep).some(part => part === "." || part === "..")) throw new DatastoreError("INVALID_NOTE_REF");
+	const target = resolve(path);
+	let walked: string = sep;
+	for (const part of target.split(sep).filter(Boolean)) {
+		throwIfAborted(signal);
+		walked = resolve(walked, part);
+		const info = await lstat(walked).catch((error: NodeJS.ErrnoException) => {
+			if (error.code === "ENOENT") return undefined;
+			throw new DatastoreError("UNSAFE_FILE_TYPE");
+		});
+		if (!info) break;
+		if (info.isSymbolicLink()) throw new DatastoreError("SYMLINK_REJECTED");
+		if (!info.isDirectory() && (walked !== target || !info.isFile() || info.nlink !== 1)) throw new DatastoreError("UNSAFE_FILE_TYPE");
+		const canonical = await realpath(walked).catch(() => { throw new DatastoreError("STORE_UNAVAILABLE"); });
+		// Case/Unicode aliases must not turn an owned destination into an outside result.
+		if (canonical !== walked) throw new DatastoreError("SYMLINK_REJECTED");
+	}
+	return target;
+}
+
+export function ownsDestination(root: string, target: string): boolean { return root === target || contained(root, target); }
+
 export async function safeOpenNote(store: StoreConfig, inputPath: string, signal?: AbortSignal): Promise<SafeNote> {
 	throwIfAborted(signal);
 	const path = validateRelativeNotePath(inputPath);
 	const target = resolve(store.root, ...path.split("/"));
 	if (!contained(store.root, target)) throw new DatastoreError("PATH_ESCAPE");
-	const rootNow = await stat(store.root).catch(() => { throw new DatastoreError("STORE_UNAVAILABLE"); });
-	if (!rootNow.isDirectory() || rootNow.dev !== store.rootDev || rootNow.ino !== store.rootIno) throw new DatastoreError("STORE_UNAVAILABLE");
+	await assertRootIdentity(store);
 	let walked = store.root;
 	let inspected;
 	for (const part of path.split("/")) {
@@ -111,7 +141,7 @@ export async function safeOpenNote(store: StoreConfig, inputPath: string, signal
 
 export async function safeInspectContainedFile(store: StoreConfig, inputPath: string, signal?: AbortSignal): Promise<{ file: { store: string; path: string }; size: number; mtime: string }> {
 	throwIfAborted(signal); const path = validateRelativeContainedPath(inputPath); const target = resolve(store.root, ...path.split("/")); if (!contained(store.root, target)) throw new DatastoreError("PATH_ESCAPE");
-	const rootNow = await stat(store.root).catch(() => { throw new DatastoreError("STORE_UNAVAILABLE"); }); if (!rootNow.isDirectory() || rootNow.dev !== store.rootDev || rootNow.ino !== store.rootIno) throw new DatastoreError("STORE_UNAVAILABLE");
+	await assertRootIdentity(store);
 	let walked = store.root; let inspected: Awaited<ReturnType<typeof lstat>> | undefined;
 	for (const part of path.split("/")) { throwIfAborted(signal); walked = resolve(walked, part); inspected = await lstat(walked).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") throw new DatastoreError("NOTE_NOT_FOUND"); throw new DatastoreError("UNSAFE_FILE_TYPE"); }); if (inspected.isSymbolicLink()) throw new DatastoreError("SYMLINK_REJECTED"); }
 	if (!inspected?.isFile() || inspected.nlink !== 1) throw new DatastoreError("UNSAFE_FILE_TYPE"); const handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
@@ -134,8 +164,7 @@ function selected(store: StoreConfig, path: string): boolean {
 }
 
 async function walkSafePaths(store: StoreConfig, visitor: (path: string, metadata: Awaited<ReturnType<typeof lstat>>) => void | Promise<void>, signal?: AbortSignal, onProgress?: () => void): Promise<void> {
-	const rootNow = await stat(store.root).catch(() => { throw new DatastoreError("STORE_UNAVAILABLE"); });
-	if (!rootNow.isDirectory() || rootNow.dev !== store.rootDev || rootNow.ino !== store.rootIno) throw new DatastoreError("STORE_UNAVAILABLE");
+	await assertRootIdentity(store);
 	const walk = async (directory: string, prefix: string): Promise<void> => {
 		throwIfAborted(signal);
 		const entries = await readdir(directory, { withFileTypes: true }); onProgress?.(); const componentNames = new Set<string>();
