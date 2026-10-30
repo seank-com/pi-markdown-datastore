@@ -142,7 +142,7 @@ export class QmdAdapter {
   const activeSignal = this.operationSignal(signal);
   while (true) { throwIfAborted(activeSignal); const job = this.#jobs.get(String(receipt.refreshId))!; if (job.state === "succeeded") return {generation:job.generation}; if (job.state === "failed" || job.state === "cancelled") throw new DatastoreError(job.errorCode as any ?? "BACKEND_FAILED"); await this.waitFor(new Promise(r=>setTimeout(r,10)),activeSignal); }
  }
- private async refreshInner(stores: StoreConfig[], semantic: boolean, signal?: AbortSignal, report?: (phase: QmdRefreshPhase, progress?: QmdWorkerProgress) => void): Promise<Record<string, unknown>> {
+ private async refreshInner(stores: StoreConfig[], semantic: boolean, signal?: AbortSignal, report?: (phase: QmdRefreshPhase, progress?: QmdWorkerProgress) => void): Promise<{ generation: string; reconciledStores: string[] }> {
   const activeSignal = this.operationSignal(signal); throwIfAborted(activeSignal);
   // Admission is synchronous before any await: already admitted semantic reads drain first.
   this.#refreshActive = true; this.#embeddingActive = semantic; this.#rebuilding = this.#needsRebuild; for (const store of stores) this.#runtimeLexicalCurrent.delete(store.name); report?.("scanning");
@@ -165,7 +165,7 @@ export class QmdAdapter {
    if (raw.status.needsEmbedding === 0 && raw.status.hasVectorIndex) this.#manifest.semanticAt=this.#manifest.generatedAt;
    this.#generation=`gen-${randomBytes(16).toString("hex")}`;
    await atomicJson(join(this.root,"reconciliation.json"),{...this.#manifest,generation:this.#generation});
-   return {generation:this.#generation,...raw};
+   return {generation:this.#generation,reconciledStores:stores.map(store=>store.name)};
   } catch(error) { this.#manifest=undefined; this.#runtimeLexicalCurrent.clear(); throw error; }
   finally { this.#refreshActive=false; this.#embeddingActive=false; this.#rebuilding=false; }
  }
@@ -217,7 +217,7 @@ export class QmdAdapter {
 			if (changedPhase || Date.now() - lastPersisted >= 1000) { lastPersisted = Date.now(); void this.persistJobs().catch(() => controller.abort(new DatastoreError("INDEX_CORRUPT"))); }
 		};
 		const operation = (async () => { await previous.catch(() => undefined); throwIfAborted(signal); return this.refreshInner(stores, job.mode === "semantic", signal, report); })(); this.#refreshTail = operation.then(() => undefined, () => undefined);
-		try { const result = await operation; job.state = "succeeded"; job.phase = "succeeded"; job.generation = String(result.generation); for (const store of stores) if (![...this.#jobs.values()].some(other => other.refreshId !== job.refreshId && ["queued", "running"].includes(other.state) && other.stores.includes(store.name))) this.#runtimeLexicalCurrent.add(store.name); if (job.mode === "lexical") { for (const store of stores) this.#semanticStores.add(store); this.#semanticBatch.schedule(); } }
+		try { const result = await operation; job.state = "succeeded"; job.phase = "succeeded"; job.generation = result.generation; for (const name of result.reconciledStores) if (![...this.#jobs.values()].some(other => other.refreshId !== job.refreshId && ["queued", "running"].includes(other.state) && other.stores.includes(name))) this.#runtimeLexicalCurrent.add(name); if (job.mode === "lexical") { for (const name of result.reconciledStores) this.#semanticStores.add(this.config.stores.get(name)!); this.#semanticBatch.schedule(); } }
 		catch (error) { const safe = error instanceof DatastoreError ? error : new DatastoreError("BACKEND_FAILED"); if (this.#lifecycle.signal.aborted && !controller.signal.aborted) { job.state = "queued"; job.phase = "queued"; delete job.errorCode; delete job.completedAt; } else { job.state = safe.code === "CANCELLED" ? "cancelled" : "failed"; job.phase = job.state; job.errorCode = safe.code; job.completedAt = new Date().toISOString(); } }
 		finally { job.updatedAt = new Date().toISOString(); if (["succeeded", "failed", "cancelled"].includes(job.state)) job.completedAt ??= job.updatedAt; this.#jobControllers.delete(job.refreshId); await this.persistJobs().catch(() => { job.state="failed"; job.phase="failed"; job.errorCode="INDEX_CORRUPT"; }); }
 	}

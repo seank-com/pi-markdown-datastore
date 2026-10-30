@@ -120,8 +120,15 @@ does not cancel shared maintenance; explicit cancellation owns that decision.
 The latest 20 job records are retained, subject to the active-job bound.
 A backend refresh failure marks the index for rebuild on the next explicit
 refresh: close both public stores, quarantine the entire opaque backend directory,
-and build a fresh index from all configured collections. Quarantine cleanup is
-an operator action with the service stopped. No live database files are copied.
+and build a fresh index from all configured collections. Successful recovery
+publishes freshness for every collection actually reconciled, not only the
+requested subset; a collection with another outstanding maintenance job remains
+unreconciled until that job completes successfully. Lexical recovery schedules
+semantic batching for its actual reconciled scope. Job keys and store lists
+retain the original requested scope, and failed receipts remain historical:
+per-store reconciliation currency can therefore be newer than its latest
+store-targeted receipt. Quarantine cleanup is an operator action with the service
+stopped. No live database files are copied.
 
 Omitted refresh mode defaults to `direct`: it only revalidates captured root
 identities, without scanning notes or updating indexes, and returns the bounded

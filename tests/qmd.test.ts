@@ -8,11 +8,12 @@ import { discoverQmdBinding, QmdAdapter, decodeQmdUri } from '../src/qmd-adapter
 import { MarkdownDatastoreService } from '../src/service.ts';
 import { createQmdFixture } from './fixtures/qmd-fixture.ts';
 import { datastoreChildEnvironment } from '../src/child-environment.ts';
-export async function fixture(t:any, real=false) {
+export async function fixture(t:any, real=false, shared=false) {
  const project=await realpath(await mkdtemp(join(tmpdir(),'datastore-public-')));const notes=join(project,'notes');const dir=join(project,'.pi','markdown-datastore');await mkdir(dir,{recursive:true,mode:0o700});await chmod(dir,0o700);await mkdir(notes);
  await writeFile(join(notes,'alpha.md'),'# Alpha\n\nCopper heron crosses the marsh.\r\n');
  const packageRoot=real?process.env.DATASTORE_QMD_PACKAGE!:await createQmdFixture(project);
- const configPath=join(dir,'config.json');await writeFile(configPath,JSON.stringify({schemaVersion:1,defaults:{maxResultBytes:8192,maxResultLines:100,operationTimeoutMs:3000},qmd:{enabled:true,installation:{packageRoot},minimumVersion:'2.8.3'},stores:{memory:{root:'notes',include:['**/*.md'],exclude:[],maxFileBytes:4096,search:{defaultMode:'lexical',qmdCollection:'memory'}}}}),{mode:0o600});
+ if(shared){await mkdir(join(project,'shared'));await writeFile(join(project,'shared','one.md'),'Copper shared fixture.\n');}
+ const configPath=join(dir,'config.json');await writeFile(configPath,JSON.stringify({schemaVersion:1,defaults:{maxResultBytes:8192,maxResultLines:100,operationTimeoutMs:3000},qmd:{enabled:true,installation:{packageRoot},minimumVersion:'2.8.3'},stores:{memory:{root:'notes',include:['**/*.md'],exclude:[],maxFileBytes:4096,search:{defaultMode:'lexical',qmdCollection:'memory'}},...(shared?{shared:{root:'shared',include:['**/*.md'],exclude:[],maxFileBytes:4096,search:{defaultMode:'lexical',qmdCollection:'shared'}}}:{})}}),{mode:0o600});
  const config=await loadMarkdownDatastoreConfig(project,configPath);const adapter=new QmdAdapter(config,await discoverQmdBinding(config));const service=new MarkdownDatastoreService(config,undefined,adapter);t.after(async()=>{await service.shutdown();await rm(project,{recursive:true,force:true});});return {project,notes,config,adapter,service,store:config.stores.get('memory')!};
 }
 async function waitJob(adapter:QmdAdapter,id:string) {for(let i=0;i<1000;i++){const j=adapter.activity().jobs.find(j=>j.refreshId===id);if(j&&['succeeded','failed','cancelled'].includes(j.state))return j;await new Promise(r=>setTimeout(r,10));}throw new Error('job timeout');}
@@ -66,6 +67,33 @@ test('recovery requeues interrupted jobs and requires fresh reconciliation',asyn
 
 test('corrupt derived data is quarantined as a closed directory and rebuilt from source',async t=>{
  const f=await fixture(t);await ready(f);await f.adapter.shutdown();await writeFile(join(f.adapter.root,'backend','index.sqlite'),'invalid',{mode:0o600});const a=new QmdAdapter(f.config,await discoverQmdBinding(f.config));t.after(()=>a.shutdown());let receipt=await a.startLexicalRefresh([f.store]);assert.equal((await waitJob(a,String(receipt.refreshId))).state,'failed');receipt=await a.startLexicalRefresh([f.store]);assert.equal((await waitJob(a,String(receipt.refreshId))).state,'succeeded');assert.equal((await a.search(f.store,'copper','lexical',5,undefined)).candidates.length,1);
+});
+
+test('cross-store recovery publishes actual rebuild freshness without erasing failure history',async t=>{
+ const f=await fixture(t,false,true),shared=f.config.stores.get('shared')!;
+ await f.adapter.refresh([...f.config.stores.values()],true);
+ await behavior(f,{updateError:true});
+ await assert.rejects(f.adapter.refresh([shared],true),{code:'BACKEND_FAILED'});
+ const failed=f.adapter.activity().jobs.find(j=>j.stores.includes('shared')&&j.state==='failed')!;
+ // A failed expanded recovery must not grant either store currency.
+ await behavior(f,{embedError:true});
+ await assert.rejects(f.adapter.refresh([f.store],true),{code:'BACKEND_FAILED'});
+ assert.equal(f.adapter.isLexicallyCurrent('memory'),false);
+ assert.equal(f.adapter.isLexicallyCurrent('shared'),false);
+ await behavior(f,{});
+ await writeFile(join(f.project,'shared','new.md'),'Copper new shared document after failure.\n');
+ await f.adapter.refresh([f.store],true);
+ const status=await f.adapter.status();assert.equal(status.pendingEmbeddings,0);
+ assert.equal((await f.adapter.search(shared,'copper','lexical',10,undefined)).candidates.length,2);
+ assert.equal(f.adapter.isLexicallyCurrent('shared'),true);
+ const result=await f.service.search({store:'shared',query:'copper',mode:'hybrid',freshness:'require-current-semantic'});
+ assert.equal(result.data.returned,2);assert.ok(result.data.hits.some(h=>h.path==='new.md'));
+ const reported=await f.service.status({store:'shared'});
+ assert.equal(reported.data.stores[0].sourceReconciliation.state,'succeeded');
+ assert.equal(reported.data.stores[0].sourceReconciliation.additionsMayBeAbsent,false);
+ assert.deepEqual(f.adapter.activity().jobs.find(j=>j.refreshId===failed.refreshId),failed);
+ // Requested scope/key stay intact; actual rebuild scope is internal publication data.
+ assert.deepEqual(f.adapter.activity().jobs[0].stores,['memory']);
 });
 
 test('maintenance waits for admitted semantic reads; new requests cannot cross admission gate',async t=>{
