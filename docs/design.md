@@ -154,6 +154,12 @@ supported policy API. No paths or write grant are returned by discovery. The
 query subscribes, emits, and unsubscribes synchronously. Missing services return
 immediately; malformed/incompatible or duplicate replies grant no capability.
 
+All five model-facing tools use object-root parameter schemas. Conditional
+`anyOf`/`oneOf` object branches explicitly declare their object type, including
+presence constraints inside `not`, so provider validators do not infer a
+non-object union. The read-view/continuation and refresh-action exclusions remain
+part of the schema and runtime validation.
+
 All five model-facing tools and the event responder register independently of
 configuration success. Configuration/backend construction occurs in
 `session_start` after project trust. Missing/invalid configuration disables

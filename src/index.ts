@@ -29,7 +29,7 @@ const Selector = Type.Union([
 ]);
 const ReadIdentity = { store: Type.Optional(Type.String()), note: Type.Optional(Note), uri: Type.Optional(Type.String()) };
 const ReadBounds = { maxBytes: Type.Optional(Type.Integer({ minimum: 4, maximum: HARD_MAX_RESULT_BYTES })), maxLines: Type.Optional(Type.Integer({ minimum: 1, maximum: HARD_MAX_RESULT_LINES })) };
-const forbidden = (...keys: string[]) => ({ not: { anyOf: keys.map((key) => ({ required: [key] })) } });
+const forbidden = (...keys: string[]) => ({ not: { type: "object", anyOf: keys.map((key) => ({ type: "object", required: [key] })) } });
 const PolicySchemas = {
 	roots: Type.Object({}, { additionalProperties: false }),
 	validateDestination: Type.Object({ path: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
@@ -48,10 +48,10 @@ const Schemas = {
 		},
 		additionalProperties: false,
 		anyOf: [
-			{ required: ["continuation"], ...forbidden("store", "note", "uri", "view", "includeFrontmatter", "excludeSections", "headingPath", "occurrence", "sectionHandle", "includeSemanticRelated", "maxBytes", "maxLines") },
-			{ properties: { view: { type: "string", enum: ["content"] } }, ...forbidden("continuation", "headingPath", "occurrence", "sectionHandle", "includeSemanticRelated") },
-			{ required: ["view"], properties: { view: { type: "string", enum: ["section"] } }, ...forbidden("continuation", "includeFrontmatter", "excludeSections", "includeSemanticRelated") },
-			{ required: ["view"], properties: { view: { type: "string", enum: ["outline"] } }, ...forbidden("continuation", "includeFrontmatter", "excludeSections", "headingPath", "occurrence", "sectionHandle", "includeSemanticRelated") },
+			{ type: "object", required: ["continuation"], ...forbidden("store", "note", "uri", "view", "includeFrontmatter", "excludeSections", "headingPath", "occurrence", "sectionHandle", "includeSemanticRelated", "maxBytes", "maxLines") },
+			{ type: "object", properties: { view: { type: "string", enum: ["content"] } }, ...forbidden("continuation", "headingPath", "occurrence", "sectionHandle", "includeSemanticRelated") },
+			{ type: "object", required: ["view"], properties: { view: { type: "string", enum: ["section"] } }, ...forbidden("continuation", "includeFrontmatter", "excludeSections", "includeSemanticRelated") },
+			{ type: "object", required: ["view"], properties: { view: { type: "string", enum: ["outline"] } }, ...forbidden("continuation", "includeFrontmatter", "excludeSections", "headingPath", "occurrence", "sectionHandle", "includeSemanticRelated") },
 		],
 	}),
 	status: Type.Object({ store: Type.Optional(Type.String()) }, { additionalProperties: false }),
@@ -65,8 +65,8 @@ const Schemas = {
 		},
 		additionalProperties: false,
 		anyOf: [
-			{ properties: { action: { type: "string", enum: ["start"] } }, not: { required: ["refreshId"] } },
-			{ required: ["action", "refreshId"], properties: { action: { type: "string", enum: ["cancel"] } }, not: { anyOf: [{ required: ["store"] }, { required: ["mode"] }] } },
+			{ type: "object", properties: { action: { type: "string", enum: ["start"] } }, not: { type: "object", required: ["refreshId"] } },
+			{ type: "object", required: ["action", "refreshId"], properties: { action: { type: "string", enum: ["cancel"] } }, not: { type: "object", anyOf: [{ type: "object", required: ["store"] }, { type: "object", required: ["mode"] }] } },
 		],
 	}),
 };
