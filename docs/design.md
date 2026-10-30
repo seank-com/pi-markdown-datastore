@@ -79,6 +79,13 @@ models; reopening retains native on-disk state. Search reuses this durable index
 qmd controls cache reuse, pruning and update invalidation. Explicit refresh may
 invalidate cached queries even if little source content changed.
 
+Worker IPC stream errors are contained within the datastore, including writes
+for requests, cancellation and shutdown. An unusable child is retired and the
+affected call settles once; its late events cannot affect a newer child or call.
+A failed operation is not replayed. A later independent call can open a new
+worker after retirement. Child liveness checks do not replace stream error
+handling because an idle exit can race with a write before exit events arrive.
+
 Maintenance admission closes semantic admission before dispatch and drains
 already admitted reads. During maintenance, independent lexical reads remain
 available. Hybrid falls back only for this known maintenance interval, with a
