@@ -48,12 +48,22 @@ export class QmdWorkerClient {
 	get busy(): boolean { return this.#pending !== undefined || this.#terminating; }
 	get processId(): number | undefined { return this.#child?.pid; }
 	private ensureChild(): ChildProcessWithoutNullStreams {
-		if (this.#closed) throw new DatastoreError("CANCELLED"); if (this.#terminating) throw new DatastoreError("BACKEND_FAILED"); if (this.#child) return this.#child;
+		if (this.#closed) throw new DatastoreError("CANCELLED"); if (this.#terminating) throw new DatastoreError("BACKEND_FAILED");
+		if (this.#child) {
+			const child = this.#child;
+			if (child.exitCode !== null || child.signalCode !== null || child.stdin.destroyed || !child.stdin.writable) { this.fail(new DatastoreError("BACKEND_FAILED"), true); throw new DatastoreError("BACKEND_FAILED"); }
+			return child;
+		}
 		const child = spawn(process.execPath, [WORKER_PATH, ...(this.idleExitMs === undefined ? [] : [`--idle-exit-ms=${this.idleExitMs}`])], { stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", env: datastoreChildEnvironment() }); this.#child = child; this.#stdout = Buffer.alloc(0); this.#stderrBytes = 0;
-		child.stdout.on("data", (chunk: Buffer) => this.consume(chunk));
-		child.stderr.on("data", (chunk: Buffer) => { this.#stderrBytes += chunk.length; if (this.#stderrBytes > MAX_MESSAGE_BYTES) this.fail(new DatastoreError("BACKEND_OUTPUT_INVALID"), true); });
-		child.on("error", () => this.fail(new DatastoreError("BACKEND_FAILED"), false));
-		child.on("close", () => { const error = this.#terminationError ?? new DatastoreError("BACKEND_FAILED"); if (this.#child === child) { this.#child = undefined; this.#terminating = false; this.#terminationError = undefined; } if (this.#pending) this.fail(error, false); });
+		const transportError = () => { if (this.#child === child) this.fail(new DatastoreError("BACKEND_FAILED"), true); };
+		// Socket errors are emitted separately from write callbacks, including on
+		// cancel/shutdown. Keep these listeners after retirement to consume late errors.
+		for (const stream of [child.stdin, child.stdout, child.stderr]) stream.on("error", transportError);
+		child.stdout.on("data", (chunk: Buffer) => { if (this.#child === child && !this.#terminating) this.consume(chunk); });
+		child.stderr.on("data", (chunk: Buffer) => { if (this.#child !== child) return; this.#stderrBytes += chunk.length; if (this.#stderrBytes > MAX_MESSAGE_BYTES) this.fail(new DatastoreError("BACKEND_OUTPUT_INVALID"), true); });
+		child.on("error", transportError);
+		child.on("exit", () => { if (this.#child === child) { this.#terminating = true; this.#terminationError ??= new DatastoreError("BACKEND_FAILED"); } });
+		child.on("close", () => { if (this.#child !== child) return; const error = this.#terminationError ?? new DatastoreError("BACKEND_FAILED"); this.#child = undefined; this.#terminating = false; this.#terminationError = undefined; this.settle(error); });
 		return child;
 	}
 	private consume(chunk: Buffer): void {
@@ -73,12 +83,12 @@ export class QmdWorkerClient {
 
 	request(request: QmdWorkerRequest, options: { signal?: AbortSignal; progressive?: boolean; onProgress?: (progress: QmdWorkerProgress) => void } = {}): Promise<any> {
 		throwIfAborted(options.signal); if (this.#pending) return Promise.reject(new DatastoreError("BACKEND_FAILED")); const child = this.ensureChild(); const id = randomBytes(16).toString("hex");
-		return new Promise((resolve, reject) => { const abort = () => this.cancel(abortError(options.signal)); const pending: Pending = { id, operation: request.operation, progressive: options.progressive === true, resolve, reject, signal: options.signal, abort, onProgress: options.onProgress }; this.#stderrBytes = 0; this.#pending = pending; options.signal?.addEventListener("abort", abort, { once: true }); pending.startupTimer = setTimeout(() => this.fail(new DatastoreError("TIMEOUT"), true), this.timeoutMs); const frame = Buffer.from(`${JSON.stringify({ ...request, id })}\n`); if (frame.length > MAX_MESSAGE_BYTES) { this.fail(new DatastoreError("BACKEND_OUTPUT_INVALID"), true); return; } child.stdin.write(frame, (error) => { if (error) this.fail(new DatastoreError("BACKEND_FAILED"), false); }); });
+		return new Promise((resolve, reject) => { const abort = () => this.cancel(abortError(options.signal)); const pending: Pending = { id, operation: request.operation, progressive: options.progressive === true, resolve, reject, signal: options.signal, abort, onProgress: options.onProgress }; this.#stderrBytes = 0; this.#pending = pending; options.signal?.addEventListener("abort", abort, { once: true }); pending.startupTimer = setTimeout(() => this.fail(new DatastoreError("TIMEOUT"), true), this.timeoutMs); const frame = Buffer.from(`${JSON.stringify({ ...request, id })}\n`); if (frame.length > MAX_MESSAGE_BYTES) { this.fail(new DatastoreError("BACKEND_OUTPUT_INVALID"), true); return; } try { child.stdin.write(frame, (error) => { if (error && this.#child === child && this.#pending === pending) this.fail(new DatastoreError("BACKEND_FAILED"), true); }); } catch { this.fail(new DatastoreError("BACKEND_FAILED"), true); } });
 	}
 	private clear(pending: Pending): void { if (pending.startupTimer) clearTimeout(pending.startupTimer); pending.signal?.removeEventListener("abort", pending.abort); }
 	private settle(error?: DatastoreError, value?: unknown): void { const pending = this.#pending; if (!pending) return; this.#pending = undefined; this.clear(pending); error ? pending.reject(error) : pending.resolve(value); }
-	private fail(error: DatastoreError, terminate: boolean): void { if (!terminate) { this.settle(error); return; } this.#terminating = true; this.#terminationError = error; this.terminate(); }
-	private cancel(error: DatastoreError): void { const child = this.#child; const pending = this.#pending; if (!child || !pending) { this.settle(error); return; } this.#terminating = true; this.#terminationError = error; try { child.stdin.write(`${JSON.stringify({ version: 2, id: pending.id, type: "cancel" })}\n`); } catch {} const term = setTimeout(() => { try { process.kill(process.platform === "win32" ? child.pid! : -child.pid!, "SIGTERM"); } catch {} }, CANCEL_GRACE_MS); const kill = setTimeout(() => { if (this.#child === child) try { process.kill(process.platform === "win32" ? child.pid! : -child.pid!, "SIGKILL"); } catch {} }, KILL_GRACE_MS); term.unref(); kill.unref(); }
+	private fail(error: DatastoreError, terminate: boolean): void { if (!terminate) { this.settle(error); return; } this.#terminating = true; this.#terminationError ??= error; this.terminate(); }
+	private cancel(error: DatastoreError): void { const child = this.#child; const pending = this.#pending; if (!child || !pending) { this.settle(error); return; } this.#terminating = true; this.#terminationError = error; try { child.stdin.write(`${JSON.stringify({ version: 2, id: pending.id, type: "cancel" })}\n`); } catch {} const term = setTimeout(() => { if (this.#child === child) try { process.kill(process.platform === "win32" ? child.pid! : -child.pid!, "SIGTERM"); } catch {} }, CANCEL_GRACE_MS); const kill = setTimeout(() => { if (this.#child === child) try { process.kill(process.platform === "win32" ? child.pid! : -child.pid!, "SIGKILL"); } catch {} }, KILL_GRACE_MS); term.unref(); kill.unref(); child.once("close", () => { clearTimeout(term); clearTimeout(kill); }); }
 	private terminate(): void { const child = this.#child; if (!child) return; try { process.kill(process.platform === "win32" ? child.pid! : -child.pid!, "SIGKILL"); } catch { try { child.kill("SIGKILL"); } catch {} } }
 	async shutdown(): Promise<void> { if (this.#closed) return; this.#closed = true; if (this.#pending) this.cancel(new DatastoreError("CANCELLED")); const child = this.#child; if (!child) return; await new Promise<void>((resolve) => { const timer = setTimeout(() => { this.terminate(); }, KILL_GRACE_MS); child.once("close", () => { clearTimeout(timer); resolve(); }); try { child.stdin.write(`${JSON.stringify({ version: 2, type: "shutdown" })}\n`); } catch { this.terminate(); } }); }
 }

@@ -90,6 +90,29 @@ test("trusted valid configuration registers exactly five strict tools", async (t
 	assert.ok(app.entries.every((entry) => !JSON.stringify(entry).includes("one.md") && !JSON.stringify(entry).includes("Body")));
 });
 
+test("conditional read/refresh schemas explicitly declare object branches without changing valid inputs", () => {
+	const app = harness("/synthetic-schema-project");
+	createMarkdownDatastoreExtension({ projectRoot: "/synthetic-schema-project" })(app.pi);
+	const visit = (schema: any) => {
+		if (!schema || typeof schema !== "object") return;
+		for (const keyword of ["anyOf", "oneOf"]) {
+			for (const branch of schema[keyword] ?? []) {
+				assert.equal(branch.type, "object", `${keyword} branch must explicitly be an object for xAI`);
+				visit(branch);
+			}
+		}
+		if (schema.not) visit(schema.not);
+	};
+	for (const tool of app.tools) visit(tool.parameters);
+	const read = app.tools.find(tool => tool.name === "datastore_read").parameters;
+	const refresh = app.tools.find(tool => tool.name === "datastore_refresh").parameters;
+	for (const input of [{}, { note: { store: "memory", path: "one.md" } }, { continuation: "opaque" }, { view: "section", headingPath: ["Heading"] }, { view: "outline" }]) assert.equal(Check(read, input), true);
+	for (const input of [null, [], "text", { continuation: "opaque", store: "memory" }, { continuation: "opaque", maxLines: 10 }, { view: "content", headingPath: ["Heading"] }, { view: "section", includeFrontmatter: true }, { view: "outline", sectionHandle: "opaque" }, { unknown: true }]) assert.equal(Check(read, input), false);
+	const refreshId = "a".repeat(32);
+	for (const input of [{}, { action: "start", store: "memory", mode: "lexical" }, { action: "cancel", refreshId }]) assert.equal(Check(refresh, input), true);
+	for (const input of [null, [], "text", { refreshId }, { action: "start", refreshId }, { action: "cancel" }, { action: "cancel", refreshId, store: "memory" }, { action: "cancel", refreshId, mode: "semantic" }]) assert.equal(Check(refresh, input), false);
+});
+
 test("refresh end metrics include only structural counts and backend state", async (t) => {
 	const current = await fixture(t); const app = harness(current.project); createMarkdownDatastoreExtension({ projectRoot: current.project, configPath: current.configPath })(app.pi); await app.fire("session_start"); const refresh = app.tools.find((tool) => tool.name === "datastore_refresh"); await refresh.execute("id", { store: "memory", mode: "direct" }, new AbortController().signal); const metric = app.entries.filter((entry) => entry.type === "markdown-datastore-operation" && entry.data.phase === "end").at(-1).data; assert.equal(metric.refreshCount, 1); assert.equal(metric.returnedCount, 1); assert.deepEqual(metric.backendSelection, ["filesystem"]); assert.deepEqual(metric.warningCodes, []); assert.equal(metric.outputSchema, "valid"); assert.ok(metric.returnedBytes <= metric.maxBytes); assert.ok(metric.returnedLines <= metric.maxLines); assert.ok(!JSON.stringify(metric).includes("one.md") && !JSON.stringify(metric).includes("Body"));
 });

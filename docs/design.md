@@ -79,6 +79,13 @@ models; reopening retains native on-disk state. Search reuses this durable index
 qmd controls cache reuse, pruning and update invalidation. Explicit refresh may
 invalidate cached queries even if little source content changed.
 
+Worker IPC stream errors are contained within the datastore, including writes
+for requests, cancellation and shutdown. An unusable child is retired and the
+affected call settles once; its late events cannot affect a newer child or call.
+A failed operation is not replayed. A later independent call can open a new
+worker after retirement. Child liveness checks do not replace stream error
+handling because an idle exit can race with a write before exit events arrive.
+
 Maintenance admission closes semantic admission before dispatch and drains
 already admitted reads. During maintenance, independent lexical reads remain
 available. Hybrid falls back only for this known maintenance interval, with a
@@ -120,8 +127,15 @@ does not cancel shared maintenance; explicit cancellation owns that decision.
 The latest 20 job records are retained, subject to the active-job bound.
 A backend refresh failure marks the index for rebuild on the next explicit
 refresh: close both public stores, quarantine the entire opaque backend directory,
-and build a fresh index from all configured collections. Quarantine cleanup is
-an operator action with the service stopped. No live database files are copied.
+and build a fresh index from all configured collections. Successful recovery
+publishes freshness for every collection actually reconciled, not only the
+requested subset; a collection with another outstanding maintenance job remains
+unreconciled until that job completes successfully. Lexical recovery schedules
+semantic batching for its actual reconciled scope. Job keys and store lists
+retain the original requested scope, and failed receipts remain historical:
+per-store reconciliation currency can therefore be newer than its latest
+store-targeted receipt. Quarantine cleanup is an operator action with the service
+stopped. No live database files are copied.
 
 Omitted refresh mode defaults to `direct`: it only revalidates captured root
 identities, without scanning notes or updating indexes, and returns the bounded
@@ -153,6 +167,12 @@ configured store names, and optional `policyVersion: 1` plus `instanceId` for th
 supported policy API. No paths or write grant are returned by discovery. The
 query subscribes, emits, and unsubscribes synchronously. Missing services return
 immediately; malformed/incompatible or duplicate replies grant no capability.
+
+All five model-facing tools use object-root parameter schemas. Conditional
+`anyOf`/`oneOf` object branches explicitly declare their object type, including
+presence constraints inside `not`, so provider validators do not infer a
+non-object union. The read-view/continuation and refresh-action exclusions remain
+part of the schema and runtime validation.
 
 All five model-facing tools and the event responder register independently of
 configuration success. Configuration/backend construction occurs in
