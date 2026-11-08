@@ -1,6 +1,7 @@
 // Refuses commits and pushes that contain private terms or local secret values.
 // Terms come from ~/.pii (one per line, matched case-insensitively) and secret
-// values from ~/.env (KEY=value lines, matched exactly). Missing files are
+// values from ~/.env credential names containing TOKEN, API_KEY or PASSWORD
+// (nonempty KEY=value assignments, matched exactly). Missing files are
 // skipped, so the check passes trivially where neither exists, such as CI.
 // By default it checks lines added in staged changes; --all checks every
 // staged file, --message a commit message, and --range commits being pushed.
@@ -20,8 +21,8 @@ export interface Finding {
 	label: string;
 }
 
-/** Shorter secret values (flags, ports, booleans) would match ordinary text. */
-export const MIN_SECRET_LENGTH = 8;
+// Match the case-sensitive credential-name rule used by provider egress.
+const CREDENTIAL_KEY_FRAGMENTS = ["TOKEN", "API_KEY", "PASSWORD"] as const;
 
 export function parsePrivateTerms(text: string, source: string): PrivateTerm[] {
 	const terms: PrivateTerm[] = [];
@@ -36,10 +37,10 @@ export function parseSecretValues(text: string, source: string): PrivateTerm[] {
 	const terms: PrivateTerm[] = [];
 	for (const raw of text.split(/\r?\n/)) {
 		const match = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$/.exec(raw);
-		if (!match) continue;
+		if (!match || !CREDENTIAL_KEY_FRAGMENTS.some(fragment => match[1]!.includes(fragment))) continue;
 		let value = match[2]!.trim();
 		if (value.length >= 2 && (value[0] === "\"" || value[0] === "'") && value.at(-1) === value[0]) value = value.slice(1, -1);
-		if (value.length >= MIN_SECRET_LENGTH) terms.push({ value, label: `${source} ${match[1]}`, caseInsensitive: false });
+		if (value.length > 0) terms.push({ value, label: `${source} ${match[1]}`, caseInsensitive: false });
 	}
 	return terms;
 }

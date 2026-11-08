@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 
-import { findPrivateTerms, MIN_SECRET_LENGTH, parsePrivateTerms, parseSecretValues } from "../scripts/check-private-terms.ts";
+import { findPrivateTerms, parsePrivateTerms, parseSecretValues } from "../scripts/check-private-terms.ts";
 
 test("private terms skip blanks and comments and match case-insensitively", () => {
 	const terms = parsePrivateTerms("Example Person\n\n# comment\n  example_bot  \n", "terms");
@@ -16,11 +16,10 @@ test("private terms skip blanks and comments and match case-insensitively", () =
 	]);
 });
 
-test("secret values parse env lines, strip quotes and ignore short values", () => {
+test("secret values select credential names, strip quotes and include short nonempty values", () => {
 	const secret = "s3cret-value-123";
-	const terms = parseSecretValues(`# note\nexport API_TOKEN="${secret}"\nPORT=7351\nFLAG=true\nOTHER='${secret}x'\nnot a line\n`, "env");
-	assert.deepEqual(terms.map((term) => [term.label, term.value]), [["env API_TOKEN", secret], ["env OTHER", `${secret}x`]]);
-	assert.ok(terms.every((term) => term.value.length >= MIN_SECRET_LENGTH));
+	const terms = parseSecretValues(`# note\nexport API_TOKEN="${secret}"\nPORT=7351\nFLAG=true\nOTHER='${secret}x'\nDB_PASSWORD='q7!'\nSERVICE_API_KEY=x\nTOKEN_COUNT=0\nEMPTY_TOKEN=\nBLANK_PASSWORD=''\nlower_token=${secret}lower\nnot a line\n`, "env");
+	assert.deepEqual(terms.map((term) => [term.label, term.value]), [["env API_TOKEN", secret], ["env DB_PASSWORD", "q7!"], ["env SERVICE_API_KEY", "x"], ["env TOKEN_COUNT", "0"]]);
 	assert.deepEqual(findPrivateTerms(`token ${secret.toUpperCase()}`, terms, "f"), [], "secrets match exactly");
 	assert.equal(findPrivateTerms(`token ${secret}`, terms, "f").length, 1);
 });
@@ -33,7 +32,7 @@ test("hooks refuse private terms in staged files, messages and pushes", () => {
 		const termsFile = join(root, "terms");
 		const secretsFile = join(root, "secrets");
 		writeFileSync(termsFile, "Example Person\n");
-		writeFileSync(secretsFile, "API_TOKEN=s3cret-value-123\n");
+		writeFileSync(secretsFile, "API_TOKEN=s3cret-value-123\nAPP_PASSWORD=q7!\n");
 		const env = { ...process.env, PRIVATE_TERMS_FILE: termsFile, PRIVATE_SECRETS_FILE: secretsFile, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
 		const run = (...args: string[]) => spawnSync("git", args, { cwd: repo, env, encoding: "utf8" });
 		const ok = (...args: string[]) => { const result = run(...args); assert.equal(result.status, 0, result.stderr); };
@@ -68,6 +67,14 @@ test("hooks refuse private terms in staged files, messages and pushes", () => {
 		assert.notEqual(staged.status, 0);
 		assert.match(staged.stderr, /leak\.md:2: matches .*terms line 1/);
 		ok("rm", "-q", "--cached", "leak.md");
+
+		writeFileSync(join(repo, "short.md"), "q7!\n");
+		ok("add", "short.md");
+		const short = run("commit", "-q", "-m", "Short credential");
+		assert.notEqual(short.status, 0);
+		assert.match(short.stderr, /short\.md:1: matches .*secrets APP_PASSWORD/);
+		assert.doesNotMatch(short.stderr, /q7!/, "short secret values are never printed");
+		ok("rm", "-q", "--cached", "short.md");
 
 		const message = run("commit", "-q", "--allow-empty", "-m", "Uses s3cret-value-123");
 		assert.notEqual(message.status, 0);
