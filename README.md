@@ -92,8 +92,10 @@ PI_CODING_AGENT_PACKAGE=/path/to/pi-coding-agent npm run test:package
 To keep private terms and secrets out of commits, run `npm run hooks:install`
 once per clone. Commits and pushes are then refused when an added line or a
 commit message contains a line of `~/.pii` (one term per line, matched
-case-insensitively; `#` lines are comments) or a value of 8 or more characters
-from `~/.env`. `PRIVATE_TERMS_FILE` and `PRIVATE_SECRETS_FILE` select other
+case-insensitively; `#` lines are comments) or a nonempty credential value
+from `~/.env`. Credential names must contain case-sensitive `TOKEN`, `API_KEY`,
+or `PASSWORD`; there is no minimum value length. Private-term matching is
+unchanged. `PRIVATE_TERMS_FILE` and `PRIVATE_SECRETS_FILE` select other
 files. `npm run check:private -- --all` checks every staged file, including
 unchanged ones.
 
