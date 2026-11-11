@@ -62,6 +62,26 @@ expire after 15 minutes, and live in a bounded 256-entry registry. Snippets use
 current body paragraphs, exclude frontmatter, and obey 1024-byte/30-line and
 aggregate limits. They do not interpret backend chunk offsets.
 
+## Restrictions register
+
+Review in every PR against implementation, tests and dependency behavior. The
+following are effective constraints, not approval of their values. Unless stated,
+explicit numeric/policy approval and supporting necessity evidence remain to be
+mapped. Configuration owners are component maintainers for fixed values, project
+configuration for exposed settings, and test maintainers for fixtures. Surface
+additional encountered restrictions rather than assuming this list is exhaustive.
+
+| Restriction | Why (what failure does it prevent) |
+| --- | --- |
+| Config64KiB/mode0600 and canonical configured root/file identity, link, type and UTF-8 checks. Locations: `src/config.ts`, source access helpers. | Enforces the described namespace/configuration authority contract while keeping source unchanged. Specific mode/path-exclusion approval references remain unestablished; same-account processes are not new hostile principals. |
+| Result32768 bytes/800 lines, file10MiB, search20, backend candidates500, outline100; snippet1024 bytes/30 lines; continuation registry256 entries/15 minutes. Locations: configuration, search/read and continuation code; exposed settings cannot exceed hard maxima. | Bounds what the API returns or retains and can truncate/reject valid content. Specific numeric rationale and approval are not established by existing implementation or this table. |
+| Configured reader operation timeout100-60000ms; service ceiling900000ms; client default900000ms and allowed1-900000ms; maintenance update/embed35 minutes. Locations: config, service, client and qmd lifecycle code. | Aborts work under different queue/execution scopes described below. These are our chosen envelopes, not automatic approval from qmd/Pi. Numeric approval remains missing; a durable refresh receipt is not completed maintenance. |
+| Two supervised workers, serial maintenance, maintenance semantic-admission drain; idle exit5 minutes with injected range25-300000ms; automatic semantic batching5 minutes. Locations: qmd adapter/worker clients. | Implements the described coordination/model-release behavior. Concurrency, cadence and idle values require explicit approval evidence, not inference from dependency defaults. |
+| Worker IPC/stdout/stderr1MiB, cancellation TERM100ms/KILL250ms. Location: `src/qmd-worker-client.ts`. | Rejects oversized frames and terminates uncancellable native operations. Specific caps/escalation values' necessity and approval are not established. |
+| Metadata preflight100000 documents/512MiB; latest20 job records subject to active-job bound. Location: `src/qmd-adapter.ts` and maintenance state. | Limits scan/admission metadata and retained receipts, not transactional index correctness. Numeric rationale/approval remain unestablished. |
+| Default test child300000ms; package outer60000ms/subprocess30000ms; facade cases5000ms; worker/CLI subprocess10000ms and CLI capture1MiB; opt-in native cases90000/180000ms. Locations: `scripts/test.ts`, package/facade/qmd/worker/CLI tests. | Functional qualification can fail solely because a host/backend is slow or verbose. Fixture/opt-in status and green tests do not establish owner approval for these budgets. |
+| README publication registry rules and main-history exclusion; scanner capture256MiB. Location: `.githooks/`, `scripts/check-private-terms.ts`. | Approved PR#13 exclusion prevents published main history blocking clean updates; feature checks remain. The separate capture cap's necessity/approval is not established; registry paths remain configurable. |
+
 ## Public qmd lifecycle
 
 The qualified release is exactly `@tobilu/qmd` 2.8.3. The package's public export
