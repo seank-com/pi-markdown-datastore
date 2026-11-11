@@ -83,6 +83,7 @@ additional encountered restrictions rather than assuming this list is exhaustive
 | Publication content matching uses the README registry rules. Location: `scripts/check-private-terms.ts`; registry paths are configurable with `PRIVATE_TERMS_FILE`/`PRIVATE_SECRETS_FILE`. | Rejects matching private terms and credential values; matching-policy evidence is distinct from the revision-range correction and output cap. |
 | Existing-branch publication scans exclude `origin/main` ancestry; new branches exclude known remote history. Location: `.githooks/pre-push`. | Approved correction in PR #13 prevents published main history from blocking clean updates; feature checks remain. |
 | Publication scanner Git-output capture is 256 MiB. Location: `scripts/check-private-terms.ts`; fixed by scanner maintainers. | Can reject large captured Git output. Specific necessity/approval is not established by the registry or revision-selection rules. |
+| Shared index socket is current-user-owned and not a network listener. Location: `src/shared-ipc.ts`. The service hosts `QmdAdapter`; it adds no transport deadline or frame cap. | Keeps shared index ownership in the operator-started service. Existing reader, maintenance and result limits still apply inside that adapter. Reuse does not approve them. |
 
 ## Public qmd lifecycle
 
@@ -169,6 +170,16 @@ Automatic semantic batching waits five minutes after lexical refresh without pos
 or fully embedded ticks do not update. Failed embedding jobs remain failed until
 an explicit retry; there is no automatic infinite retry of a bad document.
 Broader automatic lexical indexing cadence is not enabled.
+
+## Shared datastores
+
+A project store is either private or an explicit reference to a shared catalog entry. The reference selects a canonical store id. It does not create an index, and the local alias is not a second definition. Same path is not identity. Direct find, read, outline and root policy stay in the project against the resolved source root.
+
+Indexed search, refresh, status and job cancellation for a shared store go to one foreground local service. That service hosts the same `QmdAdapter` used for a private store, one adapter and one derived index per canonical shared datastore. The project does not keep a second coordinator or a private replacement index for that store. If the service is unavailable, shared indexed operations fail and direct reads continue.
+
+The service is started by an operator with `--catalog`. Projects connect to its configured owner-only socket. They do not launch it, install a LaunchAgent, or become its owner. Closing a project closes that client's waiters. It does not cancel an accepted shared job or rebuild the index. Restarting the service creates a new generation. A request bound to the previous generation or a different definition revision fails instead of being retargeted.
+
+Private stores keep project-hosted maintenance. That is the same adapter class, not a second algorithm. A future links-and-tags index is not part of this path.
 
 ## Integration lifecycle and packaging
 

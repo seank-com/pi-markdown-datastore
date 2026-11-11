@@ -15,6 +15,7 @@ import { HARD_MAX_RESULT_BYTES, HARD_MAX_RESULT_LINES, loadMarkdownDatastoreConf
 import { DatastoreError, datastoreError } from "./errors.ts";
 import { discoverQmdBinding, QmdAdapter } from "./qmd-adapter.ts";
 import { MarkdownDatastoreService } from "./service.ts";
+import { SharedIndexClient } from "./shared-client.ts";
 
 export interface MarkdownDatastoreExtensionOptions {
 	projectRoot?: string; configPath?: string;
@@ -207,11 +208,13 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 			if (!ctx.isProjectTrusted()) { unavailable = new DatastoreError("PROJECT_UNTRUSTED"); ctx.ui.setStatus("markdown-datastore", "datastore: disabled (project untrusted)"); return; }
 			let config; try { config = await loadMarkdownDatastoreConfig(projectRoot, configPath); } catch (error) { if (generation !== ownGeneration) return; unavailable = datastoreError(error, "CONFIG_INVALID"); ctx.ui.setStatus("markdown-datastore", `datastore: disabled (${unavailable.code})`); return; }
 			if (generation !== ownGeneration) return;
+			const privateStores = [...config.stores.values()].filter((store) => !store.shared);
 			let qmd: QmdAdapter | undefined;
-			if (config.qmd.enabled) try { qmd = await (options.createQmd ?? createQmd)(config); } catch {}
-			if (generation !== ownGeneration) { await Promise.allSettled([qmd?.shutdown()].filter((operation): operation is Promise<void> => operation !== undefined)); return; }
-			service = new MarkdownDatastoreService(config, undefined, qmd);
-			if (qmd) void qmd.startupReconcile([...config.stores.values()]).catch(() => undefined);
+			if (config.qmd.enabled && privateStores.length) try { qmd = await (options.createQmd ?? createQmd)({ ...config, stores: new Map(privateStores.map((store) => [store.name, store])) }); } catch {}
+			const sharedClients = new Map([...config.stores.values()].filter((store) => store.shared).map((store) => [store.name, new SharedIndexClient(store.shared!)]));
+			if (generation !== ownGeneration) { await Promise.allSettled([qmd?.shutdown(), ...[...sharedClients.values()].map((client) => client.shutdown())].filter((operation): operation is Promise<void> => operation !== undefined)); return; }
+			service = new MarkdownDatastoreService(config, undefined, qmd, sharedClients);
+			if (qmd) void qmd.startupReconcile(privateStores).catch(() => undefined);
 			ctx.ui.setStatus("markdown-datastore", "datastore: ready");
 		});
 		pi.on("session_shutdown", async (_event, ctx) => { generation += 1; removeRpc(); capabilityUnsubscribe?.(); capabilityUnsubscribe = undefined; const current = service; service = undefined; await current?.shutdown(); ctx.ui.setStatus("markdown-datastore", undefined); });

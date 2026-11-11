@@ -10,6 +10,7 @@ import { ContinuationRegistry, type ContinuationDescriptor } from "./continuatio
 import { DatastoreError, throwIfAborted } from "./errors.ts";
 import { boundedPage, contentWithoutSections, parseMarkdown, sectionText, selectSection, type SectionDescriptor } from "./markdown.ts";
 import type { QmdAdapter, QmdCandidate } from "./qmd-adapter.ts";
+import { SharedIndexClient } from "./shared-client.ts";
 
 function elapsed(started: number): number { return Math.max(0, Date.now() - started); }
 function propagateControlError(error: unknown): void { if (error instanceof DatastoreError && (error.code === "CANCELLED" || error.code === "TIMEOUT")) throw error; }
@@ -24,8 +25,9 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 	readonly config: MarkdownDatastoreConfig;
 	readonly continuations: ContinuationRegistry;
 	readonly qmd?: QmdAdapter;
+	readonly sharedClients?: ReadonlyMap<string, SharedIndexClient>;
 	#lifecycle = new AbortController(); #active = new Set<Promise<unknown>>(); #closed = false;
-	constructor(config: MarkdownDatastoreConfig, continuations = new ContinuationRegistry(), qmd?: QmdAdapter) { this.config = config; this.continuations = continuations; this.qmd = qmd; }
+	constructor(config: MarkdownDatastoreConfig, continuations = new ContinuationRegistry(), qmd?: QmdAdapter, sharedClients?: ReadonlyMap<string, SharedIndexClient>) { this.config = config; this.continuations = continuations; this.qmd = qmd; this.sharedClients = sharedClients; }
 	private runOperation<T>(signal: AbortSignal | undefined, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
 		if (this.#closed) return Promise.reject(new DatastoreError("CANCELLED"));
 		const deadline = new AbortController();
@@ -86,16 +88,21 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 	}
 	private async searchInner(input: SearchInput, signal: AbortSignal): Promise<SearchResult> {
 		const started = Date.now(); throwIfAborted(signal); const store = this.store(input.store);
-		if (!this.qmd) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
+		const shared = store.shared ? this.sharedClients?.get(store.name) : undefined;
+		if (store.shared && !shared) throw new DatastoreError("STORE_UNAVAILABLE");
+		if (!shared && !this.qmd) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
+		if (shared) return this.searchShared(store, shared, input, signal, started);
+		const qmd = this.qmd;
+		if (!qmd) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
 		if (typeof input.query !== "string" || !input.query.trim() || Buffer.byteLength(input.query) > 4096) throw new DatastoreError("BACKEND_OUTPUT_INVALID");
 		const mode = input.mode ?? store.search.defaultMode; const limit = input.limit ?? 5;
 		if (input.minScore !== undefined && !Number.isFinite(input.minScore)) throw new DatastoreError("INVALID_NOTE_REF");
 		if (!Number.isInteger(limit) || limit < 1 || limit > 20 || !["lexical", "semantic", "hybrid"].includes(mode)) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
 		const freshness = input.freshness ?? "allow-stale";
-		if (mode === "semantic" && this.qmd.activity?.().embeddingActive) throw new DatastoreError("SEMANTIC_UNAVAILABLE", { retryable: true, requestedMode: mode });
-		if (freshness !== "allow-stale" && !this.qmd.isLexicallyCurrent(store.name)) throw new DatastoreError("STALE_INDEX");
+		if (mode === "semantic" && qmd.activity?.().embeddingActive) throw new DatastoreError("SEMANTIC_UNAVAILABLE", { retryable: true, requestedMode: mode });
+		if (freshness !== "allow-stale" && !qmd.isLexicallyCurrent(store.name)) throw new DatastoreError("STALE_INDEX");
 		{
-			const backend = await this.qmd.search(store, input.query, mode, Math.min(500, Math.max(limit * 4, limit)), input.minScore, signal);
+			const backend = await qmd.search(store, input.query, mode, Math.min(500, Math.max(limit * 4, limit)), input.minScore, signal);
 			if ((backend.effectiveMode === "semantic" || backend.effectiveMode === "hybrid") && (!backend.manifest.semanticAt || backend.manifest.pendingEmbeddings !== 0 || !backend.manifest.hasVectorIndex)) throw new DatastoreError("STALE_INDEX");
 			if (backend.effectiveMode === "lexical" && freshness === "require-current-semantic") throw new DatastoreError("STALE_INDEX");
 			const hits: SearchHit[] = []; let dropped = backend.rejectedCandidates ?? 0; let stale = dropped > 0;
@@ -108,20 +115,20 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 					if (source.fullRevision !== indexed.revision) { stale = true; dropped += 1; continue; }
 					const parsed = parseMarkdown(source);
 					const excerpt = input.includeContent ? this.excerpt(source.text, parsed, input.query, candidate) : undefined;
-					hits.push({ note: source.note, uri: source.uri, path: source.note.path, title: parsed.title, snippet: excerpt?.content, rank: hits.length + 1, backendRank: candidate.backendRank, backend: "qmd" as const, mode: backend.effectiveMode, score: candidate.score, sourceRevision: source.revision, indexedRevision: source.revision, sourceMtime: source.mtime, indexFreshness: this.qmd.isLexicallyCurrent(store.name) ? "current" as const : "stale" as const, truncated: excerpt?.truncated ?? false });
+					hits.push({ note: source.note, uri: source.uri, path: source.note.path, title: parsed.title, snippet: excerpt?.content, rank: hits.length + 1, backendRank: candidate.backendRank, backend: "qmd" as const, mode: backend.effectiveMode, score: candidate.score, sourceRevision: source.revision, indexedRevision: source.revision, sourceMtime: source.mtime, indexFreshness: qmd.isLexicallyCurrent(store.name) ? "current" as const : "stale" as const, truncated: excerpt?.truncated ?? false });
 				} catch (error) {
 					if (error instanceof DatastoreError && (error.code === "CANCELLED" || error.code === "TIMEOUT")) throw error;
 					stale = true; dropped += 1;
 				}
 			}
 			if (stale && freshness !== "allow-stale") throw new DatastoreError("STALE_INDEX");
-			const indexCurrent = this.qmd.isLexicallyCurrent(store.name);
+			const indexCurrent = qmd.isLexicallyCurrent(store.name);
 			if (!indexCurrent && freshness !== "allow-stale") throw new DatastoreError("STALE_INDEX");
 			const aggregateLines = (): number => Math.max(1, hits.reduce((count, hit) => count + (typeof hit.snippet === "string" ? lines(hit.snippet) : 1), 0)); let budgetTruncated = false; while (hits.length && (Buffer.byteLength(JSON.stringify(hits)) > this.config.defaults.maxResultBytes || aggregateLines() > this.config.defaults.maxResultLines)) { hits.pop(); budgetTruncated = true; }
 			const text = JSON.stringify(hits); const returnedLines = aggregateLines(); if (Buffer.byteLength(text) > this.config.defaults.maxResultBytes || returnedLines > this.config.defaults.maxResultLines) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
 			const staleMessage = "Serving indexed results while source reconciliation is pending; new notes may be absent.";
 			const warnings = [...(backend.requestedMode !== backend.effectiveMode ? [{ code: "SEMANTIC_UNAVAILABLE" as const, message: "Embedding underway; semantic retrieval is temporarily unavailable. Hybrid request served with lexical search." }] : []), ...(!indexCurrent ? [{ code: "STALE_INDEX" as const, message: staleMessage }] : []), ...(dropped ? [{ code: "STALE_CANDIDATE_DROPPED" as const, message: "One or more backend candidates failed current direct validation." }] : []), ...(budgetTruncated ? [{ code: "RESULT_LIMIT_EXCEEDED" as const, message: "Search hits were truncated at the configured aggregate result budget." }] : [])];
-			return this.envelope("search", store.name, { hits, examined: backend.candidates.length + (backend.rejectedCandidates ?? 0), dropped, returned: hits.length, requestedMode: backend.requestedMode, effectiveMode: backend.effectiveMode, queueMs: backend.queueMs, operationMs: backend.operationMs, workerId: backend.workerId }, started, text, budgetTruncated, undefined, [{ kind: "qmd", backendVersion: this.qmd.binding.version, observationId: backend.generation, observedAt: new Date().toISOString(), freshness: indexCurrent ? "current" : "stale" }, { kind: "filesystem", observedAt: new Date().toISOString(), freshness: "current" }], warnings, undefined, returnedLines) as SearchResult;
+			return this.envelope("search", store.name, { hits, examined: backend.candidates.length + (backend.rejectedCandidates ?? 0), dropped, returned: hits.length, requestedMode: backend.requestedMode, effectiveMode: backend.effectiveMode, queueMs: backend.queueMs, operationMs: backend.operationMs, workerId: backend.workerId }, started, text, budgetTruncated, undefined, [{ kind: "qmd", backendVersion: qmd.binding.version, observationId: backend.generation, observedAt: new Date().toISOString(), freshness: indexCurrent ? "current" : "stale" }, { kind: "filesystem", observedAt: new Date().toISOString(), freshness: "current" }], warnings, undefined, returnedLines) as SearchResult;
 		}
 	}
 
@@ -220,6 +227,40 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		return this.envelope("read", store.name, data, started, page.content, page.truncated, continuation, [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: "current" }], [], descriptor) as ReadResult;
 	}
 
+	private async searchShared(store: StoreConfig, shared: SharedIndexClient, input: SearchInput, signal: AbortSignal, started: number): Promise<SearchResult> {
+		const activity = await shared.activity(signal);
+		const mode = input.mode ?? store.search.defaultMode; const limit = input.limit ?? 5;
+		if (input.minScore !== undefined && !Number.isFinite(input.minScore)) throw new DatastoreError("INVALID_NOTE_REF");
+		if (!Number.isInteger(limit) || limit < 1 || limit > 20 || !["lexical", "semantic", "hybrid"].includes(mode)) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
+		const freshness = input.freshness ?? "allow-stale";
+		if (mode === "semantic" && activity.embeddingActive) throw new DatastoreError("SEMANTIC_UNAVAILABLE", { retryable: true, requestedMode: mode });
+		if (freshness !== "allow-stale" && !await shared.isLexicallyCurrent(signal)) throw new DatastoreError("STALE_INDEX");
+		const backend = await shared.search(input.query, mode, Math.min(500, Math.max(limit * 4, limit)), input.minScore, signal);
+		if ((backend.effectiveMode === "semantic" || backend.effectiveMode === "hybrid") && (!backend.manifest.semanticAt || backend.manifest.pendingEmbeddings !== 0 || !backend.manifest.hasVectorIndex)) throw new DatastoreError("STALE_INDEX");
+		if (backend.effectiveMode === "lexical" && freshness === "require-current-semantic") throw new DatastoreError("STALE_INDEX");
+		const hits: SearchHit[] = []; let dropped = backend.rejectedCandidates ?? 0; let stale = dropped > 0;
+		for (const candidate of backend.candidates) {
+			if (hits.length >= limit) break;
+			const indexed = backend.manifest.stores[store.shared!.store]?.[candidate.path] ?? backend.manifest.stores[store.name]?.[candidate.path];
+			if (!indexed) { stale = true; dropped += 1; continue; }
+			try {
+				const source = await safeOpenNote(store, candidate.path, signal);
+				if (source.fullRevision !== indexed.revision) { stale = true; dropped += 1; continue; }
+				const parsed = parseMarkdown(source);
+				const excerpt = input.includeContent ? this.excerpt(source.text, parsed, input.query, candidate) : undefined;
+				hits.push({ note: source.note, uri: source.uri, path: source.note.path, title: parsed.title, snippet: excerpt?.content, rank: hits.length + 1, backendRank: candidate.backendRank, backend: "qmd" as const, mode: backend.effectiveMode, score: candidate.score, sourceRevision: source.revision, indexedRevision: source.revision, sourceMtime: source.mtime, indexFreshness: await shared.isLexicallyCurrent(signal) ? "current" as const : "stale" as const, truncated: excerpt?.truncated ?? false });
+			} catch (error) {
+				if (error instanceof DatastoreError && (error.code === "CANCELLED" || error.code === "TIMEOUT")) throw error;
+				stale = true; dropped += 1;
+			}
+		}
+		if (stale && freshness !== "allow-stale") throw new DatastoreError("STALE_INDEX");
+		const indexCurrent = await shared.isLexicallyCurrent(signal);
+		if (!indexCurrent && freshness !== "allow-stale") throw new DatastoreError("STALE_INDEX");
+		const text = JSON.stringify(hits);
+		return this.envelope("search", store.name, { hits, examined: backend.candidates.length + (backend.rejectedCandidates ?? 0), dropped, returned: hits.length, requestedMode: backend.requestedMode, effectiveMode: backend.effectiveMode, queueMs: backend.queueMs, operationMs: backend.operationMs, workerId: backend.workerId }, started, text, false, undefined, [{ kind: "qmd", backendVersion: shared.version, observationId: backend.generation, observedAt: new Date().toISOString(), freshness: indexCurrent ? "current" : "stale" }, { kind: "filesystem", observedAt: new Date().toISOString(), freshness: "current" }]) as SearchResult;
+	}
+
 	private async statusInner(input: StatusInput, signal: AbortSignal): Promise<StatusResult> {
 		const started = Date.now(); throwIfAborted(signal);
 		const stores = input.store ? [this.store(input.store)] : [...this.config.stores.values()];
@@ -229,6 +270,19 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		const qmdSummary = qmdStatus ? Object.fromEntries(Object.entries(qmdStatus).filter(([key]) => !["stores", "refresh", "reconciliation"].includes(key))) : undefined;
 		if (qmdSummary && qmdActivity) qmdSummary.refresh = { state: qmdActivity.state, active: qmdActivity.active, queued: qmdActivity.queued };
 		for (const store of stores) {
+			if (store.shared) {
+				const client = this.sharedClients?.get(store.name);
+				let remote: Record<string, unknown> | undefined;
+				if (!client) remote = { state: "unavailable", reasonCode: "STORE_UNAVAILABLE" };
+				else { try { remote = await client.status(signal); } catch (error) { propagateControlError(error); remote = { state: "unavailable", reasonCode: error instanceof DatastoreError ? error.code : "STORE_UNAVAILABLE" }; } }
+				const remoteStores = remote?.stores && typeof remote.stores === "object" ? remote.stores as Record<string, Record<string, unknown>> : undefined;
+				const cached = remoteStores?.[store.shared.store];
+				const runtimeCurrent = cached?.runtimeLexicalCurrent === true;
+				const ready = remote?.state === "ready";
+				const qmdState = ready ? { state: "ready" as const, backend: "qmd" as const, version: client?.version, freshness: { state: runtimeCurrent ? "current" as const : "stale" as const } } : { state: "unavailable" as const, reasonCode: String(remote?.reasonCode ?? "STORE_UNAVAILABLE") };
+				statuses.push({ store: store.name, root: redactedRoot(store, this.config.projectRoot), rootWasSymlink: false, fileCount: typeof cached?.documentCount === "number" ? cached.documentCount : undefined, fileCountSource: cached?.documentCount === undefined ? "unavailable" : "backend-reported-count", permissionWarnings: [], sourceReconciliation: { state: runtimeCurrent ? "succeeded" : "pending", additionsMayBeAbsent: !runtimeCurrent, sourceTraversalPerformed: false }, qmd: remote, capabilities: { direct: { state: "ready" as const, backend: "direct", exactPath: true, boundedContent: true, boundedSection: true, currentFileValidation: true, singleNoteFallbackLinks: false }, search: { lexical: qmdState, semantic: qmdState, hybrid: qmdState }, outline: { state: "ready", backend: "direct" }, mutations: { supported: false } } });
+				continue;
+			}
 			const cachedStore = qmdStatus?.stores && typeof qmdStatus.stores === "object" ? (qmdStatus.stores as Record<string, Record<string, unknown>>)[store.name] : undefined; const fileCount = typeof cachedStore?.documentCount === "number" ? cachedStore.documentCount : undefined; const directState = "ready" as const; const reasonCode = undefined;
 			const runtimeCurrent = cachedStore?.runtimeLexicalCurrent === true; const qmdState = !this.config.qmd.enabled ? { state: "disabled" as const } : !this.qmd ? { state: "unavailable" as const, reasonCode: "BACKEND_MISSING" } : qmdStatus?.state === "ready" ? { state: "ready" as const, backend: "qmd" as const, version: this.qmd.binding.version, freshness: { state: runtimeCurrent ? "current" as const : "stale" as const } } : { state: "degraded" as const, backend: "qmd" as const, version: this.qmd.binding.version, reasonCode: String(qmdStatus?.reasonCode ?? "STALE_INDEX") };
 			const semanticState = qmdState.state === "ready" && typeof qmdStatus?.semanticAt !== "string" ? { ...qmdState, state: "degraded" as const, reasonCode: "STALE_INDEX" } : qmdState;
@@ -242,9 +296,27 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 	private async refreshInner(input: RefreshInput, signal: AbortSignal): Promise<RefreshResult> {
 		const started = Date.now(); throwIfAborted(signal);
 		if (input.action === "cancel") {
-			if (!this.qmd) throw new DatastoreError("CAPABILITY_UNAVAILABLE"); const qmd = await this.qmd.cancelRefresh(input.refreshId); const data = { action: "cancel", qmd, durationMs: elapsed(started) }; return this.envelope("refresh", "*", data, started, JSON.stringify(data), false, undefined, [], [], undefined, 1) as RefreshResult;
+			const qmd = await this.cancelRefresh(input.refreshId, signal); const data = { action: "cancel", qmd, durationMs: elapsed(started) }; return this.envelope("refresh", "*", data, started, JSON.stringify(data), false, undefined, [], [], undefined, 1) as RefreshResult;
 		}
 		const mode = input.mode ?? "direct"; const stores = input.store ? [this.store(input.store)] : [...this.config.stores.values()];
+		const sharedStores = stores.filter((store) => store.shared);
+		if (sharedStores.length && (mode === "lexical" || mode === "semantic" || mode === "all")) {
+			const receipts = [];
+			for (const store of sharedStores) {
+				const client = this.sharedClients?.get(store.name);
+				if (!client) throw new DatastoreError("STORE_UNAVAILABLE");
+				receipts.push(mode === "lexical" ? await client.startLexical(signal) : await client.startSemantic(signal));
+			}
+				if (sharedStores.length === stores.length) {
+				const data = { action: "start", mode, qmd: receipts[0], shared: receipts, backgroundOwnership: "explicit-maintenance", durationMs: elapsed(started) };
+				return this.envelope("refresh", input.store ?? "*", data, started, JSON.stringify(data), false, undefined, [], [], undefined, 1) as RefreshResult;
+			}
+			const privateStores = stores.filter((store) => !store.shared);
+			if (!this.qmd) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
+			const qmd = mode === "lexical" ? await this.qmd.startLexicalRefresh(privateStores) : await this.qmd.startSemanticRefresh(privateStores);
+			const data = { action: "start", mode, qmd, shared: receipts, backgroundOwnership: "explicit-maintenance", durationMs: elapsed(started) };
+			return this.envelope("refresh", input.store ?? "*", data, started, JSON.stringify(data), false, undefined, [], [], undefined, 1) as RefreshResult;
+		}
 		if (mode === "semantic" || mode === "all") {
 			if (!this.qmd) throw new DatastoreError("CAPABILITY_UNAVAILABLE"); const qmd = await this.qmd.startSemanticRefresh(stores); const data = { action: "start", mode, qmd, backgroundOwnership: "explicit-maintenance", durationMs: elapsed(started) }; return this.envelope("refresh", input.store ?? "*", data, started, JSON.stringify(data), false, undefined, [], [], undefined, 1) as RefreshResult;
 		}
@@ -252,8 +324,17 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		const roots: Record<string, string> = {}; for (const store of stores) { await assertRootIdentity(store); roots[store.name] = "available"; }
 		const data = { action: "start", mode, roots, semantics: "bounded-root-revalidation-only", durationMs: elapsed(started) }; return this.envelope("refresh", input.store ?? "*", data, started, JSON.stringify(data), false, undefined, [], [], undefined, Math.max(1, Object.keys(roots).length)) as RefreshResult;
 	}
+	private async cancelRefresh(refreshId: string, signal: AbortSignal): Promise<Record<string, unknown>> {
+		if (this.qmd) {
+			try { return await this.qmd.cancelRefresh(refreshId); } catch (error) { if (!(error instanceof DatastoreError) || error.code !== "INVALID_NOTE_REF") throw error; }
+		}
+		for (const client of this.sharedClients?.values() ?? []) {
+			try { return await client.cancel(refreshId, signal); } catch (error) { if (!(error instanceof DatastoreError) || error.code !== "INVALID_NOTE_REF") throw error; }
+		}
+		throw new DatastoreError("CAPABILITY_UNAVAILABLE");
+	}
 	async shutdown(): Promise<void> {
 		if (this.#closed) return; this.#closed = true; this.continuations.clear(); this.#lifecycle.abort(new DatastoreError("CANCELLED"));
-		await Promise.allSettled([...this.#active, ...[this.qmd?.shutdown()].filter((operation): operation is Promise<void> => operation !== undefined)]);
+		await Promise.allSettled([...this.#active, ...[this.qmd?.shutdown(), ...[...this.sharedClients?.values() ?? []].map((client) => client.shutdown())].filter((operation): operation is Promise<void> => operation !== undefined)]);
 	}
 }

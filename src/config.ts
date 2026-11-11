@@ -3,6 +3,7 @@ import { lstat, open, realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { DatastoreError } from "./errors.ts";
+import { loadSharedCatalog } from "./shared-catalog.ts";
 
 export const HARD_MAX_RESULT_BYTES = 32 * 1024;
 export const HARD_MAX_RESULT_LINES = 800;
@@ -14,10 +15,12 @@ export const HARD_MAX_OUTLINE = 100;
 export interface DatastoreDefaults { maxResultBytes: number; maxResultLines: number; operationTimeoutMs: number }
 export interface QmdConfig { enabled: boolean; installation: { executable?: string; packageRoot?: string }; minimumVersion: string }
 
+export interface SharedStoreReference { catalog: string; store: string; socketPath: string; definitionRevision: string }
 export interface StoreConfig {
 	name: string; configuredRoot: string; root: string; rootWasSymlink: boolean; rootDev: number; rootIno: number;
 	include: string[]; exclude: string[]; maxFileBytes: number;
 	search: { defaultMode: "lexical" | "semantic" | "hybrid"; qmdCollection: string };
+	shared?: SharedStoreReference;
 }
 export interface MarkdownDatastoreConfig {
 	schemaVersion: 1; projectRoot: string; configPath: string; stateRoot: string; defaults: DatastoreDefaults;
@@ -29,6 +32,8 @@ const DEFAULT_KEYS = new Set(["maxResultBytes", "maxResultLines", "operationTime
 const QMD_KEYS = new Set(["enabled", "installation", "minimumVersion"]);
 const INSTALL_KEYS = new Set(["executable", "packageRoot"]);
 const STORE_KEYS = new Set(["root", "include", "exclude", "maxFileBytes", "search"]);
+const SHARED_STORE_KEYS = new Set(["shared"]);
+const SHARED_REF_KEYS = new Set(["catalog", "store"]);
 const SEARCH_KEYS = new Set(["defaultMode", "qmdCollection"]);
 const STORE_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
 
@@ -187,7 +192,27 @@ export async function loadMarkdownDatastoreConfig(projectRootInput: string, conf
 	const canonicalRoots = new Set<string>();
 	for (const [name, value] of Object.entries(storesRaw)) {
 		if (!STORE_NAME.test(name)) throw new DatastoreError("CONFIG_INVALID");
-		const storeRaw = record(value); exactKeys(storeRaw, STORE_KEYS);
+		const storeRaw = record(value);
+		if (Object.hasOwn(storeRaw, "shared")) {
+			exactKeys(storeRaw, SHARED_STORE_KEYS);
+			const sharedRaw = record(storeRaw.shared); exactKeys(sharedRaw, SHARED_REF_KEYS);
+			const catalogPath = string(sharedRaw.catalog);
+			const sharedId = string(sharedRaw.store);
+			if (!isAbsolute(catalogPath) || !STORE_NAME.test(sharedId)) throw new DatastoreError("CONFIG_INVALID");
+			const catalog = await loadSharedCatalog(catalogPath);
+			const defined = catalog.stores.get(sharedId);
+			if (!defined || canonicalRoots.has(defined.root)) throw new DatastoreError("CONFIG_INVALID");
+			canonicalRoots.add(defined.root);
+			if (qmdCollections.has(defined.search.qmdCollection)) throw new DatastoreError("CONFIG_INVALID");
+			qmdCollections.add(defined.search.qmdCollection);
+			stores.set(name, {
+				name, configuredRoot: defined.root, root: defined.root, rootWasSymlink: false, rootDev: defined.rootDev, rootIno: defined.rootIno,
+				include: defined.include, exclude: defined.exclude, maxFileBytes: defined.maxFileBytes, search: defined.search,
+				shared: { catalog: catalog.path, store: sharedId, socketPath: catalog.socketPath, definitionRevision: defined.definitionRevision },
+			});
+			continue;
+		}
+		exactKeys(storeRaw, STORE_KEYS);
 		const configuredRoot = string(storeRaw.root);
 		const rootInput = isAbsolute(configuredRoot) ? configuredRoot : resolve(projectRoot, configuredRoot);
 		const rootLstat = await lstat(rootInput).catch(() => { throw new DatastoreError("CONFIG_INVALID"); });

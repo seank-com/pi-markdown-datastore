@@ -99,6 +99,24 @@ semantic work after lexical refresh; clean ticks do no work. Publication batchin
 of lexical updates is not implemented: integrations must continue requesting
 explicit lexical refresh when needed. External filesystem edits require refresh.
 
+## Shared catalog
+
+A shared store is opt-in. Write an absolute catalog the operator owns, then reference it from a project store. The catalog's `socketPath` and `stateRoot` are absolute. Its `defaults` and `qmd` fields are the same reader and backend settings a private store already uses. They are not new limits.
+
+Start the service in the foreground after building:
+
+```bash
+node dist/shared-service-main.js --catalog /absolute/catalog.json
+```
+
+Do not install a LaunchAgent or start it from a project session. A project store that should use it contains only the reference:
+
+```json
+"notes": { "shared": { "catalog": "/absolute/catalog.json", "store": "notebook" } }
+```
+
+The local name may differ from the catalog id. Search and refresh fail while the service is down. Direct find and read still use the catalog's source root. Stopping the project does not stop the service.
+
 During coordinator-owned semantic maintenance, lexical reads use a separate
 process. Hybrid requests return lexical results with `SEMANTIC_UNAVAILABLE`
 warning and `requestedMode`/`effectiveMode`; semantic-only requests fail with
