@@ -128,7 +128,11 @@ export class MaintenanceCoordinator {
 	async enqueue(mode: Mode, stores: string[], ownership: QmdRefreshJob["ownership"], definition?: string): Promise<Record<string, unknown>> {
 		if (this.#closed) throw new DatastoreError("CANCELLED");
 		await this.ensureLoaded();
+		if (this.#closed) throw new DatastoreError("CANCELLED");
 		const ordered = [...stores].sort();
+		const current = this.definitionFor?.({ mode, stores: ordered });
+		if (definition !== undefined && current !== undefined && definition !== current) throw new DatastoreError("STALE_INDEX");
+		definition ??= current;
 		const key = `${mode}:${ordered.join(",")}`;
 		const existing = [...this.#jobs.values()].find((job) => job.key === key && (job.state === "queued" || job.state === "running") && job.definition === definition);
 		if (existing) { this.launch(existing); return { ...structuredClone(existing), coalesced: true }; }
@@ -173,8 +177,10 @@ export class MaintenanceCoordinator {
 			job.updatedAt = new Date().toISOString();
 			if (["succeeded", "failed", "cancelled"].includes(job.state)) job.completedAt ??= job.updatedAt;
 			this.#controllers.delete(job.refreshId);
-			try { await this.persist(); this.#settlePersist.get(job.refreshId)?.resolve(); }
-			catch (error) { job.state = "failed"; job.phase = "failed"; job.errorCode = "INDEX_CORRUPT"; job.completedAt = job.updatedAt; this.#settlePersist.get(job.refreshId)?.reject(error); }
+			if (["succeeded", "failed", "cancelled"].includes(job.state)) {
+				try { await this.persist(); this.#finish(job.refreshId); }
+				catch (error) { job.state = "failed"; job.phase = "failed"; job.errorCode = "INDEX_CORRUPT"; job.completedAt = job.updatedAt; this.#fail(job.refreshId, error); }
+			}
 		});
 		this.#tail = operation.then(() => undefined, () => undefined);
 	}
@@ -185,7 +191,7 @@ export class MaintenanceCoordinator {
 		const controller = this.#controllers.get(refreshId);
 		this.#explicitCancel.add(refreshId);
 		controller?.abort(new DatastoreError("CANCELLED"));
-		if (job.state === "queued") { job.state = "cancelled"; job.phase = "cancelled"; job.errorCode = "CANCELLED"; job.updatedAt = new Date().toISOString(); job.completedAt = job.updatedAt; await this.persist(); }
+		if (job.state === "queued") { job.state = "cancelled"; job.phase = "cancelled"; job.errorCode = "CANCELLED"; job.updatedAt = new Date().toISOString(); job.completedAt = job.updatedAt; try { await this.persist(); this.#finish(refreshId); } catch (error) { this.#fail(refreshId, error); throw error; } }
 		return { ...structuredClone(job), cancellationRequested: controller !== undefined || job.state === "cancelled" };
 	}
 	async stampMissingDefinition(identityFor: (job: { mode: string; stores: string[] }, version: string) => string, version: string): Promise<void> {
@@ -196,16 +202,21 @@ export class MaintenanceCoordinator {
 		}
 		await this.persist();
 	}
-	persisted(refreshId: string): Promise<void> {
+	#finish(refreshId: string): void { this.#settlePersist.get(refreshId)?.resolve(); this.#persisted.delete(refreshId); this.#settlePersist.delete(refreshId); this.#explicitCancel.delete(refreshId); }
+	#fail(refreshId: string, error: unknown): void { this.#settlePersist.get(refreshId)?.reject(error); this.#persisted.delete(refreshId); this.#settlePersist.delete(refreshId); this.#explicitCancel.delete(refreshId); }
+	async persisted(refreshId: string): Promise<void> {
+		await this.ensureLoaded();
 		const existing = this.#persisted.get(refreshId);
 		if (existing) return existing;
-		const terminal = (id: string) => { const job = this.#jobs.get(id); return Boolean(job && ["succeeded", "failed", "cancelled"].includes(job.state) && !this.#controllers.has(id)); };
-		if (terminal(refreshId)) return this.#persistTail.then(() => undefined);
+		const job = this.#jobs.get(refreshId);
+		if (!job) throw new DatastoreError("INVALID_NOTE_REF");
+		if (["succeeded", "failed", "cancelled"].includes(job.state) && !this.#controllers.has(refreshId)) return this.#persistTail.then(() => undefined);
 		let resolve!: () => void;
 		let reject!: (error: unknown) => void;
 		const promise = new Promise<void>((accept, fail) => { resolve = accept; reject = fail; });
 		this.#settlePersist.set(refreshId, { resolve, reject });
-		if (terminal(refreshId)) { this.#settlePersist.delete(refreshId); return this.#persistTail.then(() => undefined); }
+		const again = this.#jobs.get(refreshId);
+		if (again && ["succeeded", "failed", "cancelled"].includes(again.state) && !this.#controllers.has(refreshId)) { this.#settlePersist.delete(refreshId); return this.#persistTail.then(() => undefined); }
 		this.#persisted.set(refreshId, promise);
 		return promise;
 	}
