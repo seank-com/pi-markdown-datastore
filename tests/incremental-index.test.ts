@@ -1,19 +1,19 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, realpath, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { loadMarkdownDatastoreConfig } from "../src/config.ts";
 import { MaintenanceCoordinator } from "../src/maintenance-coordinator.ts";
-import { MetadataIndex, registerMetadata } from "../src/metadata-index.ts";
+import { MetadataIndex } from "../src/metadata-index.ts";
+import type { StoreConfig } from "../src/config.ts";
 
-test("a path update does not reopen an unreadable unrelated note", async () => {
+async function fixture(): Promise<{ root: string; notes: string; state: string; store: StoreConfig }> {
 	const root = await realpath(await mkdtemp(join(tmpdir(), "incremental-")));
 	const notes = join(root, "notes");
 	const state = join(root, "state");
 	await mkdir(notes, { recursive: true });
-	await writeFile(join(notes, "alpha.md"), "[[beta]]\n");
-	await writeFile(join(notes, "beta.md"), "hello\n");
+	await mkdir(state, { recursive: true, mode: 0o700 });
 	const configDir = join(root, ".pi", "markdown-datastore");
 	await mkdir(configDir, { recursive: true, mode: 0o700 });
 	await chmod(root, 0o700);
@@ -22,21 +22,74 @@ test("a path update does not reopen an unreadable unrelated note", async () => {
 	const configPath = join(configDir, "config.json");
 	await writeFile(configPath, JSON.stringify({ schemaVersion: 1, defaults: { maxResultBytes: 8192, maxResultLines: 100, operationTimeoutMs: 3000 }, qmd: { enabled: false, installation: { executable: "qmd" }, minimumVersion: "2.8.3" }, stores: { notes: { root: notes, include: ["**/*.md"], exclude: [], maxFileBytes: 4096, search: { defaultMode: "lexical", qmdCollection: "notes" } } } }), { mode: 0o600 });
 	const config = await loadMarkdownDatastoreConfig(root, configPath);
-	const store = config.stores.get("notes")!;
+	return { root, notes, state, store: config.stores.get("notes")! };
+}
+
+function semantic(snapshot: { files: Record<string, { kind: string; links?: unknown; tags?: string[]; size?: number; mtime?: string }>; targets: Record<string, string[]>; tags: Record<string, string[]>; references: Record<string, string[]>; complete: boolean; diagnostics: string[] }) {
+	return { files: snapshot.files, targets: snapshot.targets, tags: snapshot.tags, references: snapshot.references, complete: snapshot.complete, diagnostics: snapshot.diagnostics };
+}
+
+test("path updates keep written targets and match a rebuild", async () => {
+	const { notes, state, store } = await fixture();
+	await mkdir(join(notes, "clients"));
+	await writeFile(join(notes, "clients", "Project Atlas.md"), "---\ntags: ['#Projects']\n---\n[[Missing Project]]\n");
+	await writeFile(join(notes, "constructor.md"), "[[constructor]]\n");
 	const index = new MetadataIndex(state);
-	await index.refresh(store);
-	await chmod(join(notes, "beta.md"), 0);
-	await writeFile(join(notes, "alpha.md"), "[[beta]] edited\n");
-	const updated = await index.updatePaths(store, ["alpha.md"]);
-	assert.equal(updated.files["alpha.md"]?.kind, "note");
-	assert.equal(updated.files["beta.md"]?.kind, "note");
-	await chmod(join(notes, "beta.md"), 0o600);
+	const first = await index.refresh(store);
+	assert.equal(first.files["clients/Project Atlas.md"].links?.[0].target, "Missing Project");
+	assert.deepEqual(first.targets["Missing Project"], []);
+	assert.equal(Object.hasOwn(first.files, "constructor.md"), true);
+	assert.match(await readFile(join(state, "index.json"), "utf8"), /"constructor.md"/);
+
+	await chmod(join(notes, "constructor.md"), 0);
+	await writeFile(join(notes, "clients", "Project Atlas.md"), "---\ntags: ['#Projects']\n---\n[[Missing Project]]\nedited\n");
+	const edited = await index.updatePaths(store, ["clients/Project Atlas.md"]);
+	assert.equal(edited.files["constructor.md"].revision, first.files["constructor.md"].revision);
+	await chmod(join(notes, "constructor.md"), 0o600);
+
+	const kept = edited.files["clients/Project Atlas.md"].links;
+	await utimes(join(notes, "clients", "Project Atlas.md"), new Date(), new Date());
+	const stamped = await index.updatePaths(store, ["clients/Project Atlas.md"]);
+	assert.equal(stamped.files["clients/Project Atlas.md"].links, kept);
+	assert.notEqual(stamped.files["clients/Project Atlas.md"].mtime, edited.files["clients/Project Atlas.md"].mtime);
+
+	await writeFile(join(notes, "clients", "Other Atlas.md"), "same stem\n");
+	await index.updatePaths(store, ["clients/Other Atlas.md"]);
+	assert.equal((await index.links("clients/Project Atlas.md"))[0].targetKind, "unresolved");
+	await writeFile(join(notes, "Missing Project.md"), "now here\n");
+	await index.updatePaths(store, ["Missing Project.md"]);
+	assert.equal((await index.links("clients/Project Atlas.md"))[0].targetKind, "note");
+	await writeFile(join(notes, "also", "Missing Project.md"), "collision\n").catch(async () => { await mkdir(join(notes, "also")); await writeFile(join(notes, "also", "Missing Project.md"), "collision\n"); });
+	await index.updatePaths(store, ["also/Missing Project.md"]);
+	assert.equal((await index.links("clients/Project Atlas.md"))[0].targetKind, "ambiguous");
+
+	await rm(join(notes, "clients", "Project Atlas.md"));
+	await rename(join(notes, "constructor.md"), join(notes, "renamed.md"));
+	await index.updatePaths(store, ["clients/Project Atlas.md", "constructor.md", "renamed.md"]);
+	assert.equal(Object.hasOwn((await index.snapshot())!.files, "clients/Project Atlas.md"), false);
+	assert.equal(Object.hasOwn((await index.snapshot())!.files, "renamed.md"), true);
+
+	const incremental = semantic((await index.snapshot())!);
+	const rebuilt = semantic(await new MetadataIndex(join(state, "rebuild")).rebuild(store));
+	assert.deepEqual(incremental, rebuilt);
+});
+
+test("a failed snapshot write keeps the previous memory and disk", async () => {
+	const { notes, state, store } = await fixture();
+	await writeFile(join(notes, "alpha.md"), "one\n");
+	const index = new MetadataIndex(state);
+	const saved = await index.refresh(store);
+	await chmod(state, 0o500);
+	await writeFile(join(notes, "alpha.md"), "two\n");
+	await assert.rejects(index.updatePaths(store, ["alpha.md"]));
+	await chmod(state, 0o700);
+	assert.equal((await index.snapshot())?.revision, saved.revision);
+	assert.equal(JSON.parse(await readFile(join(state, "index.json"), "utf8")).revision, saved.revision);
 });
 
 test("the reconciliation timer is the accepted five minutes", () => {
 	const coordinator = new MaintenanceCoordinator(join(tmpdir(), "unused-jobs.json"), () => new Set());
 	let delay = 0;
-	coordinator.startCycle(async () => undefined, undefined, ((run: () => void, ms: number) => { delay = ms; return { unref() {}, ref() {} } as unknown as ReturnType<typeof setTimeout>; }) as typeof setTimeout);
+	coordinator.startCycle(async () => undefined, undefined, ((_: () => void, ms: number) => { delay = ms; return { unref() {}, ref() {} } as unknown as ReturnType<typeof setTimeout>; }) as typeof setTimeout);
 	assert.equal(delay, 300_000);
-	void coordinator;
 });
