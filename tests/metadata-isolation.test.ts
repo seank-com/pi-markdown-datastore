@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -211,4 +211,32 @@ test("tag find pages the rendered candidate, not the path string", async (t) => 
 	assert.equal(found.bounds.truncated, true);
 	assert.equal(found.data.candidates[0].uri.startsWith("datastore://notes/"), true);
 	assert.notEqual(found.data.candidates[0].revision, found.provenance.sources[0].indexRevision);
+});
+
+test("an in-place note edit is not current membership", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-edit-meta-")));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const notes = join(root, "notes");
+	await mkdir(notes);
+	const file = join(notes, "alpha.md");
+	await writeFile(file, "---\ntags: [travel]\n---\nSee [[old]].\n");
+	const config = await projectConfig(root, { notes });
+	const index = new MetadataIndex(join(root, "state", "metadata-notes"));
+	const coordinator = new MaintenanceCoordinator(join(root, "state", "jobs.json"), () => new Set(["notes"]));
+	registerMetadata(coordinator, new Map([["notes", index]]), config.stores);
+	const service = new MarkdownDatastoreService(config);
+	service.bindMetadata(coordinator, new Map([["notes", index]]));
+	await service.refresh({ store: "notes", mode: "metadata" });
+	await coordinator.settled();
+	const before = await service.read({ store: "notes", note: { store: "notes", path: "alpha.md" }, view: "links" });
+	assert.equal(before.provenance.sources[0].freshness, "current");
+	assert.equal(before.data.edges[0].target, "old");
+	const info = await stat(file);
+	await writeFile(file, "---\ntags: [worked]\n---\nSee [[new]].\n");
+	await utimes(file, info.atime, info.mtime);
+	const after = await service.read({ store: "notes", note: { store: "notes", path: "alpha.md" }, view: "links" });
+	assert.equal(after.provenance.sources[0].freshness, "stale");
+	assert.match(after.warnings.map((warning) => warning.message).join("\n"), new RegExp(String(before.data.revision)));
+	const tagged = await service.find({ store: "notes", selectors: [{ kind: "tag", value: "travel" }] });
+	assert.equal(tagged.provenance.sources[0].freshness, "stale");
 });

@@ -128,9 +128,14 @@ export class MetadataIndex {
 			if (seen.has(key)) continue;
 			seen.add(key);
 			try {
-				const inspected = await safeInspectContainedFile(store, item.path, signal);
 				const prior = snapshot.observed?.find((entry) => entry.path === item.path);
-				if (!prior || prior.size !== inspected.size || prior.mtime !== inspected.mtime) diagnostics.push(`${snapshot.revision}: ${item.path}: changed`);
+				if (item.kind === "note") {
+					const opened = await safeOpenNote(store, item.path, signal);
+					if (!prior?.sourceRevision || prior.sourceRevision !== opened.revision) diagnostics.push(`${snapshot.revision}: ${item.path}: changed`);
+				} else {
+					const inspected = await safeInspectContainedFile(store, item.path, signal);
+					if (!prior || prior.size !== inspected.size || prior.mtime !== inspected.mtime) diagnostics.push(`${snapshot.revision}: ${item.path}: changed`);
+				}
 			} catch (error) {
 				if (!(error instanceof DatastoreError) || error.code === "STORE_UNAVAILABLE") throw error;
 				diagnostics.push(`${snapshot.revision}: ${item.path}: ${error.code}`);
