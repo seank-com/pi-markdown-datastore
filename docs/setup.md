@@ -100,7 +100,7 @@ semantic work after lexical refresh; clean ticks do no work. Publication batchin
 of lexical updates is not implemented: integrations must continue requesting
 explicit lexical refresh when needed. External filesystem edits require refresh.
 
-`datastore_refresh` mode `metadata` builds the wikilink and frontmatter-tag index without qmd. `datastore_tags` lists tag identity, display spelling, and distinct page count. `datastore_read` views `links` and `backlinks` read that index, including an attachment backlink, without opening the attachment as Markdown. A continuation on those results is bound to the store, revision, and query.
+`datastore_refresh` mode `metadata` builds the wikilink and frontmatter-tag index without qmd. `datastore_status` reports that index's readiness, revision, completeness, and job progress even when qmd is disabled or unavailable. `datastore_tags` lists tag identity, display spelling, and distinct page count. `datastore_read` views `links` and `backlinks` read that index. An attachment backlink is inspected, not opened as Markdown. A continuation on those results is bound to the store, revision, and query, and uses the same read budget check as the first page.
 
 ## Shared catalog
 
