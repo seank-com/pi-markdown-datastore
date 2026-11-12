@@ -1,7 +1,8 @@
 import type { Server, Socket } from "node:net";
-import { discoverQmdBinding, prepareQmdStateDirectory, QmdAdapter } from "./qmd-adapter.ts";
+import { join } from "node:path";
+import { discoverQmdBinding, prepareQmdStateDirectory, qmdApplicationDirectory, QmdAdapter } from "./qmd-adapter.ts";
 import { acquireIndexOwnership, type IndexOwnership } from "./index-ownership.ts";
-import { MaintenanceCoordinator } from "./maintenance-coordinator.ts";
+import { adoptLegacyApplicationJobs, MaintenanceCoordinator } from "./maintenance-coordinator.ts";
 import { MetadataIndex, registerMetadata, pageRendered, continuationOffset, continuationToken, tagCandidate } from "./metadata-index.ts";
 import type { MarkdownDatastoreConfig, StoreConfig } from "./config.ts";
 import { DatastoreError } from "./errors.ts";
@@ -57,16 +58,16 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 			const stateDirectory = `${catalog.stateRoot}/${definition.id}`;
 			await prepareQmdStateDirectory(stateDirectory);
 			ownerships.set(definition.id, await acquireIndexOwnership(stateDirectory));
+			if (config.qmd.enabled) { try { const binding = await discoverQmdBinding(config); await adoptLegacyApplicationJobs(`${stateDirectory}/jobs.json`, join(qmdApplicationDirectory(config, binding.version), "jobs.json")); } catch {} }
+			coordinator = new MaintenanceCoordinator(`${stateDirectory}/jobs.json`, () => new Set([definition.id]));
 			if (config.qmd.enabled) {
 				try {
-					const adapter = new QmdAdapter(config, await discoverQmdBinding(config));
+					const adapter = new QmdAdapter(config, await discoverQmdBinding(config), coordinator);
 					try { await adapter.acquireOwnership(); }
 					catch (error) { await adapter.shutdown(); throw error; }
 					adapters.set(definition.id, adapter);
-					coordinator = adapter.coordinator;
-				} catch { coordinator = undefined as unknown as MaintenanceCoordinator; }
+				} catch { /* graph work continues on the same coordinator */ }
 			}
-			if (!adapters.has(definition.id)) coordinator = new MaintenanceCoordinator(`${stateDirectory}/jobs.json`, () => new Set([definition.id]));
 			coordinators.set(definition.id, coordinator);
 			const index = new MetadataIndex(stateDirectory);
 			metadata.set(definition.id, index);
@@ -147,6 +148,7 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 					}
 				}
 				else if (call.operation === "activity" || call.operation === "status" || call.operation === "current") {
+					await coordinator.ensureLoaded();
 					const jobs = coordinator.jobs().filter((job) => job.mode === "metadata" && job.stores.includes(message.store));
 					const running = jobs.find((job) => job.state === "running");
 					const queued = jobs.find((job) => job.state === "queued");

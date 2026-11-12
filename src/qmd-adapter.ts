@@ -90,13 +90,18 @@ async function atomicJson(path: string, value: unknown): Promise<void> {
 	const directory = await open(dirname(path), constants.O_RDONLY); await directory.sync(); await directory.close();
 }
 
+export function qmdApplicationDirectory(config: MarkdownDatastoreConfig, version: string): string {
+	const fingerprint = createHash("sha256").update(JSON.stringify([...config.stores.values()])).digest("hex").slice(0, 16);
+	return join(config.stateRoot, `qmd-public-${version}-${fingerprint}`);
+}
+
 export class QmdAdapter {
  readonly config: MarkdownDatastoreConfig; readonly binding: QmdBinding; readonly root: string; readonly configFingerprint: string;
  #ownershipPromise?: Promise<IndexOwnership>; #indexOwnership?: IndexOwnership;
  #reader: QmdWorkerClient; #writer: QmdWorkerClient;
  #readTail: Promise<void> = Promise.resolve(); #refreshTail: Promise<void> = Promise.resolve();
  #rebuilding = false; #needsRebuild = false; #embeddingActive = false; #closed = false; #lifecycle = new AbortController(); #refreshActive = false;
- #runningJobs = new Set<Promise<void>>(); #coordinator: MaintenanceCoordinator;
+ #runningJobs = new Set<Promise<void>>(); #coordinator: MaintenanceCoordinator; #ownsCoordinator = true;
  #runtimeLexicalCurrent = new Set<string>(); #startup?: Promise<Record<string, unknown>>;
  #metadataLoaded = false; #manifest?: QmdManifest; #generation = `gen-${randomBytes(16).toString("hex")}`;
  #semanticStores = new Set<StoreConfig>(); #semanticBatchError?: string;
@@ -109,10 +114,11 @@ export class QmdAdapter {
   this.config = config; this.binding = binding;
   this.configFingerprint = createHash("sha256").update(JSON.stringify([...config.stores.values()])).digest("hex");
   // A new release/config gets independent derived state; older indexes are never migrated in place.
-  this.root = join(config.stateRoot, `qmd-public-${binding.version}-${this.configFingerprint.slice(0,16)}`);
+  this.root = qmdApplicationDirectory(config, binding.version);
   this.#reader = new QmdWorkerClient(config.defaults.operationTimeoutMs);
   this.#writer = new QmdWorkerClient(35 * 60_000);
-  this.#coordinator = coordinator ?? new MaintenanceCoordinator(join(this.root, "jobs.json"), () => new Set(this.config.stores.keys()));
+  this.#ownsCoordinator = coordinator === undefined;
+ this.#coordinator = coordinator ?? new MaintenanceCoordinator(join(this.root, "jobs.json"), () => new Set(this.config.stores.keys()));
   const run = async (job: QmdRefreshJob, signal: AbortSignal, report: (phase: QmdRefreshPhase) => void) => {
     const stores = job.stores.map((name) => this.config.stores.get(name)!);
     const result = await this.refreshInner(stores, job.mode === "semantic", signal, report);
@@ -249,7 +255,7 @@ export class QmdAdapter {
   const previous=this.#readTail;const operation=(async()=>{await this.waitFor(previous,activeSignal);await this.validateBinding();await this.prepare();const raw=await this.#reader.request(this.request("status"),{signal:activeSignal});return {state:"ready",version:this.binding.version,generatedAt:this.#manifest?.generatedAt,semanticAt:raw.status.needsEmbedding===0 && raw.status.hasVectorIndex ? this.#manifest?.semanticAt : undefined,documentCount:raw.status.totalDocuments,pendingEmbeddings:raw.status.needsEmbedding,hasVectorIndex:raw.status.hasVectorIndex,refresh:this.activity(),stores:Object.fromEntries([...this.config.stores.values()].map(s=>[s.name,{documentCount:raw.collections.find((c:any)=>c.name===s.search.qmdCollection)?.active_count,runtimeLexicalCurrent:this.isLexicallyCurrent(s.name)}]))};})();this.#readTail=operation.then(()=>undefined,()=>undefined);return operation;
  }
  get coordinator(): MaintenanceCoordinator { return this.#coordinator; }
- async shutdown(): Promise<void> { if(this.#closed)return;this.#closed=true;this.#coordinator.shutdown();this.#lifecycle.abort(new DatastoreError("CANCELLED"));await this.#semanticBatch.close();await Promise.allSettled([this.#refreshTail,this.#readTail,this.#coordinator.settled(),...(this.#startup?[this.#startup]:[])]);await Promise.all([this.#reader.shutdown(),this.#writer.shutdown()]); await this.#ownershipPromise?.then(ownership => ownership.release(), () => undefined); }
+ async shutdown(): Promise<void> { if(this.#closed)return;this.#closed=true;if(this.#ownsCoordinator)this.#coordinator.shutdown();this.#lifecycle.abort(new DatastoreError("CANCELLED"));await this.#semanticBatch.close();await Promise.allSettled([this.#refreshTail,this.#readTail,...(this.#ownsCoordinator?[this.#coordinator.settled()]:[]),...(this.#startup?[this.#startup]:[])]);await Promise.all([this.#reader.shutdown(),this.#writer.shutdown()]); await this.#ownershipPromise?.then(ownership => ownership.release(), () => undefined); }
 }
 export function decodeQmdUri(uri: unknown, expectedCollection: string): string {
  if(typeof uri!=="string" || uri.includes("?") || uri.includes("#") || !uri.startsWith(`qmd://${expectedCollection}/`))throw new DatastoreError("BACKEND_OUTPUT_INVALID");

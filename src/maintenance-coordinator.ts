@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, open, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { DatastoreError, throwIfAborted } from "./errors.ts";
 import type { QmdRefreshJob, QmdRefreshPhase } from "./qmd-adapter.ts";
@@ -23,6 +23,14 @@ async function atomicJson(path: string, value: unknown): Promise<void> {
 }
 
 /** Existing queue, receipt file, coalescing and cancellation. Backends register runners; they do not keep another queue. */
+export async function adoptLegacyApplicationJobs(stablePath: string, legacyPath: string): Promise<void> {
+	try { await lstat(stablePath); return; } catch (error: any) { if (error?.code !== "ENOENT") throw error; }
+	let info: Awaited<ReturnType<typeof lstat>>;
+	try { info = await lstat(legacyPath); } catch { return; }
+	if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0 || info.size > 256 * 1024) return;
+	await copyFile(legacyPath, stablePath);
+}
+
 export class MaintenanceCoordinator {
 	#jobs = new Map<string, QmdRefreshJob>();
 	#controllers = new Map<string, AbortController>();

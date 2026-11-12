@@ -308,6 +308,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 			const runtimeCurrent = cachedStore?.runtimeLexicalCurrent === true;
 			const semanticState = qmdState.state === "ready" && typeof backendStatus?.semanticAt !== "string" ? { ...qmdState, state: "degraded" as const, reasonCode: "STALE_INDEX" } : qmdState;
 			const localSnapshot = store.shared ? undefined : await this.metadata?.get(store.name)?.snapshot();
+			await this.maintenance?.ensureLoaded();
 			const metadataJobs = (this.maintenance?.jobs() ?? []).filter((job) => job.mode === "metadata" && job.stores.includes(store.name));
 			const metadataRunning = metadataJobs.find((job) => job.state === "running");
 			const metadataQueued = metadataJobs.find((job) => job.state === "queued");
