@@ -43,8 +43,9 @@ Write `.pi/markdown-datastore/config.json` with generic store identities:
 Then `chmod 600 .pi/markdown-datastore/config.json`. The config and authority
 parents must be current-user-owned, regular directories/files with the existing
 safe-mode contract. Root directories must exist; relative roots resolve against
-this project, and deliberately configured absolute roots are allowed. Store names,
-canonical roots, and qmd collections must be unique. Unknown/duplicate config
+this project, and deliberately configured absolute roots are allowed. Store aliases
+must be unique. Private roots and qmd collections are unique within their
+project-owned backend; shared canonical definitions use independent namespaces. Unknown/duplicate config
 keys are rejected. Roots must name real directories without symlink aliases,
 including in their ancestry. Descendant symlinks and hard-linked notes are not
 accepted by direct reads. The extension does not move, copy, unlink, chmod, or
@@ -101,7 +102,38 @@ explicit lexical refresh when needed. External filesystem edits require refresh.
 
 ## Shared catalog
 
-A shared store is opt-in. Write an absolute catalog the operator owns, then reference it from a project store. The catalog's `socketPath` and `stateRoot` are absolute. Its `defaults` and `qmd` fields are the same reader and backend settings a private store already uses. They are not new limits.
+A shared store is opt-in. Write an absolute catalog the operator owns, then reference it from a project store. The catalog's `socketPath`, `stateRoot` and source roots are absolute. The socket parent must be an owner-only directory; the catalog must be a protected current-user-owned file. Its `defaults` and `qmd` fields are the same reader and backend settings a private store already uses, not transport limits.
+
+For example, a catalog can use this shape. The numeric settings repeat the private-store example above; they illustrate existing configuration and do not establish approval or new defaults:
+
+```json
+{
+  "schemaVersion": 1,
+  "socketPath": "/example/run/markdown.sock",
+  "stateRoot": "/example/state/shared",
+  "defaults": {
+    "maxResultBytes": 12288,
+    "maxResultLines": 300,
+    "operationTimeoutMs": 10000
+  },
+  "qmd": {
+    "enabled": true,
+    "installation": { "packageRoot": "/example/qualified-qmd" },
+    "minimumVersion": "2.8.3"
+  },
+  "stores": {
+    "notebook": {
+      "root": "/example/notebook",
+      "include": ["**/*.md"],
+      "exclude": [".git/**", ".pi/**"],
+      "maxFileBytes": 1048576,
+      "search": { "defaultMode": "lexical", "qmdCollection": "notes" }
+    }
+  }
+}
+```
+
+The source root and the state/socket parents must exist. The host creates and validates its protected state directory without changing source permissions. Keep socket paths within the operating system's native Unix-socket support; an OS path error is not permission to move source files or invent a new application length policy.
 
 Start the service in the foreground after building:
 
@@ -115,7 +147,11 @@ Do not install a LaunchAgent or start it from a project session. A project store
 "notes": { "shared": { "catalog": "/absolute/catalog.json", "store": "notebook" } }
 ```
 
-The local name may differ from the catalog id. Search and refresh fail while the service is down. Direct find and read still use the catalog's source root. Stopping the project does not stop the service.
+The local name may differ from the catalog id. Search and refresh fail while the service is down. Direct find and read still use the catalog's source root. Stopping the project does not stop the service. Reusing a native collection name in an independent index is allowed; a local alias does not allocate another index.
+
+A second host cannot claim an already-owned index by selecting a different socket or catalog path. On graceful shutdown, the common maintenance unit closes its workers and releases ownership. After a crash, the operator may run the same foreground command again: proven-dead owner/worker records are reclaimed, interrupted receipts are recovered and reconciliation runs. No manual dead-lock-file deletion, autostart or lease timer is required. If a recorded process is still live or cannot be verified dead, startup reports unavailable; inspect ownership rather than deleting its records or automatically killing that process.
+
+Catalog and project definitions are loaded at startup, not hot-reloaded. Deliberate definition changes require reloading the corresponding host/project; changed source-root identities invalidate old attachments rather than silently redirecting them.
 
 During coordinator-owned semantic maintenance, lexical reads use a separate
 process. Hybrid requests return lexical results with `SEMANTIC_UNAVAILABLE`

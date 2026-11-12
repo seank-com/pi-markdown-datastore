@@ -201,10 +201,7 @@ export async function loadMarkdownDatastoreConfig(projectRootInput: string, conf
 			if (!isAbsolute(catalogPath) || !STORE_NAME.test(sharedId)) throw new DatastoreError("CONFIG_INVALID");
 			const catalog = await loadSharedCatalog(catalogPath);
 			const defined = catalog.stores.get(sharedId);
-			if (!defined || canonicalRoots.has(defined.root)) throw new DatastoreError("CONFIG_INVALID");
-			canonicalRoots.add(defined.root);
-			if (qmdCollections.has(defined.search.qmdCollection)) throw new DatastoreError("CONFIG_INVALID");
-			qmdCollections.add(defined.search.qmdCollection);
+			if (!defined) throw new DatastoreError("CONFIG_INVALID");
 			stores.set(name, {
 				name, configuredRoot: defined.root, root: defined.root, rootWasSymlink: false, rootDev: defined.rootDev, rootIno: defined.rootIno,
 				include: defined.include, exclude: defined.exclude, maxFileBytes: defined.maxFileBytes, search: defined.search,

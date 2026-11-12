@@ -10,6 +10,7 @@ import { HARD_MAX_CANDIDATES } from "./config.ts";
 import { validateRelativeNotePath, walkSafeNoteMetadata } from "./containment.ts";
 import { abortError, DatastoreError, throwIfAborted } from "./errors.ts";
 import { QmdWorkerClient, type QmdWorkerProgress, type QmdWorkerRequest } from "./qmd-worker-client.ts";
+import { acquireIndexOwnership, type IndexOwnership } from "./index-ownership.ts";
 
 const TESTED_QMD_VERSIONS = new Set(["2.8.3"]);
 const MAX_REFRESH_DOCUMENTS = 100_000;
@@ -79,6 +80,7 @@ async function protectedDir(path: string): Promise<void> {
 	try { info = await lstat(path); } catch (error: any) { if (error?.code !== "ENOENT") throw new DatastoreError("INDEX_CORRUPT"); await mkdir(path, { recursive: false, mode: 0o700 }).catch((error: NodeJS.ErrnoException) => { if(error.code !== "EEXIST") throw error; }); info = await lstat(path); }
 	if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) throw new DatastoreError("INDEX_CORRUPT");
 }
+export { protectedDir as prepareQmdStateDirectory };
 async function atomicJson(path: string, value: unknown): Promise<void> {
 	const temp = `${path}.tmp-${randomBytes(8).toString("hex")}`;
 	await writeFile(temp, JSON.stringify(value), { mode: 0o600 });
@@ -89,6 +91,7 @@ async function atomicJson(path: string, value: unknown): Promise<void> {
 
 export class QmdAdapter {
  readonly config: MarkdownDatastoreConfig; readonly binding: QmdBinding; readonly root: string; readonly configFingerprint: string;
+ #ownershipPromise?: Promise<IndexOwnership>; #indexOwnership?: IndexOwnership;
  #reader: QmdWorkerClient; #writer: QmdWorkerClient;
  #readTail: Promise<void> = Promise.resolve(); #refreshTail: Promise<void> = Promise.resolve();
  #rebuilding = false; #needsRebuild = false; #embeddingActive = false; #closed = false; #lifecycle = new AbortController(); #refreshActive = false;
@@ -110,6 +113,16 @@ export class QmdAdapter {
   this.#reader = new QmdWorkerClient(config.defaults.operationTimeoutMs);
   this.#writer = new QmdWorkerClient(35 * 60_000);
  }
+ async acquireOwnership(): Promise<IndexOwnership> {
+  if (this.#closed) throw new DatastoreError("CANCELLED");
+  this.#ownershipPromise ??= (async () => {
+   await protectedDir(this.config.stateRoot); await protectedDir(this.root);
+   const ownership = await acquireIndexOwnership(this.root);
+   if (this.#closed) { await ownership.release(); throw new DatastoreError("CANCELLED"); }
+   this.#indexOwnership = ownership; return ownership;
+  })();
+  return this.#ownershipPromise;
+ }
  private operationSignal(signal?: AbortSignal): AbortSignal { return AbortSignal.any([this.#lifecycle.signal, ...(signal ? [signal] : [])]); }
  private async validateBinding(): Promise<void> {
   const binding = await discoverQmdBinding(this.config);
@@ -117,7 +130,7 @@ export class QmdAdapter {
   for (const store of this.config.stores.values()) { const info = await stat(store.root); if (!info.isDirectory() || info.dev !== store.rootDev || info.ino !== store.rootIno) throw new DatastoreError("STORE_UNAVAILABLE"); }
  }
  private async prepare(): Promise<void> {
-  await protectedDir(this.config.stateRoot); await protectedDir(this.root);
+  await this.acquireOwnership();
   if (!this.#metadataLoaded) {
    const path=join(this.root,"reconciliation.json");
    try { const info=await lstat(path); if(!info.isFile() || info.isSymbolicLink() || info.nlink!==1 || info.uid!==process.getuid?.() || (info.mode & 0o077)!==0 || info.size>65536)throw new DatastoreError("INDEX_CORRUPT");
@@ -131,7 +144,9 @@ export class QmdAdapter {
   for (const name of await readdir(join(this.root,"backend"))) { const info = await lstat(join(this.root,"backend",name)).catch((error: NodeJS.ErrnoException) => { if(error.code === "ENOENT")return undefined;throw error; }); if(!info)continue; if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) throw new DatastoreError("INDEX_CORRUPT"); }
  }
  private request(operation: string, extra: Record<string, unknown> = {}): QmdWorkerRequest {
-  return { version: 2, sdkUrl: this.binding.sdkUrl, dbPath: join(this.root,"backend","index.sqlite"), config: { collections: Object.fromEntries([...this.config.stores.values()].map(s => [s.search.qmdCollection,{path:s.root,pattern:s.include[0],ignore:s.exclude,includeByDefault:false}])) }, operation, ...extra };
+  if (!this.#indexOwnership) throw new DatastoreError("STORE_UNAVAILABLE");
+  const { directory, ownerName, nonce } = this.#indexOwnership;
+  return { version: 2, sdkUrl: this.binding.sdkUrl, dbPath: join(this.root,"backend","index.sqlite"), ownership: { directory, ownerName, nonce }, config: { collections: Object.fromEntries([...this.config.stores.values()].map(s => [s.search.qmdCollection,{path:s.root,pattern:s.include[0],ignore:s.exclude,includeByDefault:false}])) }, operation, ...extra };
  }
  private waitFor<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
   throwIfAborted(signal); return new Promise((resolve,reject) => { const abort = () => reject(abortError(signal)); signal.addEventListener("abort",abort,{once:true}); operation.then(value => { signal.removeEventListener("abort",abort);resolve(value); },error => {signal.removeEventListener("abort",abort);reject(error);}); });
@@ -171,6 +186,7 @@ export class QmdAdapter {
  }
 	private jobStatuses(): QmdRefreshJob[] { return [...this.#jobs.values()].sort((left, right) => right.createdAt.localeCompare(left.createdAt)).map((job) => structuredClone(job)); }
 	private async ensureJobs(): Promise<void> {
+		await this.acquireOwnership();
 		if (this.#jobsLoaded) return; if (this.#jobsLoad) return this.#jobsLoad;
 		this.#jobsLoad = this.loadJobs(); try { await this.#jobsLoad; } finally { this.#jobsLoad = undefined; }
 	}
@@ -259,7 +275,7 @@ export class QmdAdapter {
   if (this.#refreshActive) return {state:"degraded",reasonCode:this.#embeddingActive ? "SEMANTIC_UNAVAILABLE" : "STALE_INDEX",version:this.binding.version,refresh:this.activity(),stores:{}};
   const previous=this.#readTail;const operation=(async()=>{await this.waitFor(previous,activeSignal);await this.validateBinding();await this.prepare();const raw=await this.#reader.request(this.request("status"),{signal:activeSignal});return {state:"ready",version:this.binding.version,generatedAt:this.#manifest?.generatedAt,semanticAt:raw.status.needsEmbedding===0 && raw.status.hasVectorIndex ? this.#manifest?.semanticAt : undefined,documentCount:raw.status.totalDocuments,pendingEmbeddings:raw.status.needsEmbedding,hasVectorIndex:raw.status.hasVectorIndex,refresh:this.activity(),stores:Object.fromEntries([...this.config.stores.values()].map(s=>[s.name,{documentCount:raw.collections.find((c:any)=>c.name===s.search.qmdCollection)?.active_count,runtimeLexicalCurrent:this.isLexicallyCurrent(s.name)}]))};})();this.#readTail=operation.then(()=>undefined,()=>undefined);return operation;
  }
- async shutdown(): Promise<void> { if(this.#closed)return;this.#closed=true;this.#lifecycle.abort(new DatastoreError("CANCELLED"));await this.#semanticBatch.close();await Promise.allSettled([...this.#runningJobs,this.#refreshTail,this.#readTail,...(this.#startup?[this.#startup]:[])]);await Promise.all([this.#reader.shutdown(),this.#writer.shutdown()]);await this.#persistTail.catch(()=>undefined); }
+ async shutdown(): Promise<void> { if(this.#closed)return;this.#closed=true;this.#lifecycle.abort(new DatastoreError("CANCELLED"));await this.#semanticBatch.close();await Promise.allSettled([...this.#runningJobs,this.#refreshTail,this.#readTail,...(this.#startup?[this.#startup]:[])]);await Promise.all([this.#reader.shutdown(),this.#writer.shutdown()]);await this.#persistTail.catch(()=>undefined); await this.#ownershipPromise?.then(ownership => ownership.release(), () => undefined); }
 }
 export function decodeQmdUri(uri: unknown, expectedCollection: string): string {
  if(typeof uri!=="string" || uri.includes("?") || uri.includes("#") || !uri.startsWith(`qmd://${expectedCollection}/`))throw new DatastoreError("BACKEND_OUTPUT_INVALID");

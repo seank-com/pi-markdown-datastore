@@ -27,7 +27,7 @@ test("one maintenance implementation is hosted, not copied", async () => {
 	assert.equal((host.match(/class /g) ?? []).length, 0);
 });
 
-test("private and shared hosts expose the same refresh coalescing and detach does not rebuild", async (t) => {
+test("foreground shared service preserves aliases, accepted receipts and direct reads after detach", async (t) => {
 	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-shared-")));
 	const socketDir = `/tmp/ds${process.pid}`;
 	await mkdir(socketDir, { mode: 0o700 });
@@ -64,10 +64,13 @@ test("private and shared hosts expose the same refresh coalescing and detach doe
 	await writeFile(privateConfigPath, JSON.stringify({ schemaVersion: 1, defaults: { maxResultBytes: 8192, maxResultLines: 100, operationTimeoutMs: 3000 }, qmd: { enabled: true, installation: { packageRoot }, minimumVersion: "2.8.3" }, stores: { memory: { root: "notes", include: ["**/*.md"], exclude: [], maxFileBytes: 4096, search: { defaultMode: "lexical", qmdCollection: "memory" } } } }), { mode: 0o600 });
 	const privateConfig = await loadMarkdownDatastoreConfig(privateProject, privateConfigPath);
 	privateAdapter = new QmdAdapter(privateConfig, await discoverQmdBinding(privateConfig));
+	await mkdir(privateAdapter.root, { recursive: true, mode: 0o700 });
+	await writeFile(join(privateAdapter.root, "behavior.json"), JSON.stringify({ updateGate: "private-coalescing" }), { mode: 0o600 });
 	const first = await privateAdapter.startLexicalRefresh([privateConfig.stores.get("memory")!]);
 	const second = await privateAdapter.startLexicalRefresh([privateConfig.stores.get("memory")!]);
 	assert.equal(second.refreshId, first.refreshId);
 	assert.equal(second.coalesced, true);
+	await writeFile(join(privateAdapter.root, "private-coalescing.release"), "", { mode: 0o600 });
 
 	child = spawn(process.execPath, ["--experimental-strip-types", "src/shared-service-main.ts", "--catalog", catalogPath], { cwd: new URL("..", import.meta.url).pathname, stdio: ["ignore", "pipe", "pipe"] });
 	let err = "";
@@ -95,8 +98,8 @@ test("private and shared hosts expose the same refresh coalescing and detach doe
 
 	const leftReceipt = await left.service.refresh({ action: "start", store: left.alias, mode: "lexical" });
 	const rightReceipt = await right.service.refresh({ action: "start", store: right.alias, mode: "lexical" });
-	assert.equal(rightReceipt.data.qmd.refreshId, leftReceipt.data.qmd.refreshId);
-	assert.equal(rightReceipt.data.qmd.coalesced, true);
+	assert.deepEqual(leftReceipt.data.qmd.stores, [left.alias]);
+	assert.deepEqual(rightReceipt.data.qmd.stores, [right.alias]);
 	await left.service.shutdown();
 	const still = await right.client.activity();
 	assert.equal(still.jobs.some((job) => job.refreshId === leftReceipt.data.qmd.refreshId), true);

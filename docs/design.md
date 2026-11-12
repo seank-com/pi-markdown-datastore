@@ -7,8 +7,11 @@ owns indexing, embeddings, ranking, model lifetime, cache storage and recovery.
 ## Identity and source validation
 
 Each trusted project supplies protected strict JSON configuration at
-`.pi/markdown-datastore/config.json`. Store names, canonical roots and collection
-names are unique. Unknown/duplicate keys and unsafe configuration authority
+`.pi/markdown-datastore/config.json`. Project store aliases are unique. Private definitions keep root and collection
+uniqueness within their project-owned backend. Shared definitions have canonical
+catalog IDs and independent backend namespaces; a backend-local collection name
+may recur in another shared index. Explicitly different index definitions may
+use the same source root. Paths alone do not identify a datastore. Unknown/duplicate keys and unsafe configuration authority
 paths fail closed. Configuration is current-user-owned, at most 64 KiB and mode
 0600; authority directories have checked ownership and permissions.
 
@@ -83,7 +86,8 @@ additional encountered restrictions rather than assuming this list is exhaustive
 | Publication content matching uses the README registry rules. Location: `scripts/check-private-terms.ts`; registry paths are configurable with `PRIVATE_TERMS_FILE`/`PRIVATE_SECRETS_FILE`. | Rejects matching private terms and credential values; matching-policy evidence is distinct from the revision-range correction and output cap. |
 | Existing-branch publication scans exclude `origin/main` ancestry; new branches exclude known remote history. Location: `.githooks/pre-push`. | Approved correction in PR #13 prevents published main history from blocking clean updates; feature checks remain. |
 | Publication scanner Git-output capture is 256 MiB. Location: `scripts/check-private-terms.ts`; fixed by scanner maintainers. | Can reject large captured Git output. Specific necessity/approval is not established by the registry or revision-selection rules. |
-| Shared index socket is current-user-owned and not a network listener. Location: `src/shared-ipc.ts`. The service hosts `QmdAdapter`; it adds no transport deadline or frame cap. | Keeps shared index ownership in the operator-started service. Existing reader, maintenance and result limits still apply inside that adapter. Reuse does not approve them. |
+| Shared catalog uses protected JSON, the inherited 64 KiB configuration bound and one include pattern per native collection; the socket parent is owner-only and the socket mode is `0600`. Locations: `src/shared-catalog.ts`, `src/shared-ipc.ts`; catalog values belong to the operator. | Canonical definitions and owner-account-only local IPC are approved in issue #4. The catalog reuses existing reader/file/operation ranges rather than selecting a new transport deadline or frame cap. Reuse does not approve legacy numeric bounds; the single-pattern mapping follows the qualified qmd collection interface. |
+| One maintenance owner per derived index, independent of IPC path. Protected ownership directory `0700`, records `0600`; live or unverifiable owner/worker PIDs refuse admission. Locations: `src/index-ownership.ts`, `QmdAdapter`, native-worker registration. | Approved single-index ownership and operator restart without manual dead-owner cleanup, issue #4 and the owner's 2026-11-12 recovery decision. Atomic nonempty-directory admission prevents simultaneous reclaimers replacing one another. Only proven-dead process records are reclaimed; no lease timer, election, process killing or autostart. PID reuse is conservatively treated as live, not guessed dead. |
 
 ## Public qmd lifecycle
 
@@ -177,9 +181,11 @@ A project store is either private or an explicit reference to a shared catalog e
 
 Indexed search, refresh, status and job cancellation for a shared store go to one foreground local service. That service hosts the same `QmdAdapter` used for a private store, one adapter and one derived index per canonical shared datastore. The project does not keep a second coordinator or a private replacement index for that store. If the service is unavailable, shared indexed operations fail and direct reads continue.
 
-The service is started by an operator with `--catalog`. Projects connect to its configured owner-only socket. They do not launch it, install a LaunchAgent, or become its owner. Closing a project closes that client's waiters. It does not cancel an accepted shared job or rebuild the index. Restarting the service creates a new generation. A request bound to the previous generation or a different definition revision fails instead of being retargeted.
+The service is started by an operator with `--catalog`. Projects connect to its configured owner-only socket. They do not launch it, install a LaunchAgent, or become its owner. Closing a project closes that client's waiters. It does not cancel an accepted shared job or rebuild the index. Restarting the service creates a new generation. A request bound to the previous generation or a different definition revision fails instead of being retargeted. Definition revisions include captured source-root device/inode identity, so replacing a root at the same path invalidates old attachments.
 
-Private stores keep project-hosted maintenance. That is the same adapter class, not a second algorithm. A future links-and-tags index is not part of this path.
+`src/index-ownership.ts` admits one owning maintenance unit for the actual derived index before the host changes its endpoint or starts reconciliation. A different catalog or socket does not bypass that guard. A complete, nonempty ownership generation is published atomically. Native workers register before SDK access; a surviving worker prevents a replacement owner even after its parent has exited. Graceful shutdown stops requests/workers, persists receipts and releases ownership. After an unclean exit, an operator-started replacement reclaims proven-dead records and uses the same interrupted-job reconciliation. Live or unverifiable process identity remains unavailable rather than being killed or silently replaced. No background restart is introduced.
+
+Private stores keep project-hosted maintenance through that same adapter and admission algorithm. Search validation, aggregate budgets/warnings and status readiness use common private/shared paths; receipts and reconciliation present the project's local store aliases while underlying refresh IDs and queue keys remain canonical.
 
 ## Integration lifecycle and packaging
 

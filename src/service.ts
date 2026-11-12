@@ -229,31 +229,36 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		return this.envelope("read", store.name, data, started, page.content, page.truncated, continuation, [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: "current" }], [], descriptor) as ReadResult;
 	}
 
+	private localReceipt<T extends object>(value: T, store: StoreConfig): T {
+		const stores = "stores" in value ? value.stores : undefined;
+		if (!store.shared || !Array.isArray(stores)) return value;
+		return { ...value, stores: stores.map(name => name === store.shared!.store ? store.name : name) };
+	}
+
 	private async statusInner(input: StatusInput, signal: AbortSignal): Promise<StatusResult> {
 		const started = Date.now(); throwIfAborted(signal);
 		const stores = input.store ? [this.store(input.store)] : [...this.config.stores.values()];
 		const statuses = []; let qmdStatus: Record<string, unknown> | undefined;
 		if (this.qmd) { try { qmdStatus = await this.qmd.status(signal); } catch (error) { propagateControlError(error); qmdStatus = { state: "degraded", reasonCode: error instanceof DatastoreError ? error.code : "BACKEND_FAILED" }; } }
-		const qmdActivity = this.qmd?.activity?.() ?? (qmdStatus?.reconciliation as ReturnType<QmdAdapter["activity"]> | undefined); const qmdJobs = qmdActivity?.jobs ?? [];
-		const qmdSummary = qmdStatus ? Object.fromEntries(Object.entries(qmdStatus).filter(([key]) => !["stores", "refresh", "reconciliation"].includes(key))) : undefined;
-		if (qmdSummary && qmdActivity) qmdSummary.refresh = { state: qmdActivity.state, active: qmdActivity.active, queued: qmdActivity.queued };
 		for (const store of stores) {
+			let backendStatus = qmdStatus;
+			let qmdActivity = this.qmd?.activity?.() ?? (qmdStatus?.reconciliation as ReturnType<QmdAdapter["activity"]> | undefined);
+			let enabled = this.config.qmd.enabled, available = Boolean(this.qmd), version = this.qmd?.binding.version, canonicalName = store.name;
 			if (store.shared) {
 				const client = this.sharedClients?.get(store.name);
-				let remote: Record<string, unknown> | undefined;
-				if (!client) remote = { state: "unavailable", reasonCode: "STORE_UNAVAILABLE" };
-				else { try { remote = await client.status(signal); } catch (error) { propagateControlError(error); remote = { state: "unavailable", reasonCode: error instanceof DatastoreError ? error.code : "STORE_UNAVAILABLE" }; } }
-				const remoteStores = remote?.stores && typeof remote.stores === "object" ? remote.stores as Record<string, Record<string, unknown>> : undefined;
-				const cached = remoteStores?.[store.shared.store];
-				const runtimeCurrent = cached?.runtimeLexicalCurrent === true;
-				const ready = remote?.state === "ready";
-				const qmdState = ready ? { state: "ready" as const, backend: "qmd" as const, version: client?.version, freshness: { state: runtimeCurrent ? "current" as const : "stale" as const } } : { state: "unavailable" as const, reasonCode: String(remote?.reasonCode ?? "STORE_UNAVAILABLE") };
-				statuses.push({ store: store.name, root: redactedRoot(store, this.config.projectRoot), rootWasSymlink: false, fileCount: typeof cached?.documentCount === "number" ? cached.documentCount : undefined, fileCountSource: cached?.documentCount === undefined ? "unavailable" : "backend-reported-count", permissionWarnings: [], sourceReconciliation: { state: runtimeCurrent ? "succeeded" : "pending", additionsMayBeAbsent: !runtimeCurrent, sourceTraversalPerformed: false }, qmd: remote, capabilities: { direct: { state: "ready" as const, backend: "direct", exactPath: true, boundedContent: true, boundedSection: true, currentFileValidation: true, singleNoteFallbackLinks: false }, search: { lexical: qmdState, semantic: qmdState, hybrid: qmdState }, outline: { state: "ready", backend: "direct" }, mutations: { supported: false } } });
-				continue;
+				enabled = true; available = Boolean(client); canonicalName = store.shared.store;
+				if (!client) backendStatus = { state: "unavailable", reasonCode: "STORE_UNAVAILABLE" };
+				else { try { backendStatus = await client.status(signal); } catch (error) { propagateControlError(error); backendStatus = { state: "unavailable", reasonCode: error instanceof DatastoreError ? error.code : "STORE_UNAVAILABLE" }; } }
+				version = client?.version;
+				qmdActivity = backendStatus?.refresh as ReturnType<QmdAdapter["activity"]> | undefined;
 			}
-			const cachedStore = qmdStatus?.stores && typeof qmdStatus.stores === "object" ? (qmdStatus.stores as Record<string, Record<string, unknown>>)[store.name] : undefined; const fileCount = typeof cachedStore?.documentCount === "number" ? cachedStore.documentCount : undefined; const directState = "ready" as const; const reasonCode = undefined;
-			const runtimeCurrent = cachedStore?.runtimeLexicalCurrent === true; const qmdState = !this.config.qmd.enabled ? { state: "disabled" as const } : !this.qmd ? { state: "unavailable" as const, reasonCode: "BACKEND_MISSING" } : qmdStatus?.state === "ready" ? { state: "ready" as const, backend: "qmd" as const, version: this.qmd.binding.version, freshness: { state: runtimeCurrent ? "current" as const : "stale" as const } } : { state: "degraded" as const, backend: "qmd" as const, version: this.qmd.binding.version, reasonCode: String(qmdStatus?.reasonCode ?? "STALE_INDEX") };
-			const semanticState = qmdState.state === "ready" && typeof qmdStatus?.semanticAt !== "string" ? { ...qmdState, state: "degraded" as const, reasonCode: "STALE_INDEX" } : qmdState;
+			const qmdJobs = (qmdActivity?.jobs ?? []).map(job => this.localReceipt(job, store));
+			const qmdSummary = backendStatus ? Object.fromEntries(Object.entries(backendStatus).filter(([key]) => !["stores", "refresh", "reconciliation"].includes(key))) : undefined;
+			if (qmdSummary && qmdActivity) qmdSummary.refresh = { state: qmdActivity.state, active: qmdActivity.active, queued: qmdActivity.queued };
+			const cachedStore = backendStatus?.stores && typeof backendStatus.stores === "object" ? (backendStatus.stores as Record<string, Record<string, unknown>>)[canonicalName] : undefined; const fileCount = typeof cachedStore?.documentCount === "number" ? cachedStore.documentCount : undefined; const directState = "ready" as const; const reasonCode = undefined;
+			const qmdState = !enabled ? { state: "disabled" as const } : !available || backendStatus?.state === "unavailable" ? { state: "unavailable" as const, reasonCode: String(backendStatus?.reasonCode ?? (store.shared ? "STORE_UNAVAILABLE" : "BACKEND_MISSING")) } : backendStatus?.state === "ready" ? { state: "ready" as const, backend: "qmd" as const, version, freshness: { state: cachedStore?.runtimeLexicalCurrent === true ? "current" as const : "stale" as const } } : { state: "degraded" as const, backend: "qmd" as const, version, reasonCode: String(backendStatus?.reasonCode ?? "STALE_INDEX") };
+			const runtimeCurrent = cachedStore?.runtimeLexicalCurrent === true;
+			const semanticState = qmdState.state === "ready" && typeof backendStatus?.semanticAt !== "string" ? { ...qmdState, state: "degraded" as const, reasonCode: "STALE_INDEX" } : qmdState;
 			const permissionWarnings: string[] = []; const relevantJobs = qmdJobs.filter((job) => job.stores.includes(store.name)); const latest = relevantJobs[0]; const running = relevantJobs.find((job) => job.state === "running"); const queued = relevantJobs.find((job) => job.state === "queued"); const reconciliationState = runtimeCurrent ? "succeeded" : running ? "running" : queued ? "queued" : latest?.state === "failed" ? "failed" : latest?.state === "cancelled" ? "cancelled" : "pending";
 			const reconciliation = { state: reconciliationState, additionsMayBeAbsent: !runtimeCurrent, sourceTraversalPerformed: false, job: running ?? queued ?? latest };
 			statuses.push({ store: store.name, root: redactedRoot(store, this.config.projectRoot), rootWasSymlink: store.rootWasSymlink, fileCount, fileCountSource: fileCount === undefined ? "unavailable" : "backend-reported-count", permissionWarnings, sourceReconciliation: reconciliation, qmd: qmdSummary, capabilities: { direct: { state: directState, backend: "direct", exactPath: true, boundedContent: true, boundedSection: true, currentFileValidation: true, singleNoteFallbackLinks: false, reasonCode }, search: { lexical: qmdState, semantic: semanticState, hybrid: semanticState }, outline: {state:"ready",backend:"direct"}, mutations: { supported: false } } });
@@ -273,7 +278,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 			for (const store of sharedStores) {
 				const client = this.sharedClients?.get(store.name);
 				if (!client) throw new DatastoreError("STORE_UNAVAILABLE");
-				receipts.push(mode === "lexical" ? await client.startLexical(signal) : await client.startSemantic(signal));
+				receipts.push(this.localReceipt(mode === "lexical" ? await client.startLexical(signal) : await client.startSemantic(signal), store));
 			}
 				if (sharedStores.length === stores.length) {
 				const data = { action: "start", mode, qmd: receipts[0], shared: receipts, backgroundOwnership: "explicit-maintenance", durationMs: elapsed(started) };
@@ -296,10 +301,10 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		if (this.qmd) {
 			try { return await this.qmd.cancelRefresh(refreshId); } catch (error) { if (!(error instanceof DatastoreError) || error.code !== "INVALID_NOTE_REF") throw error; }
 		}
-		for (const client of this.sharedClients?.values() ?? []) {
-			try { return await client.cancel(refreshId, signal); } catch (error) { if (!(error instanceof DatastoreError) || error.code !== "INVALID_NOTE_REF") throw error; }
+		for (const [name, client] of this.sharedClients?.entries() ?? []) {
+			try { return this.localReceipt(await client.cancel(refreshId, signal), this.store(name)); } catch (error) { if (!(error instanceof DatastoreError) || error.code !== "INVALID_NOTE_REF") throw error; }
 		}
-		throw new DatastoreError("CAPABILITY_UNAVAILABLE");
+		throw new DatastoreError(this.qmd || this.sharedClients?.size ? "INVALID_NOTE_REF" : "CAPABILITY_UNAVAILABLE");
 	}
 	async shutdown(): Promise<void> {
 		if (this.#closed) return; this.#closed = true; this.continuations.clear(); this.#lifecycle.abort(new DatastoreError("CANCELLED"));

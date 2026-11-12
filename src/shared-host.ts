@@ -1,5 +1,5 @@
-import type { Socket } from "node:net";
-import { discoverQmdBinding, QmdAdapter } from "./qmd-adapter.ts";
+import type { Server, Socket } from "node:net";
+import { discoverQmdBinding, prepareQmdStateDirectory, QmdAdapter } from "./qmd-adapter.ts";
 import type { MarkdownDatastoreConfig, StoreConfig } from "./config.ts";
 import { DatastoreError } from "./errors.ts";
 import { loadSharedCatalog, type SharedCatalog, type SharedStoreDefinition } from "./shared-catalog.ts";
@@ -28,9 +28,27 @@ function storeConfig(catalog: SharedCatalog, definition: SharedStoreDefinition):
 export async function startSharedHost(catalogPath: string): Promise<SharedHost> {
 	const catalog = await loadSharedCatalog(catalogPath);
 	const generation = generationId();
+	await prepareQmdStateDirectory(catalog.stateRoot);
 	const adapters = new Map<string, QmdAdapter>();
 	const sockets = new Set<Socket>();
-	const server = await listenOwnedSocket(catalog.socketPath, (socket) => {
+	let server: Server | undefined;
+	let closing: Promise<void> | undefined;
+	const close = () => closing ??= (async () => {
+		const currentServer = server;
+		const stopped = currentServer ? new Promise<void>((resolve, reject) => currentServer.close(error => error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING" ? reject(error) : resolve())) : Promise.resolve();
+		for (const socket of sockets) socket.destroy();
+		await Promise.all([stopped, ...[...adapters.values()].map(adapter => adapter.shutdown())]);
+	})();
+	try {
+		// Admission precedes endpoint changes; no workers or reconciliation run yet.
+		for (const definition of catalog.stores.values()) {
+			const config = storeConfig(catalog, definition);
+			const adapter = new QmdAdapter(config, await discoverQmdBinding(config));
+			try { await adapter.acquireOwnership(); }
+			catch (error) { await adapter.shutdown(); throw error; }
+			adapters.set(definition.id, adapter);
+		}
+		server = await listenOwnedSocket(catalog.socketPath, (socket) => {
 		sockets.add(socket);
 		const waiters = new Map<string, AbortController>();
 		const send = (reply: SharedReply) => { if (!socket.destroyed) socket.write(encodeSharedMessage(reply)); };
@@ -79,25 +97,10 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 			for (const controller of waiters.values()) controller.abort(new DatastoreError("CANCELLED"));
 		});
 	});
-	try {
-		for (const definition of catalog.stores.values()) {
-			const config = storeConfig(catalog, definition);
-			const adapter = new QmdAdapter(config, await discoverQmdBinding(config));
-			adapters.set(definition.id, adapter);
-			void adapter.startupReconcile([config.stores.get(definition.id)!]).catch(() => undefined);
-		}
+		for (const adapter of adapters.values()) void adapter.startupReconcile([...adapter.config.stores.values()]).catch(() => undefined);
 	} catch (error) {
-		server.close();
-		for (const socket of sockets) socket.destroy();
-		await Promise.all([...adapters.values()].map((adapter) => adapter.shutdown()));
+		await close();
 		throw error;
 	}
-	return {
-		generation, catalog, adapters,
-		close: async () => {
-			server.close();
-			for (const socket of sockets) socket.destroy();
-			await Promise.all([...adapters.values()].map((adapter) => adapter.shutdown()));
-		},
-	};
+	return { generation, catalog, adapters, close };
 }

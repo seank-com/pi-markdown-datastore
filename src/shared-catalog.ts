@@ -101,8 +101,6 @@ export async function loadSharedCatalog(pathInput: string): Promise<SharedCatalo
 	const storesRaw = record(top.stores);
 	if (Object.keys(storesRaw).length === 0) throw new DatastoreError("CONFIG_INVALID");
 	const stores = new Map<string, SharedStoreDefinition>();
-	const roots = new Set<string>();
-	const collections = new Set<string>();
 	for (const [id, value] of Object.entries(storesRaw)) {
 		if (!NAME.test(id)) throw new DatastoreError("CONFIG_INVALID");
 		const storeRaw = record(value); exact(storeRaw, STORE);
@@ -110,20 +108,18 @@ export async function loadSharedCatalog(pathInput: string): Promise<SharedCatalo
 		if (!isAbsolute(configuredRoot)) throw new DatastoreError("CONFIG_INVALID");
 		const rootInfo = await lstat(configuredRoot).catch(() => { throw new DatastoreError("CONFIG_INVALID"); });
 		const root = await realpath(configuredRoot).catch(() => { throw new DatastoreError("CONFIG_INVALID"); });
-		if (rootInfo.isSymbolicLink() || root !== resolve(configuredRoot) || roots.has(root)) throw new DatastoreError("CONFIG_INVALID");
+		if (rootInfo.isSymbolicLink() || root !== resolve(configuredRoot)) throw new DatastoreError("CONFIG_INVALID");
 		const rootStat = await stat(root);
 		if (!rootStat.isDirectory()) throw new DatastoreError("CONFIG_INVALID");
-		roots.add(root);
 		const searchRaw = record(storeRaw.search); exact(searchRaw, SEARCH);
 		const defaultMode = text(searchRaw.defaultMode) as StoreConfig["search"]["defaultMode"];
 		const qmdCollection = text(searchRaw.qmdCollection);
-		if (!["lexical", "semantic", "hybrid"].includes(defaultMode) || !NAME.test(qmdCollection) || collections.has(qmdCollection)) throw new DatastoreError("CONFIG_INVALID");
-		collections.add(qmdCollection);
+		if (!["lexical", "semantic", "hybrid"].includes(defaultMode) || !NAME.test(qmdCollection)) throw new DatastoreError("CONFIG_INVALID");
 		const include = storeRaw.include === undefined ? ["**/*.md"] : (Array.isArray(storeRaw.include) ? storeRaw.include.map(text) : (() => { throw new DatastoreError("CONFIG_INVALID"); })());
 		if (include.length !== 1) throw new DatastoreError("CONFIG_INVALID");
 		const exclude = storeRaw.exclude === undefined ? [] : (Array.isArray(storeRaw.exclude) ? storeRaw.exclude.map(text) : (() => { throw new DatastoreError("CONFIG_INVALID"); })());
 		const maxFileBytes = integer(storeRaw.maxFileBytes, 1, 10 * 1024 * 1024);
-		const identity = { id, root, include, exclude, maxFileBytes, search: { defaultMode, qmdCollection }, qmd };
+		const identity = { id, root, rootDev: rootStat.dev, rootIno: rootStat.ino, include, exclude, maxFileBytes, search: { defaultMode, qmdCollection }, qmd };
 		stores.set(id, { id, root, rootDev: rootStat.dev, rootIno: rootStat.ino, include, exclude, maxFileBytes, search: { defaultMode, qmdCollection }, definitionRevision: definitionRevision(identity) });
 	}
 	return { path, socketPath, stateRoot, defaults, qmd, stores };
