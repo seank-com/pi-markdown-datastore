@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, copyFile, lstat, mkdir, open, readdir, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { legacyOwnerState } from "./index-ownership.ts";
 import { DatastoreError, throwIfAborted } from "./errors.ts";
@@ -33,30 +33,37 @@ function jobsMatch(raw: any, knownStores: ReadonlySet<string>): boolean {
 	return true;
 }
 
-export async function adoptLegacyApplicationJobs(stateRoot: string, stablePath: string, knownStores: ReadonlySet<string>): Promise<void> {
+export async function adoptLegacyApplicationJobs(stateRoot: string, stablePath: string, knownStores: ReadonlySet<string>, expectedDirectory: (version: string) => string): Promise<void> {
 	let stable: any;
 	try { stable = JSON.parse(await readFile(stablePath, "utf8")); } catch (error: any) { if (error?.code !== "ENOENT") throw error; }
 	if (stable && jobsMatch(stable, knownStores) && stable.jobs.length > 0) return;
 	const names = await readdir(stateRoot).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return []; throw error; });
 	const matches: string[] = [];
 	for (const name of names) {
-		if (!name.startsWith("qmd-public-")) continue;
+		const parsed = /^qmd-public-(.+)-([0-9a-f]{16})$/.exec(name);
+		if (!parsed) continue;
 		const directory = join(stateRoot, name);
 		const info = await lstat(directory).catch(() => undefined);
 		if (!info?.isDirectory() || info.isSymbolicLink()) continue;
-		const owner = await legacyOwnerState(directory);
-		if (owner === "live") throw new DatastoreError("STORE_UNAVAILABLE");
-		if (owner === "uncertain") throw new DatastoreError("INDEX_CORRUPT");
 		const path = join(directory, "jobs.json");
 		const file = await lstat(path).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? undefined : Promise.reject(error));
 		if (!file) continue;
+		if (directory !== expectedDirectory(parsed[1])) throw new DatastoreError("INDEX_CORRUPT");
+		const owner = await legacyOwnerState(directory);
+		if (owner === "live") throw new DatastoreError("STORE_UNAVAILABLE");
+		if (owner === "uncertain") throw new DatastoreError("INDEX_CORRUPT");
 		if (!file.isFile() || file.isSymbolicLink() || file.nlink !== 1 || file.uid !== process.getuid?.() || (file.mode & 0o077) !== 0 || file.size > 256 * 1024) throw new DatastoreError("INDEX_CORRUPT");
 		const raw = JSON.parse(await readFile(path, "utf8"));
-		if (!jobsMatch(raw, knownStores)) continue;
+		if (!jobsMatch(raw, knownStores)) throw new DatastoreError("INDEX_CORRUPT");
 		matches.push(path);
 	}
 	if (matches.length > 1) throw new DatastoreError("INDEX_CORRUPT");
-	if (matches.length === 1) await copyFile(matches[0], stablePath);
+	if (matches.length !== 1) return;
+	const temp = `${stablePath}.adopting-${randomBytes(8).toString("hex")}`;
+	await copyFile(matches[0], temp);
+	const probe = new MaintenanceCoordinator(temp, () => knownStores);
+	try { await probe.ensureLoaded(); probe.shutdown(); await rename(temp, stablePath); }
+	catch (error) { probe.shutdown(); await rm(temp, { force: true }).catch(() => undefined); throw error; }
 }
 
 export class MaintenanceCoordinator {

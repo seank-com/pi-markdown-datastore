@@ -12,6 +12,8 @@ export interface MarkdownDatastoreCapability {
 	/** Optional additive capability. Policy requests must bind to this instance. */
 	readonly policyVersion?: 1;
 	readonly instanceId?: string;
+	/** Additive. Absent on older contracts; present when graph and tag reads are served. */
+	readonly metadata?: { readonly links: true; readonly backlinks: true; readonly tags: true };
 }
 export interface MarkdownDatastoreCapabilityRequest { version: 1; requestId: string }
 export interface MarkdownDatastoreCapabilityReply {
