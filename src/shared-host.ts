@@ -1,5 +1,6 @@
 import type { Server, Socket } from "node:net";
 import { discoverQmdBinding, prepareQmdStateDirectory, QmdAdapter } from "./qmd-adapter.ts";
+import { MaintenanceCoordinator } from "./maintenance-coordinator.ts";
 import { MetadataIndex, registerMetadata } from "./metadata-index.ts";
 import type { MarkdownDatastoreConfig, StoreConfig } from "./config.ts";
 import { DatastoreError } from "./errors.ts";
@@ -10,6 +11,7 @@ export interface SharedHost {
 	generation: string;
 	catalog: SharedCatalog;
 	adapters: ReadonlyMap<string, QmdAdapter>;
+	coordinators: ReadonlyMap<string, MaintenanceCoordinator>;
 	close: () => Promise<void>;
 }
 
@@ -31,6 +33,8 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 	const generation = generationId();
 	await prepareQmdStateDirectory(catalog.stateRoot);
 	const adapters = new Map<string, QmdAdapter>();
+	const metadata = new Map<string, MetadataIndex>();
+	const coordinators = new Map<string, MaintenanceCoordinator>();
 	const sockets = new Set<Socket>();
 	let server: Server | undefined;
 	let closing: Promise<void> | undefined;
@@ -38,17 +42,27 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 		const currentServer = server;
 		const stopped = currentServer ? new Promise<void>((resolve, reject) => currentServer.close(error => error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING" ? reject(error) : resolve())) : Promise.resolve();
 		for (const socket of sockets) socket.destroy();
+		for (const coordinator of coordinators.values()) coordinator.shutdown();
 		await Promise.all([stopped, ...[...adapters.values()].map(adapter => adapter.shutdown())]);
 	})();
 	try {
 		// Admission precedes endpoint changes; no workers or reconciliation run yet.
 		for (const definition of catalog.stores.values()) {
 			const config = storeConfig(catalog, definition);
-			const adapter = new QmdAdapter(config, await discoverQmdBinding(config));
-			try { await adapter.acquireOwnership(); }
-			catch (error) { await adapter.shutdown(); throw error; }
-			adapters.set(definition.id, adapter);
-			registerMetadata(adapter.coordinator, new Map([[definition.id, new MetadataIndex(adapter.root)]]), config.stores);
+			let coordinator: MaintenanceCoordinator;
+			let stateDirectory = `${catalog.stateRoot}/${definition.id}`;
+			if (config.qmd.enabled) {
+				const adapter = new QmdAdapter(config, await discoverQmdBinding(config));
+				try { await adapter.acquireOwnership(); }
+				catch (error) { await adapter.shutdown(); throw error; }
+				adapters.set(definition.id, adapter);
+				coordinator = adapter.coordinator;
+				stateDirectory = `${adapter.root}/${definition.id}`;
+			} else coordinator = new MaintenanceCoordinator(`${stateDirectory}/jobs.json`, () => new Set([definition.id]));
+			coordinators.set(definition.id, coordinator);
+			const index = new MetadataIndex(stateDirectory);
+			metadata.set(definition.id, index);
+			registerMetadata(coordinator, new Map([[definition.id, index]]), config.stores);
 		}
 		server = await listenOwnedSocket(catalog.socketPath, (socket) => {
 		sockets.add(socket);
@@ -68,9 +82,11 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 			if (message.version !== 1 || typeof message.store !== "string" || typeof message.definitionRevision !== "string") throw new DatastoreError("CONFIG_INVALID");
 			const definition = catalog.stores.get(message.store);
 			const adapter = adapters.get(message.store);
-			if (!definition || !adapter || message.definitionRevision !== definition.definitionRevision) throw new DatastoreError("STORE_UNAVAILABLE");
+			const index = metadata.get(message.store);
+			const coordinator = coordinators.get(message.store);
+			if (!definition || !index || !coordinator || message.definitionRevision !== definition.definitionRevision) throw new DatastoreError("STORE_UNAVAILABLE");
 			if (message.operation === "hello") {
-				send({ version: 1, requestId: message.requestId, generation, definitionRevision: definition.definitionRevision, ok: true, result: { generation, version: adapter.binding.version } });
+				send({ version: 1, requestId: message.requestId, generation, definitionRevision: definition.definitionRevision, ok: true, result: { generation, version: adapter?.binding.version ?? "metadata" } });
 				return;
 			}
 			const call = message as SharedCall;
@@ -78,9 +94,14 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 			const controller = new AbortController();
 			if (call.requestId) waiters.set(call.requestId, controller);
 			try {
-				const store = adapter.config.stores.get(message.store)!;
+				const store = adapter?.config.stores.get(message.store);
 				let result: unknown;
-				if (call.operation === "activity") result = adapter.activity();
+				if (call.operation === "startMetadata") result = await coordinator.enqueue("metadata", [message.store], "explicit-maintenance");
+				else if (call.operation === "links") result = await index.links(String(call.input?.path));
+				else if (call.operation === "backlinks") result = await index.backlinks(String(call.input?.path));
+				else if (call.operation === "tagPages") result = await index.tagPages(String(call.input?.tag));
+				else if (!adapter || !store) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
+				else if (call.operation === "activity") result = adapter.activity();
 				else if (call.operation === "current") result = adapter.isLexicallyCurrent(message.store);
 				else if (call.operation === "status") result = await adapter.status(controller.signal);
 				else if (call.operation === "search") {
@@ -89,7 +110,7 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 				}
 				else if (call.operation === "startLexical") result = await adapter.startLexicalRefresh([store]);
 				else if (call.operation === "startSemantic") result = await adapter.startSemanticRefresh([store]);
-				else if (call.operation === "cancel") result = await adapter.cancelRefresh(String(call.input?.refreshId));
+				else if (call.operation === "cancel") result = adapter ? await adapter.cancelRefresh(String(call.input?.refreshId)) : await coordinator.cancel(String(call.input?.refreshId));
 				else throw new DatastoreError("CAPABILITY_UNAVAILABLE");
 				send({ version: 1, requestId: call.requestId, generation, definitionRevision: definition.definitionRevision, ok: true, result });
 			} finally { if (call.requestId) waiters.delete(call.requestId); }
@@ -104,5 +125,5 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 		await close();
 		throw error;
 	}
-	return { generation, catalog, adapters, close };
+	return { generation, catalog, adapters, coordinators, close };
 }

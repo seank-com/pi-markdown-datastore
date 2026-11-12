@@ -39,7 +39,7 @@ const PolicySchemas = {
 };
 const Schemas = {
 	search: Type.Object({ store: Type.String(), query: Type.String({ minLength: 1, maxLength: 4096 }), mode: Type.Optional(StringEnum(["lexical", "semantic", "hybrid"] as const)), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })), minScore: Type.Optional(Type.Number()), freshness: Type.Optional(StringEnum(["allow-stale", "require-current-lexical", "require-current-semantic"] as const)), includeContent: Type.Optional(Type.Boolean()) }, { additionalProperties: false }),
-	find: Type.Object({ store: Type.String(), selectors: Type.Array(Selector, { minItems: 1, maxItems: 8 }), match: Type.Optional(StringEnum(["all", "any"] as const)), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })) }, { additionalProperties: false }),
+	find: Type.Object({ store: Type.String(), selectors: Type.Array(Selector, { minItems: 1, maxItems: 8 }), match: Type.Optional(StringEnum(["all", "any"] as const)), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })), continuation: Type.Optional(Type.String()) }, { additionalProperties: false }),
 	read: Type.Unsafe<ReadInput>({
 		type: "object",
 		properties: {
@@ -217,7 +217,7 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 			if (generation !== ownGeneration) { await Promise.allSettled([qmd?.shutdown(), ...[...sharedClients.values()].map((client) => client.shutdown())].filter((operation): operation is Promise<void> => operation !== undefined)); return; }
 			service = new MarkdownDatastoreService(config, undefined, qmd, sharedClients);
 			const coordinator = qmd?.coordinator ?? new MaintenanceCoordinator(join(config.stateRoot, "jobs.json"), () => new Set(config.stores.keys()));
-			const indexes = new Map(privateStores.map((store) => [store.name, new MetadataIndex(qmd?.root ?? config.stateRoot)]));
+			const indexes = new Map(privateStores.map((store) => [store.name, new MetadataIndex(join(qmd?.root ?? config.stateRoot, `metadata-${store.name}`))]));
 			if (indexes.size) registerMetadata(coordinator, indexes, config.stores);
 			service.bindMetadata(coordinator, indexes);
 			if (qmd) void qmd.startupReconcile(privateStores).catch(() => undefined);

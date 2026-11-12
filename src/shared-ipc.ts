@@ -17,7 +17,7 @@ export interface SharedHello {
 }
 export interface SharedCall {
 	version: 1;
-	operation: "search" | "status" | "startLexical" | "startSemantic" | "cancel" | "activity" | "current";
+	operation: "search" | "status" | "startLexical" | "startSemantic" | "startMetadata" | "links" | "backlinks" | "tagPages" | "cancel" | "activity" | "current";
 	requestId: string;
 	generation: string;
 	store: string;
@@ -44,7 +44,7 @@ const STORE_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
 const ID = /^[0-9a-f]{32}$/;
 const REVISION = /^[0-9a-f]{64}$/;
 const GENERATION = /^gen-[0-9a-f]{32}$/;
-const CALLS = new Set(["search", "status", "startLexical", "startSemantic", "cancel", "activity", "current"]);
+const CALLS = new Set(["search", "status", "startLexical", "startSemantic", "startMetadata", "links", "backlinks", "tagPages", "cancel", "activity", "current"]);
 
 function record(value: unknown): Record<string, unknown> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new DatastoreError("CONFIG_INVALID");

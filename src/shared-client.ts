@@ -98,6 +98,10 @@ export class SharedIndexClient {
 	async startLexical(signal?: AbortSignal): Promise<Record<string, unknown>> { return this.call("startLexical", undefined, signal) as Promise<Record<string, unknown>>; }
 	async startSemantic(signal?: AbortSignal): Promise<Record<string, unknown>> { return this.call("startSemantic", undefined, signal) as Promise<Record<string, unknown>>; }
 	async cancel(refreshId: string, signal?: AbortSignal): Promise<Record<string, unknown>> { return this.call("cancel", { refreshId }, signal) as Promise<Record<string, unknown>>; }
+	async startMetadata(signal?: AbortSignal): Promise<Record<string, unknown>> { return this.call("startMetadata", undefined, signal) as Promise<Record<string, unknown>>; }
+	async links(path: string, signal?: AbortSignal): Promise<unknown[]> { return this.call("links", { path }, signal) as Promise<unknown[]>; }
+	async backlinks(path: string, signal?: AbortSignal): Promise<unknown[]> { return this.call("backlinks", { path }, signal) as Promise<unknown[]>; }
+	async tagPages(tag: string, signal?: AbortSignal): Promise<string[]> { return this.call("tagPages", { tag }, signal) as Promise<string[]>; }
 	async shutdown(): Promise<void> {
 		if (this.#closed) return;
 		this.#closed = true;
