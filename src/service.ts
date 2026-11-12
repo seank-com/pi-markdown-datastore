@@ -323,7 +323,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 	}
 
 	private async refreshInner(input: RefreshInput, signal: AbortSignal): Promise<RefreshResult> {
-		if ("paths" in input && (input.action === "cancel" || input.mode !== "metadata")) throw new DatastoreError("INVALID_NOTE_REF");
+		if (Object.hasOwn(input, "paths") && (input.action === "cancel" || input.mode !== "metadata")) throw new DatastoreError("INVALID_NOTE_REF");
 		const started = Date.now(); throwIfAborted(signal);
 		if (input.action === "cancel") {
 			const qmd = await this.cancelRefresh(input.refreshId, signal); const data = { action: "cancel", qmd, durationMs: elapsed(started) }; return this.envelope("refresh", "*", data, started, JSON.stringify(data), false, undefined, [], [], undefined, 1) as RefreshResult;

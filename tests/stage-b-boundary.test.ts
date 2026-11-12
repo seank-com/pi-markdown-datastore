@@ -146,7 +146,7 @@ test("a shared owner runs the injected clock and graph work before qmd", async (
 	let callback: (() => void) | undefined;
 	const host = await startSharedHost(catalogPath, { schedule: ((stored: () => void) => { callback = stored; return { unref() {}, ref() {} } as ReturnType<typeof setTimeout>; }) as typeof setTimeout });
 	let client: SharedIndexClient | undefined;
-	t.after(async () => { client?.close(); await host.close(); await rm(root, { recursive: true, force: true }); });
+	t.after(async () => { await client?.shutdown(); await host.close(); await rm(root, { recursive: true, force: true }); });
 	const coordinator = host.coordinators.get("notebook")!;
 	let sawMetadata = false;
 	coordinator.register("lexical", async () => { sawMetadata = coordinator.jobs().some((job) => job.mode === "metadata" && job.state === "succeeded"); });

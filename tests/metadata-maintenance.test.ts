@@ -32,9 +32,12 @@ test("metadata refresh uses the shared coordinator with qmd disabled", async (t)
 	await coordinator.settled();
 	const snapshot = await index.snapshot();
 	assert.equal(snapshot?.complete, true);
-	assert.equal(snapshot?.tags[0].identity, "travel");
-	assert.equal(snapshot?.edges[0].targetKind, "note");
-	assert.equal(snapshot?.edges[0].target, "beta.md");
+	assert.deepEqual(snapshot?.tags.travel, ["alpha.md"]);
+	assert.equal(snapshot?.files["alpha.md"].links?.[0].target, "beta");
+	assert.equal((await index.catalog())[0].spelling, "Travel");
+	const edges = await index.links("alpha.md");
+	assert.equal(edges[0].targetKind, "note");
+	assert.equal(edges[0].target, "beta.md");
 	await coordinator.shutdown();
 	await index.shutdown();
 });
