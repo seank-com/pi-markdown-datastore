@@ -240,3 +240,58 @@ test("an in-place note edit is not current membership", async (t) => {
 	const tagged = await service.find({ store: "notes", selectors: [{ kind: "tag", value: "travel" }] });
 	assert.equal(tagged.provenance.sources[0].freshness, "stale");
 });
+
+test("metadata status is ready without qmd and stays at the state root", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-meta-status-")));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const notes = join(root, "notes");
+	await mkdir(notes);
+	await writeFile(join(notes, "alpha.md"), "---\ntags: [Travel]\n---\nSee [[beta]].\n");
+	await writeFile(join(notes, "beta.md"), "Target.\n");
+	const config = await projectConfig(root, { notes });
+	const index = new MetadataIndex(join(config.stateRoot, "metadata-notes"));
+	const coordinator = new MaintenanceCoordinator(join(config.stateRoot, "jobs.json"), () => new Set(["notes"]));
+	registerMetadata(coordinator, new Map([["notes", index]]), config.stores);
+	const service = new MarkdownDatastoreService(config);
+	service.bindMetadata(coordinator, new Map([["notes", index]]));
+	await service.refresh({ store: "notes", mode: "metadata" });
+	await coordinator.settled();
+	const status = await service.status({ store: "notes" });
+	const metadata = status.data.stores[0].capabilities.metadata;
+	assert.equal(metadata.state, "ready");
+	assert.equal(metadata.complete, true);
+	assert.match(metadata.revision, /^meta-/);
+	assert.equal(metadata.progress.state, "idle");
+});
+
+test("shared metadata status works when enabled qmd is unavailable", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-qmd-missing-")));
+	const socketDir = join(root, "sock");
+	await mkdir(socketDir, { recursive: true, mode: 0o700 });
+	await chmod(socketDir, 0o700);
+	const done = cleanup(t);
+	done.remove(root);
+	const notes = join(root, "notes");
+	await mkdir(notes);
+	await writeFile(join(notes, "alpha.md"), "See [[beta]].\n");
+	await writeFile(join(notes, "beta.md"), "Target.\n");
+	const state = join(root, "state");
+	await mkdir(state, { mode: 0o700 });
+	const catalogPath = join(root, "catalog.json");
+	await writeFile(catalogPath, JSON.stringify({ schemaVersion: 1, socketPath: join(socketDir, "s.sock"), stateRoot: state, defaults: { maxResultBytes: 8192, maxResultLines: 100, operationTimeoutMs: 3000 }, qmd: { enabled: true, installation: { executable: "qmd-not-installed" }, minimumVersion: "2.8.3" }, stores: { notebook: { root: notes, include: ["**/*.md"], exclude: [], maxFileBytes: 4096, search: { defaultMode: "lexical", qmdCollection: "notebook" } } } }), { mode: 0o600 });
+	const host = await startSharedHost(catalogPath);
+	done.host(host);
+	const defined = (await import("../src/shared-catalog.ts")).loadSharedCatalog;
+	const catalog = await defined(catalogPath);
+	const client = new SharedIndexClient({ socketPath: join(socketDir, "s.sock"), store: "notebook", definitionRevision: catalog.stores.get("notebook")!.definitionRevision });
+	done.client(client);
+	await client.startMetadata();
+	await host.coordinators.get("notebook")?.settled();
+	const status = await client.status() as { metadata?: { state?: string; revision?: string; complete?: boolean; progress?: { state?: string } } };
+	assert.equal(status.metadata?.state, "ready");
+	assert.equal(status.metadata?.complete, true);
+	assert.match(String(status.metadata?.revision), /^meta-/);
+	assert.equal(status.metadata?.progress?.state, "idle");
+	const activity = await client.activity();
+	assert.equal(activity.embeddingActive, false);
+});

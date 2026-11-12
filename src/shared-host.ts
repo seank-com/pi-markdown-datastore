@@ -53,20 +53,20 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 		// Admission precedes endpoint changes; no workers or reconciliation run yet.
 		for (const definition of catalog.stores.values()) {
 			const config = storeConfig(catalog, definition);
-			let coordinator: MaintenanceCoordinator;
-			let stateDirectory = `${catalog.stateRoot}/${definition.id}`;
+			let coordinator!: MaintenanceCoordinator;
+			const stateDirectory = `${catalog.stateRoot}/${definition.id}`;
+			await prepareQmdStateDirectory(stateDirectory);
+			ownerships.set(definition.id, await acquireIndexOwnership(stateDirectory));
 			if (config.qmd.enabled) {
-				const adapter = new QmdAdapter(config, await discoverQmdBinding(config));
-				try { await adapter.acquireOwnership(); }
-				catch (error) { await adapter.shutdown(); throw error; }
-				adapters.set(definition.id, adapter);
-				coordinator = adapter.coordinator;
-				stateDirectory = `${adapter.root}/${definition.id}`;
-			} else {
-				await prepareQmdStateDirectory(stateDirectory);
-				ownerships.set(definition.id, await acquireIndexOwnership(stateDirectory));
-				coordinator = new MaintenanceCoordinator(`${stateDirectory}/jobs.json`, () => new Set([definition.id]));
+				try {
+					const adapter = new QmdAdapter(config, await discoverQmdBinding(config));
+					try { await adapter.acquireOwnership(); }
+					catch (error) { await adapter.shutdown(); throw error; }
+					adapters.set(definition.id, adapter);
+					coordinator = adapter.coordinator;
+				} catch { coordinator = undefined as unknown as MaintenanceCoordinator; }
 			}
+			if (!adapters.has(definition.id)) coordinator = new MaintenanceCoordinator(`${stateDirectory}/jobs.json`, () => new Set([definition.id]));
 			coordinators.set(definition.id, coordinator);
 			const index = new MetadataIndex(stateDirectory);
 			metadata.set(definition.id, index);
@@ -146,10 +146,18 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 						result = { ...render(page.items), complete: admitted.current, diagnostics: admitted.diagnostics, continuation: page.next === undefined ? undefined : continuationToken(responseStore, snapshot.revision, query, page.next, budget) };
 					}
 				}
+				else if (call.operation === "activity" || call.operation === "status" || call.operation === "current") {
+					const jobs = coordinator.jobs().filter((job) => job.mode === "metadata" && job.stores.includes(message.store));
+					const running = jobs.find((job) => job.state === "running");
+					const queued = jobs.find((job) => job.state === "queued");
+					const snapshot = await index.snapshot();
+					const metadata = { state: !snapshot ? "unavailable" : snapshot.complete ? "ready" : "stale", revision: snapshot?.revision, complete: snapshot?.complete ?? false, progress: { state: running ? "running" : queued ? "queued" : "idle", active: Boolean(running), queued: Boolean(queued), job: running ?? queued ?? jobs[0] } };
+					if (call.operation === "current") result = adapter ? adapter.isLexicallyCurrent(message.store) : false;
+					else if (!adapter) result = call.operation === "activity" ? { state: metadata.progress.state, active: metadata.progress.active, queued: metadata.progress.queued, embeddingActive: false, jobs } : { state: "unavailable", reasonCode: "BACKEND_MISSING", metadata, refresh: metadata.progress };
+					else if (call.operation === "activity") result = { ...adapter.activity(), metadata };
+					else result = { ...await adapter.status(controller.signal), metadata };
+				}
 				else if (!adapter || !store) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
-				else if (call.operation === "activity") result = adapter.activity();
-				else if (call.operation === "current") result = adapter.isLexicallyCurrent(message.store);
-				else if (call.operation === "status") result = await adapter.status(controller.signal);
 				else if (call.operation === "search") {
 					const input = call.input ?? {};
 					result = await adapter.search(store, String(input.query), input.mode as "lexical", Number(input.limit), input.minScore as number | undefined, controller.signal);
