@@ -79,7 +79,7 @@ test("trusted valid configuration registers exactly five strict tools", async (t
 		else for (const schema of tool.parameters.anyOf) assert.equal(schema.additionalProperties, false);
 	}
 	const read = app.tools.find((tool) => tool.name === "datastore_read");
-	assert.equal(read.parameters.type, "object"); assert.equal(read.parameters.anyOf.length, 4);
+	assert.equal(read.parameters.type, "object"); assert.equal(read.parameters.anyOf.length, 5);
 	assert.equal(Check(read.parameters, { note: { store: "memory", path: "one.md" }, includeFrontmatter: true }), true);
 	assert.equal(Check(read.parameters, { note: { store: "memory", path: "one.md" }, view: "metadata", includeFrontmatter: false }), false);
 	assert.equal(Check(read.parameters, { note: { store: "memory", path: "one.md" }, view: "related", includeSemanticRelated: true }), false);
@@ -120,17 +120,17 @@ test("refresh end metrics include only structural counts and backend state", asy
 test("qmd startup reconciliation is enqueued without blocking startup", { timeout: 5000 }, async (t) => {
 	const current = await fixture(t); const raw = JSON.parse(await readFile(current.configPath, "utf8")); raw.qmd.enabled = true; await writeFile(current.configPath, JSON.stringify(raw), { mode: 0o600 }); let started = false; let release!: () => void; const pending = new Promise<void>((resolve) => { release = resolve; });
 	const qmd: any = { binding: { version: "2.8.3" }, startupReconcile: async () => { started = true; await pending; }, shutdown: async () => { release(); } }; const app = harness(current.project); createMarkdownDatastoreExtension({ projectRoot: current.project, configPath: current.configPath, createQmd: async () => qmd })(app.pi); const before = Date.now(); await app.fire("session_start");
-	assert.equal(started, true); assert.ok(Date.now() - before < 100); assert.equal(app.tools.length, 5); await app.fire("session_shutdown");
+	assert.equal(started, true); assert.ok(Date.now() - before < 100); assert.equal(app.tools.length, 6); await app.fire("session_shutdown");
 });
 
 test("five tools remain visible across initial failures, recovery, and valid-to-invalid transitions", async t => {
 	const current = await fixture(t); const original = await readFile(current.configPath);
 	const app = harness(current.project); let backendStarts = 0;
 	createMarkdownDatastoreExtension({ projectRoot: current.project, createQmd: async () => { backendStarts++; throw new Error("not installed"); } })(app.pi);
-	assert.equal(app.tools.length, 5, "registration does not wait for session_start");
+	assert.equal(app.tools.length, 6, "registration does not wait for session_start");
 	const inputs: Record<string, unknown> = { datastore_search: { store: "memory", query: "body" }, datastore_find: { store: "memory", selectors: [{ kind: "path", path: "one.md" }] }, datastore_read: { note: { store: "memory", path: "one.md" } }, datastore_status: {}, datastore_refresh: {}, datastore_tags: { store: "memory" } };
 	const fails = async (code: string) => {
-		assert.equal(app.tools.length, 5);
+		assert.equal(app.tools.length, 6);
 		for (const tool of app.tools) await assert.rejects(tool.execute("id", inputs[tool.name]), (error: any) => error.code === code);
 	};
 	await rm(current.configPath); await app.fire("session_start"); await fails("CONFIG_MISSING");
@@ -146,7 +146,7 @@ test("five tools remain visible across initial failures, recovery, and valid-to-
 	await writeFile(current.configPath, original);
 	const untrusted = harness(current.project, false);
 	createMarkdownDatastoreExtension({ projectRoot: current.project, createQmd: async () => { throw new Error("trust bypassed"); } })(untrusted.pi);
-	await untrusted.fire("session_start"); assert.equal(untrusted.tools.length, 5);
+	await untrusted.fire("session_start"); assert.equal(untrusted.tools.length, 6);
 	for (const tool of untrusted.tools) await assert.rejects(tool.execute("id", inputs[tool.name]), (error: any) => error.code === "PROJECT_UNTRUSTED");
 	await assert.rejects((await import("node:fs/promises")).stat(join(current.project, ".pi/markdown-datastore/state")), { code: "ENOENT" });
 	await app.fire("session_shutdown"); await untrusted.fire("session_shutdown");
@@ -200,7 +200,7 @@ test("repeated session_start replaces and shuts down the previous service safely
 	const current = await fixture(t); const raw = JSON.parse(await readFile(current.configPath, "utf8")); raw.qmd.enabled = true; await writeFile(current.configPath, JSON.stringify(raw), { mode: 0o600 }); let shutdowns = 0;
 	const createQmd = async () => ({ binding: { version: "2.8.3" }, startupReconcile: async () => ({ refreshId: "c".repeat(32), mode: "lexical", state: "queued" }), startLexicalRefresh: async () => ({ refreshId: "b".repeat(32), mode: "lexical", state: "queued" }), shutdown: async () => { shutdowns += 1; } }) as any;
 	const app = harness(current.project); createMarkdownDatastoreExtension({ projectRoot: current.project, configPath: current.configPath, createQmd })(app.pi); await app.fire("session_start"); await app.fire("session_start");
-	assert.equal(shutdowns, 1); assert.equal(app.emitter.listenerCount(MARKDOWN_DATASTORE_REQUEST_EVENT), 1); assert.equal(app.tools.length, 5);
+	assert.equal(shutdowns, 1); assert.equal(app.emitter.listenerCount(MARKDOWN_DATASTORE_REQUEST_EVENT), 1); assert.equal(app.tools.length, 6);
 });
 
 test("event RPC dispatches once and is removed on shutdown", { timeout: 5000 }, async (t) => {

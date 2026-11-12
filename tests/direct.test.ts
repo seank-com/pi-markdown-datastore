@@ -162,8 +162,10 @@ test("outline returns opaque section handles and exact duplicate occurrence read
 
 test("unsupported discovery and graph views fail explicitly while direct outlines remain ready",async t=>{
  const f=await fixture(t);await writeFile(join(f.storeRoot,'note.md'),'# Note\nBody\n');const service=new MarkdownDatastoreService(await loadMarkdownDatastoreConfig(f.project,f.configPath));
- for(const selector of [{kind:'title',value:'Note'},{kind:'path',path:'note'},{kind:'tag',value:'tag'},{kind:'link',target:'note.md'}] as any[])await assert.rejects(service.find({store:'memory',selectors:[selector]}),{code:'CAPABILITY_UNAVAILABLE'});
- for(const view of ['links','backlinks','metadata','related'] as const)await assert.rejects(service.read({note:{store:'memory',path:'note.md'},view}),{code:'CAPABILITY_UNAVAILABLE'});
+ for(const selector of [{kind:'title',value:'Note'},{kind:'path',path:'note'},{kind:'link',target:'note.md'}] as any[])await assert.rejects(service.find({store:'memory',selectors:[selector]}),{code:'CAPABILITY_UNAVAILABLE'});
+ await assert.rejects(service.find({store:'memory',selectors:[{kind:'tag',value:'tag'}]} as never),{code:'STALE_INDEX'});
+ for(const view of ['links','backlinks'] as const)await assert.rejects(service.read({note:{store:'memory',path:'note.md'},view}),{code:'STALE_INDEX'});
+ for(const view of ['metadata','related'] as const)await assert.rejects(service.read({note:{store:'memory',path:'note.md'},view}),{code:'CAPABILITY_UNAVAILABLE'});
  assert.equal(((await service.read({note:{store:'memory',path:'note.md'},view:'outline'})).data.outline as any[]).length,1);
 });
 
