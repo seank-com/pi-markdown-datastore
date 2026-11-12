@@ -175,9 +175,11 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
   const offset = continuationOffset(token, store.name, snapshot.revision, query);
   const selected = pageRendered(pages.slice(0, offset + limit), offset, budget, (page) => ({ candidates: page, examined: pages.length }));
   const bounded = selected.items.slice(0, limit);
+  const admitted = await index.admit(store, bounded.map((path) => ({ path, kind: "note" as const })), signal);
   const next = offset + bounded.length < pages.length ? offset + bounded.length : undefined;
   const data = { candidates: bounded.map((path) => ({ note: { store: store.name, path }, uri: "", title: path, revision: snapshot.revision })), examined: pages.length, partial: next !== undefined };
-  return this.envelope("find", store.name, data, started, JSON.stringify(data), next !== undefined, next === undefined ? undefined : continuationToken(store.name, snapshot.revision, query, next)) as FindResult;
+  const warnings = admitted.diagnostics.map((message) => ({ code: "STALE_INDEX" as const, message }));
+  return this.envelope("find", store.name, data, started, JSON.stringify(data), next !== undefined, next === undefined ? undefined : continuationToken(store.name, snapshot.revision, query, next), [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: admitted.current ? "current" : "stale" }], warnings) as FindResult;
  }
  const notes=input.selectors.map(s=>{if(s.kind!=="uri" && (s.kind!=="path" || !s.path.endsWith(".md")))throw new DatastoreError("CAPABILITY_UNAVAILABLE");const note=s.kind==="uri"?noteUriToRef(s.uri):{store:store.name,path:validateRelativeNotePath(s.path)};if(note.store!==store.name)throw new DatastoreError("INVALID_NOTE_REF");return note;});
  const paths=[...new Set(notes.map(n=>n.path))];const candidates=[];
@@ -363,7 +365,8 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 			if (!client) throw new DatastoreError("STORE_UNAVAILABLE");
 			const page = view === "links" ? await client.links(path, { continuation: token, ...budget }, signal) : await client.backlinks(path, { continuation: token, ...budget }, signal);
 			const data = { note: { store: store.name, path }, view, edges: page.edges, pageCount: page.pageCount, occurrenceCount: page.occurrenceCount, returned: page.returned, complete: page.complete, revision: page.revision };
-			return this.envelope("read", store.name, data, started, JSON.stringify(data), page.continuation !== undefined, page.continuation, [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: page.complete ? "current" : "stale" }]) as ReadResult;
+			const warnings = (page.diagnostics ?? []).map((message) => ({ code: "STALE_INDEX" as const, message }));
+			return this.envelope("read", store.name, data, started, JSON.stringify(data), page.continuation !== undefined, page.continuation, [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: page.complete ? "current" : "stale" }], warnings) as ReadResult;
 		}
 		const index = this.metadata?.get(store.name);
 		if (!index) throw new DatastoreError("STALE_INDEX");
@@ -374,8 +377,10 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		const pageCount = new Set(edges.map((edge) => view === "links" ? edge.target : edge.source)).size;
 		const render = (items: typeof edges) => ({ note: { store: store.name, path }, view, edges: items, pageCount, occurrenceCount: edges.length, returned: items.length, complete: snapshot.complete, revision: snapshot.revision });
 		const page = pageRendered(edges, offset, budget, render);
-		const data = render(page.items);
-		return this.envelope("read", store.name, data, started, JSON.stringify(data), page.next !== undefined, page.next === undefined ? undefined : continuationToken(store.name, snapshot.revision, query, page.next), [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: snapshot.complete ? "current" : "stale" }]) as ReadResult;
+		const admitted = await index.admit(store, [{ path, kind: "note" }, ...page.items.flatMap((edge) => edge.targetKind === "note" || edge.targetKind === "attachment" ? [{ path: edge.target, kind: edge.targetKind }] : [])], signal);
+		const data = { ...render(page.items), complete: admitted.current };
+		const warnings = admitted.diagnostics.map((message) => ({ code: "STALE_INDEX" as const, message }));
+		return this.envelope("read", store.name, data, started, JSON.stringify(data), page.next !== undefined, page.next === undefined ? undefined : continuationToken(store.name, snapshot.revision, query, page.next), [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: admitted.current ? "current" : "stale" }], warnings) as ReadResult;
 	}
 	async tags(input: { store: string; continuation?: string; maxBytes?: number; maxLines?: number }, signal?: AbortSignal): Promise<RefreshResult> {
 		return this.runOperation(signal, async (active) => {
@@ -397,9 +402,11 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 			const offset = continuationOffset(input.continuation, store.name, snapshot.revision, query);
 			const render = (items: typeof snapshot.tags) => ({ tags: items.map((tag) => ({ identity: tag.identity, spelling: tag.spelling, pageCount: tag.pages.length })), revision: snapshot.revision, returned: items.length, total: snapshot.tags.length });
 			const page = pageRendered(snapshot.tags, offset, budget, render);
+			const admitted = await index.admit(store, [], active);
 			const data = render(page.items);
 			const continuation = page.next === undefined ? undefined : continuationToken(store.name, snapshot.revision, query, page.next);
-			return this.envelope("tags", store.name, data, started, JSON.stringify(data), page.next !== undefined, continuation) as RefreshResult;
+			const warnings = admitted.diagnostics.map((message) => ({ code: "STALE_INDEX" as const, message }));
+			return this.envelope("tags", store.name, data, started, JSON.stringify(data), page.next !== undefined, continuation, [], warnings) as RefreshResult;
 		});
 	}
 	async shutdown(): Promise<void> {

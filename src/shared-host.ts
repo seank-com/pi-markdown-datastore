@@ -106,6 +106,8 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 				let result: unknown;
 				if (call.operation === "startMetadata") result = await coordinator.enqueue("metadata", [message.store], "explicit-maintenance");
 				else if (call.operation === "links" || call.operation === "backlinks" || call.operation === "tagPages" || call.operation === "tags") {
+					const store = storeConfig(catalog, definition).stores.get(message.store);
+					if (!store) throw new DatastoreError("STORE_UNAVAILABLE");
 					const snapshot = await index.requireSnapshot();
 					const maxBytes = Math.min(Number(call.input?.maxBytes ?? catalog.defaults.maxResultBytes), catalog.defaults.maxResultBytes);
 					const maxLines = Math.min(Number(call.input?.maxLines ?? catalog.defaults.maxResultLines), catalog.defaults.maxResultLines);
@@ -115,7 +117,8 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 						const offset = continuationOffset(typeof call.input?.continuation === "string" ? call.input.continuation : undefined, message.store, snapshot.revision, "catalog");
 						const render = (items: typeof snapshot.tags) => ({ tags: items.map((tag) => ({ identity: tag.identity, spelling: tag.spelling, pageCount: tag.pages.length })), total: snapshot.tags.length, returned: items.length, revision: snapshot.revision });
 						const page = pageRendered(snapshot.tags, offset, budget, render);
-						result = { ...render(page.items), continuation: page.next === undefined ? undefined : continuationToken(message.store, snapshot.revision, "catalog", page.next) };
+						const admitted = await index.admit(store, [], controller.signal);
+						result = { ...render(page.items), complete: admitted.current, diagnostics: admitted.diagnostics, continuation: page.next === undefined ? undefined : continuationToken(message.store, snapshot.revision, "catalog", page.next) };
 					} else if (call.operation === "tagPages") {
 						const tag = String(call.input?.tag);
 						const pages = snapshot.tags.find((item) => item.identity === tag)?.pages ?? [];
@@ -126,7 +129,8 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 						const render = (items: string[]) => ({ pages: items, total: pages.length, returned: items.length, complete: snapshot.complete, revision: snapshot.revision });
 						const page = pageRendered(window, offset, budget, render);
 						const next = offset + page.items.length < pages.length ? offset + page.items.length : undefined;
-						result = { ...render(page.items), continuation: next === undefined ? undefined : continuationToken(message.store, snapshot.revision, tag, next) };
+						const admitted = await index.admit(store, page.items.map((path) => ({ path, kind: "note" as const })), controller.signal);
+						result = { ...render(page.items), complete: admitted.current, diagnostics: admitted.diagnostics, continuation: next === undefined ? undefined : continuationToken(message.store, snapshot.revision, tag, next) };
 					} else {
 						const path = String(call.input?.path);
 						const edges = call.operation === "links" ? snapshot.edges.filter((edge) => edge.source === path) : snapshot.edges.filter((edge) => edge.target === path && edge.targetKind !== "unresolved" && edge.targetKind !== "ambiguous");
@@ -135,7 +139,8 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 						const pageCount = new Set(edges.map((edge) => call.operation === "links" ? edge.target : edge.source)).size;
 						const render = (items: typeof edges) => ({ edges: items, pageCount, occurrenceCount: edges.length, returned: items.length, complete: snapshot.complete, revision: snapshot.revision });
 						const page = pageRendered(edges, offset, budget, render);
-						result = { ...render(page.items), continuation: page.next === undefined ? undefined : continuationToken(message.store, snapshot.revision, query, page.next) };
+						const admitted = await index.admit(store, [{ path, kind: "note" as const }, ...page.items.flatMap((edge) => edge.targetKind === "note" || edge.targetKind === "attachment" ? [{ path: edge.target, kind: edge.targetKind }] : [])], controller.signal);
+						result = { ...render(page.items), complete: admitted.current, diagnostics: admitted.diagnostics, continuation: page.next === undefined ? undefined : continuationToken(message.store, snapshot.revision, query, page.next) };
 					}
 				}
 				else if (!adapter || !store) throw new DatastoreError("CAPABILITY_UNAVAILABLE");

@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { lstat, mkdir, open, readFile, rename, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join } from "node:path";
 import type { StoreConfig } from "./config.ts";
-import { safeInspectContainedFile, safeOpenNote, walkSafeAttachmentPaths, walkSafeNoteMetadata, type SafeNoteMetadata } from "./containment.ts";
+import { assertRootIdentity, safeInspectContainedFile, safeOpenNote, walkSafeAttachmentPaths, walkSafeNoteMetadata, type SafeNoteMetadata } from "./containment.ts";
 import { DatastoreError, throwIfAborted } from "./errors.ts";
 import type { MaintenanceCoordinator } from "./maintenance-coordinator.ts";
 import { parseMarkdown } from "./markdown.ts";
@@ -23,6 +23,9 @@ export interface MetadataTag { identity: string; spelling: string; pages: string
 export interface MetadataSnapshot {
 	version: 1;
 	revision: string;
+	root?: string;
+	rootDev?: number;
+	rootIno?: number;
 	complete: boolean;
 	diagnostics: string[];
 	edges: MetadataEdge[];
@@ -102,10 +105,32 @@ export class MetadataIndex {
 				edges.push({ ...resolveTarget(store, note.note.path, ref, pages, files, byBase), kind: ref.kind, source: note.note.path, fragment: ref.fragment, suffix: ref.suffix, raw: ref.raw, line: ref.line });
 			}
 		}
-		const snapshot: MetadataSnapshot = { version: 1, revision: `meta-${randomBytes(16).toString("hex")}`, complete: diagnostics.length === 0, diagnostics, edges, tags: [...tags.values()].sort((a, b) => a.identity.localeCompare(b.identity)), pages, files: files.sort() };
+		await assertRootIdentity(store);
+		const snapshot: MetadataSnapshot = { version: 1, revision: `meta-${randomBytes(16).toString("hex")}`, root: store.root, rootDev: store.rootDev, rootIno: store.rootIno, complete: diagnostics.length === 0, diagnostics, edges, tags: [...tags.values()].sort((a, b) => a.identity.localeCompare(b.identity)), pages, files: files.sort() };
 		await atomicJson(join(this.root, "index.json"), snapshot);
 		this.#snapshot = snapshot;
 		return snapshot;
+	}
+	async admit(store: StoreConfig, paths: { path: string; kind: "note" | "attachment" }[], signal?: AbortSignal): Promise<{ snapshot: MetadataSnapshot; current: boolean; diagnostics: string[] }> {
+		await assertRootIdentity(store);
+		const snapshot = await this.requireSnapshot();
+		const diagnostics: string[] = [];
+		const sameRoot = snapshot.root === store.root && snapshot.rootDev === store.rootDev && snapshot.rootIno === store.rootIno;
+		if (!sameRoot) diagnostics.push(`${snapshot.revision}: source root changed`);
+		const seen = new Set<string>();
+		for (const item of paths) {
+			const key = `${item.kind}:${item.path}`;
+			if (seen.has(key)) continue;
+			seen.add(key);
+			try {
+				if (item.kind === "note") await safeOpenNote(store, item.path, signal);
+				else await safeInspectContainedFile(store, item.path, signal);
+			} catch (error) {
+				if (!(error instanceof DatastoreError) || error.code === "STORE_UNAVAILABLE") throw error;
+				diagnostics.push(`${snapshot.revision}: ${item.path}: ${error.code}`);
+			}
+		}
+		return { snapshot, current: sameRoot && snapshot.complete && diagnostics.length === 0, diagnostics };
 	}
 	async shutdown(): Promise<void> { this.#snapshot = undefined; }
 }

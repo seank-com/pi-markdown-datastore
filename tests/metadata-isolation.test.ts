@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -133,4 +133,35 @@ test("a second graph-only endpoint cannot own the same index, and close waits fo
 	await holding;
 	await first.close();
 	assert.notEqual(coordinator.get(String(job.refreshId))?.state, "running");
+});
+
+test("a replaced source root or unsafe target is not a current graph result", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-root-meta-")));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const notes = join(root, "notes");
+	await mkdir(notes);
+	await writeFile(join(notes, "alpha.md"), "See [[beta]] and ![[map.png]].\n");
+	await writeFile(join(notes, "beta.md"), "Target.\n");
+	await writeFile(join(notes, "map.png"), "png");
+	const outside = join(root, "outside.md");
+	await writeFile(outside, "outside\n");
+	const config = await projectConfig(root, { notes });
+	const index = new MetadataIndex(join(root, "state", "metadata-notes"));
+	const coordinator = new MaintenanceCoordinator(join(root, "state", "jobs.json"), () => new Set(["notes"]));
+	registerMetadata(coordinator, new Map([["notes", index]]), config.stores);
+	const service = new MarkdownDatastoreService(config);
+	service.bindMetadata(coordinator, new Map([["notes", index]]));
+	await service.refresh({ store: "notes", mode: "metadata" });
+	await coordinator.settled();
+	const current = await service.read({ store: "notes", note: { store: "notes", path: "alpha.md" }, view: "links" });
+	assert.equal(current.provenance.sources[0].freshness, "current");
+	await rm(join(notes, "beta.md"));
+	await symlink(outside, join(notes, "beta.md"));
+	const unsafe = await service.read({ store: "notes", note: { store: "notes", path: "alpha.md" }, view: "links" });
+	assert.equal(unsafe.provenance.sources[0].freshness, "stale");
+	assert.match(unsafe.warnings.map((warning) => warning.message).join("\n"), new RegExp(String(current.data.revision)));
+	await rm(notes, { recursive: true, force: true });
+	await mkdir(notes);
+	await writeFile(join(notes, "alpha.md"), "Replacement.\n");
+	await assert.rejects(service.read({ store: "notes", note: { store: "notes", path: "alpha.md" }, view: "links" }), { code: "STORE_UNAVAILABLE" });
 });
