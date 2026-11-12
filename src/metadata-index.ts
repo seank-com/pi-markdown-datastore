@@ -1,9 +1,9 @@
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, readFile, readdir, rename, writeFile } from "node:fs/promises";
-import { basename, dirname, extname, join, relative, sep } from "node:path";
+import { lstat, mkdir, open, readFile, rename, writeFile } from "node:fs/promises";
+import { basename, dirname, extname, join } from "node:path";
 import type { StoreConfig } from "./config.ts";
-import { safeOpenNote, walkSafeNoteMetadata, type SafeNoteMetadata } from "./containment.ts";
+import { safeInspectContainedFile, safeOpenNote, walkSafeAttachmentPaths, walkSafeNoteMetadata, type SafeNoteMetadata } from "./containment.ts";
 import { DatastoreError, throwIfAborted } from "./errors.ts";
 import { parseMarkdown } from "./markdown.ts";
 import { extractWikilinks, tagIdentity, type WikiReference } from "./wiki.ts";
@@ -28,11 +28,6 @@ export interface MetadataSnapshot {
 	tags: MetadataTag[];
 	pages: string[];
 	files: string[];
-}
-
-function inside(root: string, target: string): boolean {
-	const rel = relative(root, target);
-	return rel === "" || (!rel.startsWith(`..${sep}`) && !rel.startsWith(".."));
 }
 
 async function atomicJson(path: string, value: unknown): Promise<void> {
@@ -70,7 +65,8 @@ export class MetadataIndex {
 		await mkdir(this.root, { recursive: true, mode: 0o700 });
 		const notes: SafeNoteMetadata[] = [];
 		await walkSafeNoteMetadata(store, (note) => { notes.push(note); }, signal);
-		const files = await listFiles(store.root, signal);
+		const files: string[] = [];
+		await walkSafeAttachmentPaths(store, async (path) => { await safeInspectContainedFile(store, path, signal); files.push(path); }, signal);
 		const pages = notes.map((note) => note.note.path).sort();
 		const byBase = new Map<string, string[]>();
 		for (const path of [...pages, ...files]) {
@@ -85,6 +81,7 @@ export class MetadataIndex {
 			throwIfAborted(signal);
 			const opened = await safeOpenNote(store, note.note.path, signal);
 			const parsed = parseMarkdown(opened);
+			if (parsed.frontmatter.error) diagnostics.push(`${note.note.path}: ${parsed.frontmatter.error}`);
 			const rawTags = parsed.frontmatter.value?.tags;
 			if (rawTags !== undefined && typeof rawTags !== "string" && !(Array.isArray(rawTags) && rawTags.every((item) => typeof item === "string"))) diagnostics.push(`${note.note.path}: invalid tag shape`);
 			for (const spelling of parsed.frontmatter.tags) {
@@ -126,25 +123,6 @@ function resolveTarget(store: StoreConfig, source: string, ref: WikiReference, p
 	if (all.length > 1) return { target: raw, targetKind: "ambiguous" };
 	void store; void matches;
 	return { target: raw, targetKind: "unresolved" };
-}
-
-async function listFiles(root: string, signal?: AbortSignal): Promise<string[]> {
-	const found: string[] = [];
-	const walk = async (dir: string): Promise<void> => {
-		throwIfAborted(signal);
-		for (const name of await readdir(dir)) {
-			if (name === ".git") continue;
-			const path = join(dir, name);
-			const info = await lstat(path);
-			if (info.isSymbolicLink()) continue;
-			if (info.isDirectory()) { await walk(path); continue; }
-			if (!info.isFile() || extname(name) === ".md") continue;
-			const rel = relative(root, path);
-			if (inside(root, path)) found.push(rel);
-		}
-	};
-	await walk(root);
-	return found;
 }
 
 export function pageItems<T>(items: T[], offset: number, budget: { maxBytes: number; maxLines: number }): { items: T[]; next?: number } {

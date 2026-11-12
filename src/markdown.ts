@@ -60,6 +60,22 @@ function parseFrontmatter(lines: string[]): FrontmatterResult {
 	}
 }
 
+export function codeRanges(text: string, frontmatterEndLine = 0): Array<[number, number]> {
+	const normalized = text.replace(/\r\n|\r/g, "\n");
+	const lines = normalized.split("\n");
+	const parserLines = lines.map((line, index) => index < frontmatterEndLine ? " ".repeat(line.length) : line);
+	const source = parserLines.join("\n");
+	let root: Root;
+	try { root = fromMarkdown(source); } catch { return []; }
+	const ranges: Array<[number, number]> = [];
+	const visit = (node: { type?: string; position?: { start: { offset?: number }; end: { offset?: number } }; children?: unknown[] }): void => {
+		if ((node.type === "code" || node.type === "inlineCode") && node.position?.start.offset !== undefined && node.position.end.offset !== undefined) ranges.push([node.position.start.offset, node.position.end.offset]);
+		for (const child of node.children ?? []) visit(child as typeof node);
+	};
+	visit(root);
+	return ranges;
+}
+
 export function parseMarkdown(note: SafeNote): ParsedNote {
 	const lines = note.text.split(/\r\n|\n|\r/);
 	const frontmatter = parseFrontmatter(lines);
