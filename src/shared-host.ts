@@ -1,5 +1,6 @@
 import type { Server, Socket } from "node:net";
 import { discoverQmdBinding, prepareQmdStateDirectory, QmdAdapter } from "./qmd-adapter.ts";
+import { acquireIndexOwnership, type IndexOwnership } from "./index-ownership.ts";
 import { MaintenanceCoordinator } from "./maintenance-coordinator.ts";
 import { MetadataIndex, registerMetadata } from "./metadata-index.ts";
 import type { MarkdownDatastoreConfig, StoreConfig } from "./config.ts";
@@ -35,6 +36,7 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 	const adapters = new Map<string, QmdAdapter>();
 	const metadata = new Map<string, MetadataIndex>();
 	const coordinators = new Map<string, MaintenanceCoordinator>();
+	const ownerships = new Map<string, IndexOwnership>();
 	const sockets = new Set<Socket>();
 	let server: Server | undefined;
 	let closing: Promise<void> | undefined;
@@ -43,6 +45,8 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 		const stopped = currentServer ? new Promise<void>((resolve, reject) => currentServer.close(error => error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING" ? reject(error) : resolve())) : Promise.resolve();
 		for (const socket of sockets) socket.destroy();
 		for (const coordinator of coordinators.values()) coordinator.shutdown();
+		await Promise.all([...coordinators.values()].map((coordinator) => coordinator.settled()));
+		await Promise.all([...ownerships.values()].map((ownership) => ownership.release()));
 		await Promise.all([stopped, ...[...adapters.values()].map(adapter => adapter.shutdown())]);
 	})();
 	try {
@@ -58,7 +62,11 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 				adapters.set(definition.id, adapter);
 				coordinator = adapter.coordinator;
 				stateDirectory = `${adapter.root}/${definition.id}`;
-			} else coordinator = new MaintenanceCoordinator(`${stateDirectory}/jobs.json`, () => new Set([definition.id]));
+			} else {
+				await prepareQmdStateDirectory(stateDirectory);
+				ownerships.set(definition.id, await acquireIndexOwnership(stateDirectory));
+				coordinator = new MaintenanceCoordinator(`${stateDirectory}/jobs.json`, () => new Set([definition.id]));
+			}
 			coordinators.set(definition.id, coordinator);
 			const index = new MetadataIndex(stateDirectory);
 			metadata.set(definition.id, index);

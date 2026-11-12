@@ -12,6 +12,7 @@ import { boundedPage, contentWithoutSections, parseMarkdown, sectionText, select
 import type { QmdAdapter, QmdCandidate } from "./qmd-adapter.ts";
 import { SharedIndexClient } from "./shared-client.ts";
 import type { MaintenanceCoordinator } from "./maintenance-coordinator.ts";
+import type { IndexOwnership } from "./index-ownership.ts";
 import type { MetadataIndex } from "./metadata-index.ts";
 
 function elapsed(started: number): number { return Math.max(0, Date.now() - started); }
@@ -30,6 +31,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 	readonly sharedClients?: ReadonlyMap<string, SharedIndexClient>;
 	metadata?: ReadonlyMap<string, MetadataIndex>;
 	maintenance?: MaintenanceCoordinator;
+	#ownership?: IndexOwnership;
 	#lifecycle = new AbortController(); #active = new Set<Promise<unknown>>(); #closed = false;
 	constructor(config: MarkdownDatastoreConfig, continuations = new ContinuationRegistry(), qmd?: QmdAdapter, sharedClients?: ReadonlyMap<string, SharedIndexClient>) { this.config = config; this.continuations = continuations; this.qmd = qmd; this.sharedClients = sharedClients; }
 	private runOperation<T>(signal: AbortSignal | undefined, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
@@ -346,7 +348,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		}
 		throw new DatastoreError(this.qmd || this.sharedClients?.size || this.maintenance ? "INVALID_NOTE_REF" : "CAPABILITY_UNAVAILABLE");
 	}
-	bindMetadata(coordinator: MaintenanceCoordinator, indexes: Map<string, MetadataIndex>): void { this.maintenance = coordinator; this.metadata = indexes; }
+	bindMetadata(coordinator: MaintenanceCoordinator, indexes: Map<string, MetadataIndex>, ownership?: IndexOwnership): void { this.maintenance = coordinator; this.metadata = indexes; this.#ownership = ownership; }
 	private pageToken<T>(items: T[], token: string | undefined, store: string, revision: string, query: string): { items: T[]; next?: number; continuation?: string } {
 		let offset = 0;
 		if (token) {
@@ -414,6 +416,8 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 	}
 	async shutdown(): Promise<void> {
 		if (this.#closed) return; this.#closed = true; this.continuations.clear(); this.#lifecycle.abort(new DatastoreError("CANCELLED"));
-		await Promise.allSettled([...this.#active, ...[this.qmd?.shutdown(), ...[...this.sharedClients?.values() ?? []].map((client) => client.shutdown())].filter((operation): operation is Promise<void> => operation !== undefined)]);
+		this.maintenance?.shutdown();
+		await Promise.allSettled([...this.#active, this.maintenance?.settled(), ...[this.qmd?.shutdown(), ...[...this.sharedClients?.values() ?? []].map((client) => client.shutdown())].filter((operation): operation is Promise<void> => operation !== undefined)]);
+		await this.#ownership?.release();
 	}
 }

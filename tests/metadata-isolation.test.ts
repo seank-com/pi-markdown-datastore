@@ -96,3 +96,35 @@ test("graph-only shared host refreshes metadata without qmd", async (t) => {
 	const edges = await client.links("alpha.md") as { target?: string }[];
 	assert.equal(edges[0]?.target, "beta.md");
 });
+
+test("a second graph-only endpoint cannot own the same index, and close waits for the job", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-own-meta-")));
+	const socketA = `/tmp/dsma${process.pid}`;
+	const socketB = `/tmp/dsmb${process.pid}`;
+	await mkdir(socketA, { mode: 0o700 });
+	await mkdir(socketB, { mode: 0o700 });
+	await chmod(socketA, 0o700);
+	await chmod(socketB, 0o700);
+	t.after(async () => { await rm(socketA, { recursive: true, force: true }); await rm(socketB, { recursive: true, force: true }); await rm(root, { recursive: true, force: true }); });
+	const notes = join(root, "notes");
+	await mkdir(notes, { recursive: true });
+	await writeFile(join(notes, "alpha.md"), "See [[beta]].\n");
+	await writeFile(join(notes, "beta.md"), "Target.\n");
+	const state = join(root, "state");
+	await mkdir(state, { mode: 0o700 });
+	const writeCatalog = (path: string, socketDir: string) => writeFile(path, JSON.stringify({ schemaVersion: 1, socketPath: join(socketDir, "s.sock"), stateRoot: state, defaults: { maxResultBytes: 8192, maxResultLines: 100, operationTimeoutMs: 3000 }, qmd: { enabled: false, installation: { executable: "qmd" }, minimumVersion: "2.8.3" }, stores: { notebook: { root: notes, include: ["**/*.md"], exclude: [], maxFileBytes: 4096, search: { defaultMode: "lexical", qmdCollection: "notebook" } } } }), { mode: 0o600 });
+	const firstPath = join(root, "a.json");
+	const secondPath = join(root, "b.json");
+	await writeCatalog(firstPath, socketA);
+	await writeCatalog(secondPath, socketB);
+	const first = await startSharedHost(firstPath);
+	await assert.rejects(startSharedHost(secondPath), { code: "STORE_UNAVAILABLE" });
+	let started!: () => void;
+	const holding = new Promise<void>((resolve) => { started = resolve; });
+	const coordinator = first.coordinators.get("notebook")!;
+	coordinator.register("metadata", async (_job, signal) => { started(); await new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason))); return { generation: "meta-" + "ab".repeat(16) }; });
+	const job = await coordinator.enqueue("metadata", ["notebook"], "explicit-maintenance");
+	await holding;
+	await first.close();
+	assert.notEqual(coordinator.get(String(job.refreshId))?.state, "running");
+});

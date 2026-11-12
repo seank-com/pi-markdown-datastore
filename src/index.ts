@@ -15,6 +15,8 @@ import { HARD_MAX_RESULT_BYTES, HARD_MAX_RESULT_LINES, loadMarkdownDatastoreConf
 import { DatastoreError, datastoreError } from "./errors.ts";
 import { discoverQmdBinding, QmdAdapter } from "./qmd-adapter.ts";
 import { MaintenanceCoordinator } from "./maintenance-coordinator.ts";
+import { acquireIndexOwnership } from "./index-ownership.ts";
+import { prepareQmdStateDirectory } from "./qmd-adapter.ts";
 import { MetadataIndex, registerMetadata } from "./metadata-index.ts";
 import { MarkdownDatastoreService } from "./service.ts";
 import { SharedIndexClient } from "./shared-client.ts";
@@ -220,10 +222,11 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 			const sharedClients = new Map([...config.stores.values()].filter((store) => store.shared).map((store) => [store.name, new SharedIndexClient(store.shared!)]));
 			if (generation !== ownGeneration) { await Promise.allSettled([qmd?.shutdown(), ...[...sharedClients.values()].map((client) => client.shutdown())].filter((operation): operation is Promise<void> => operation !== undefined)); return; }
 			service = new MarkdownDatastoreService(config, undefined, qmd, sharedClients);
+			const ownership = qmd ? undefined : await (async () => { await prepareQmdStateDirectory(config.stateRoot); return acquireIndexOwnership(config.stateRoot); })();
 			const coordinator = qmd?.coordinator ?? new MaintenanceCoordinator(join(config.stateRoot, "jobs.json"), () => new Set(config.stores.keys()));
 			const indexes = new Map(privateStores.map((store) => [store.name, new MetadataIndex(join(qmd?.root ?? config.stateRoot, `metadata-${store.name}`))]));
 			if (indexes.size) registerMetadata(coordinator, indexes, config.stores);
-			service.bindMetadata(coordinator, indexes);
+			service.bindMetadata(coordinator, indexes, ownership);
 			if (qmd) void qmd.startupReconcile(privateStores).catch(() => undefined);
 			ctx.ui.setStatus("markdown-datastore", "datastore: ready");
 		});
