@@ -63,12 +63,32 @@ test("a second private owner is refused and a legacy application ledger is adopt
 	await legacyOwner.settled();
 	legacyOwner.shutdown();
 	const stable = join(root, "jobs.json");
-	await adoptLegacyApplicationJobs(stable, legacy);
+	await adoptLegacyApplicationJobs(root, stable, new Set(["notes"]));
 	const adopted = new MaintenanceCoordinator(stable, () => new Set(["notes"]));
 	await adopted.ensureLoaded();
 	assert.equal(adopted.get(String(saved.refreshId))?.state, "succeeded");
 	adopted.shutdown();
+	const unseen = await realpath(await mkdtemp(join(tmpdir(), "datastore-unseen-ledger-")));
+	await prepareQmdStateDirectory(unseen);
+	const hidden = join(unseen, "qmd-public-no-binding", "jobs.json");
+	const writer = new MaintenanceCoordinator(hidden, () => new Set(["notes"]));
+	writer.register("metadata", async () => ({ generation: "meta-" + "ef".repeat(16) }));
+	const hiddenReceipt = await writer.enqueue("metadata", ["notes"], "explicit-maintenance");
+	await writer.settled();
+	writer.shutdown();
+	const stableUnseen = join(unseen, "jobs.json");
+	await adoptLegacyApplicationJobs(unseen, stableUnseen, new Set(["notes"]));
+	const recovered = new MaintenanceCoordinator(stableUnseen, () => new Set(["notes"]));
+	await recovered.ensureLoaded();
+	assert.equal(recovered.get(String(hiddenReceipt.refreshId))?.state, "succeeded");
+	recovered.shutdown();
+	await mkdir(join(unseen, "qmd-public-other"), { mode: 0o700 });
+	await writeFile(join(unseen, "qmd-public-other", "jobs.json"), await (await import("node:fs/promises")).readFile(hidden), { mode: 0o600 });
+	await rm(stableUnseen);
+	await assert.rejects(adoptLegacyApplicationJobs(unseen, stableUnseen, new Set(["notes"])), { code: "INDEX_CORRUPT" });
+	await assert.rejects((await import("node:fs/promises")).lstat(stableUnseen), { code: "ENOENT" });
 	await rm(root, { recursive: true, force: true });
+	await rm(unseen, { recursive: true, force: true });
 });
 
 test("extension status keeps the metadata receipt when qmd drops and returns", async (t) => {

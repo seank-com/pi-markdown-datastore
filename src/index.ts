@@ -13,7 +13,7 @@ import {
 } from "./contract.ts";
 import { HARD_MAX_RESULT_BYTES, HARD_MAX_RESULT_LINES, loadMarkdownDatastoreConfig, projectDatastoreConfigPath } from "./config.ts";
 import { DatastoreError, datastoreError } from "./errors.ts";
-import { discoverQmdBinding, qmdApplicationDirectory, QmdAdapter } from "./qmd-adapter.ts";
+import { discoverQmdBinding, QmdAdapter } from "./qmd-adapter.ts";
 import { adoptLegacyApplicationJobs, MaintenanceCoordinator } from "./maintenance-coordinator.ts";
 import { acquireIndexOwnership } from "./index-ownership.ts";
 import { prepareQmdStateDirectory } from "./qmd-adapter.ts";
@@ -224,7 +224,7 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 			try { await prepareQmdStateDirectory(config.stateRoot); ownership = await acquireIndexOwnership(config.stateRoot); }
 			catch (error) { if (generation !== ownGeneration) return; unavailable = datastoreError(error, "STORE_UNAVAILABLE"); ctx.ui.setStatus("markdown-datastore", `datastore: disabled (${unavailable.code})`); return; }
 			const jobsPath = join(config.stateRoot, "jobs.json");
-			if (config.qmd.enabled) { try { const binding = await discoverQmdBinding({ ...config, stores: new Map(privateStores.map((store) => [store.name, store])) }); await adoptLegacyApplicationJobs(jobsPath, join(qmdApplicationDirectory({ ...config, stores: new Map(privateStores.map((store) => [store.name, store])) }, binding.version), "jobs.json")); } catch {} }
+			await adoptLegacyApplicationJobs(config.stateRoot, jobsPath, new Set(privateStores.map((store) => store.name)));
 			const coordinator = new MaintenanceCoordinator(jobsPath, () => new Set(config.stores.keys()));
 			if (config.qmd.enabled && privateStores.length) try { qmd = await (options.createQmd ?? createQmd)({ ...config, stores: new Map(privateStores.map((store) => [store.name, store])) }, coordinator); } catch {}
 			service = new MarkdownDatastoreService(config, undefined, qmd, sharedClients);

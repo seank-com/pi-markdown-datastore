@@ -21,6 +21,24 @@ function alive(pid: number): boolean {
 	}
 }
 
+export async function legacyOwnerState(root: string): Promise<"clear" | "live" | "uncertain"> {
+	const directory = join(root, "owner");
+	const info = await lstat(directory).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? undefined : Promise.reject(error));
+	if (!info) return "clear";
+	if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) return "uncertain";
+	const names = await readdir(directory).catch(() => undefined);
+	if (!names) return "uncertain";
+	for (const name of names) {
+		const member = MEMBER.exec(name);
+		if (!member || !Number.isSafeInteger(Number(member[2]))) return "uncertain";
+		const file = await lstat(join(directory, name)).catch(() => undefined);
+		if (!file) continue;
+		if (!file.isFile() || file.nlink !== 1 || file.uid !== process.getuid?.() || (file.mode & 0o077) !== 0) return "uncertain";
+		if (alive(Number(member[2]))) return "live";
+	}
+	return "clear";
+}
+
 /** Acquire application ownership outside qmd's opaque backend directory. */
 export async function acquireIndexOwnership(root: string): Promise<IndexOwnership> {
 	const directory = join(root, "owner");

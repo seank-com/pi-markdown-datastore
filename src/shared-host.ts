@@ -1,6 +1,6 @@
 import type { Server, Socket } from "node:net";
 import { join } from "node:path";
-import { discoverQmdBinding, prepareQmdStateDirectory, qmdApplicationDirectory, QmdAdapter } from "./qmd-adapter.ts";
+import { discoverQmdBinding, prepareQmdStateDirectory, QmdAdapter } from "./qmd-adapter.ts";
 import { acquireIndexOwnership, type IndexOwnership } from "./index-ownership.ts";
 import { adoptLegacyApplicationJobs, MaintenanceCoordinator } from "./maintenance-coordinator.ts";
 import { MetadataIndex, registerMetadata, pageRendered, continuationOffset, continuationToken, tagCandidate } from "./metadata-index.ts";
@@ -58,7 +58,7 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 			const stateDirectory = `${catalog.stateRoot}/${definition.id}`;
 			await prepareQmdStateDirectory(stateDirectory);
 			ownerships.set(definition.id, await acquireIndexOwnership(stateDirectory));
-			if (config.qmd.enabled) { try { const binding = await discoverQmdBinding(config); await adoptLegacyApplicationJobs(`${stateDirectory}/jobs.json`, join(qmdApplicationDirectory(config, binding.version), "jobs.json")); } catch {} }
+			await adoptLegacyApplicationJobs(stateDirectory, `${stateDirectory}/jobs.json`, new Set([definition.id]));
 			coordinator = new MaintenanceCoordinator(`${stateDirectory}/jobs.json`, () => new Set([definition.id]));
 			if (config.qmd.enabled) {
 				try {
