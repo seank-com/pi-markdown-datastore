@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { loadMarkdownDatastoreConfig } from "../src/config.ts";
 import { MaintenanceCoordinator } from "../src/maintenance-coordinator.ts";
-import { MetadataIndex } from "../src/metadata-index.ts";
+import { MetadataIndex, reconcileChanged, registerMetadata } from "../src/metadata-index.ts";
 import type { StoreConfig } from "../src/config.ts";
 
 async function fixture(t: TestContext): Promise<{ root: string; notes: string; state: string; store: StoreConfig }> {
@@ -145,6 +145,60 @@ test("demonstrated partial, diagnostic, dotted, ambiguous, and rebound cases sta
 	const rebound = await index.updatePaths(reboundStore, ["new.md"]);
 	assert.deepEqual(Object.keys(rebound.files).sort(), ["new.md"]);
 	assert.equal(rebound.root, replacement);
+});
+
+test("deleting the last candidate keeps a referenced empty target", async (t) => {
+	const { notes, state, store } = await fixture(t);
+	await writeFile(join(notes, "Destination.md"), "here\n");
+	await writeFile(join(notes, "Ref2.md"), "[[Destination]]\n");
+	const index = new MetadataIndex(state);
+	await index.rebuild(store);
+	await rm(join(notes, "Destination.md"));
+	const updated = await index.updatePaths(store, ["Destination.md"]);
+	assert.deepEqual(updated.targets.Destination, []);
+	const rebuilt = await new MetadataIndex(join(state, "oracle")).rebuild(store);
+	assert.deepEqual(updated.targets.Destination, rebuilt.targets.Destination);
+});
+
+test("a generated mutation sequence matches rebuild without reopening untouched notes", async (t) => {
+	const { notes, state, store } = await fixture(t);
+	for (let index = 0; index < 4; index += 1) await writeFile(join(notes, `n${index}.md`), index === 0 ? "[[n1]]\n" : `body ${index}\n`);
+	const index = new MetadataIndex(state);
+	await index.rebuild(store);
+	await chmod(join(notes, "n2.md"), 0);
+	await chmod(join(notes, "n3.md"), 0);
+	await writeFile(join(notes, "n0.md"), "[[n1]] changed\n");
+	await rm(join(notes, "n1.md"));
+	const updated = await index.updatePaths(store, ["n0.md", "n1.md"]);
+	await chmod(join(notes, "n2.md"), 0o600);
+	await chmod(join(notes, "n3.md"), 0o600);
+	const rebuilt = await new MetadataIndex(join(state, "oracle")).rebuild(store);
+	assert.deepEqual(semantic(updated), semantic(rebuilt));
+	assert.equal(Object.hasOwn(updated.files, "n2.md"), true);
+});
+
+test("a fake clock runs graph reconciliation before lexical work", async (t) => {
+	const { notes, state, store } = await fixture(t);
+	await writeFile(join(notes, "a.md"), "one\n");
+	const index = new MetadataIndex(state);
+	await index.refresh(store);
+	await writeFile(join(notes, "a.md"), "two\n");
+	await utimes(join(notes, "a.md"), new Date(), new Date(Date.now() + 2000));
+	const coordinator = new MaintenanceCoordinator(join(state, "jobs.json"), () => new Set(["notes"]));
+	registerMetadata(coordinator, new Map([["notes", index]]), new Map([["notes", store]]));
+	const order: string[] = [];
+	coordinator.register("lexical", async () => { order.push("lexical"); });
+	let armed = 0;
+	coordinator.startCycle(async () => { order.push("cycle"); }, undefined, ((callback: () => void) => {
+		if (armed++ === 0) callback();
+		return { unref() {}, ref() {} } as ReturnType<typeof setTimeout>;
+	}) as typeof setTimeout);
+	assert.equal(order[0], "cycle");
+	await reconcileChanged(coordinator, new Map([["notes", index]]), new Map([["notes", store]]));
+	const lexical = coordinator.jobs().find((job) => job.mode === "lexical");
+	assert.ok(lexical);
+	await coordinator.persisted(lexical.refreshId);
+	assert.equal(coordinator.jobs().find((job) => job.refreshId === lexical.refreshId)?.state, "succeeded");
 });
 
 test("the reconciliation timer is the accepted five minutes", () => {

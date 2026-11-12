@@ -339,7 +339,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 			for (const store of shared) {
 				const client = this.sharedClients?.get(store.name);
 				if (!client) throw new DatastoreError("STORE_UNAVAILABLE");
-				sharedReceipts.push(await client.startMetadata(signal));
+				sharedReceipts.push(await client.startMetadata(signal, mode === "metadata" ? input.paths : undefined));
 			}
 			const data = { action: "start", mode, qmd: receipt ?? sharedReceipts[0], shared: sharedReceipts, backgroundOwnership: "explicit-maintenance", durationMs: elapsed(started) };
 			return this.envelope("refresh", input.store ?? "*", data, started, JSON.stringify(data), false, undefined, [], [], undefined, 1) as RefreshResult;

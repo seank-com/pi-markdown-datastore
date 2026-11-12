@@ -273,6 +273,7 @@ function applyContribution(lookups: { targets: Record<string, string[]>; tags: R
 		referenced.add(written);
 		if (extname(written)) referenced.add(basename(written, extname(written)));
 	}
+	for (const key of referenced) if (!Object.hasOwn(lookups.targets, key)) lookups.targets[key] = [];
 	for (const key of Object.keys(lookups.targets)) if (!lookups.targets[key].length && !referenced.has(key)) delete lookups.targets[key];
 }
 function reindex(store: StoreConfig, current: MetadataSnapshot): MetadataSnapshot {
