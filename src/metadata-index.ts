@@ -322,7 +322,7 @@ export function registerMetadata(coordinator: MaintenanceCoordinator, indexes: M
 			const index = indexes.get(name);
 			const store = stores.get(name);
 			if (!index || !store) throw new DatastoreError("STORE_UNKNOWN");
-			const owned = job.intent === "rebuild" || job.key.endsWith(":rebuild") ? [] : job.paths ?? coordinator.takePaths(name);
+			const owned = job.intent === "rebuild" || job.key.endsWith(":rebuild") ? [] : job.paths ?? [];
 			revision = (owned.length ? await index.updatePaths(store, owned, signal) : await index.refresh(store, signal)).revision;
 		}
 		return { generation: revision };

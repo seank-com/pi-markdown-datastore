@@ -165,16 +165,24 @@ export class MaintenanceCoordinator {
 		const inflight = this.#admissions.get(key);
 		if (inflight) {
 			await inflight;
-			if (this.#closed) throw new DatastoreError("CANCELLED");
-			const admitted = [...this.#jobs.values()].find((job) => job.key === key && (job.state === "queued" || job.state === "running") && job.definition === definition);
-			if (!admitted) throw new DatastoreError("INDEX_CORRUPT");
-			this.launch(admitted);
-			return { ...structuredClone(admitted), coalesced: true };
+			// Notifications may have arrived after that admission claimed its paths.
+			return this.enqueue(mode, stores, ownership, definition, intent);
 		}
 		const queued = [...this.#jobs.values()].find((job) => job.key === key && job.state === "queued" && job.definition === definition);
 		if (queued) {
-			const claimed = intent === "rebuild" ? [] : this.#claimPaths(ordered);
-			if (claimed.length) { queued.paths = [...new Set([...(queued.paths ?? []), ...claimed])].sort(); await this.persist(); }
+			const claimed = mode === "metadata" && intent !== "rebuild" ? this.#claimPaths(ordered) : [];
+			if (claimed.length) {
+				let admit!: () => void;
+				let refuse!: (error: unknown) => void;
+				const admission = new Promise<void>((resolve, reject) => { admit = resolve; refuse = reject; });
+				admission.catch(() => undefined);
+				this.#admissions.set(key, admission);
+				const previous = queued.paths;
+				queued.paths = [...new Set([...(previous ?? []), ...claimed])].sort();
+				try { await this.persist(); admit(); }
+				catch (error) { queued.paths = previous; refuse(error); throw error; }
+				finally { this.#admissions.delete(key); }
+			}
 			this.launch(queued);
 			return { ...structuredClone(queued), coalesced: true };
 		}
@@ -190,7 +198,7 @@ export class MaintenanceCoordinator {
 			while (this.#jobs.size + 1 > TERMINAL_JOB_LIMIT && terminal.length) this.#jobs.delete(terminal.shift()!.refreshId);
 			if (this.#jobs.size + 1 > TERMINAL_JOB_LIMIT) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
 			const now = new Date().toISOString();
-			const claimed = intent === "rebuild" ? [] : this.#claimPaths(ordered);
+			const claimed = mode === "metadata" && intent !== "rebuild" ? this.#claimPaths(ordered) : [];
 			const job: QmdRefreshJob = { version: 1, refreshId: randomBytes(16).toString("hex"), key, mode, stores: ordered, ownership, intent, paths: claimed.length ? claimed : undefined, definition, state: "queued", phase: "queued", createdAt: now, updatedAt: now, progress: { documentsCompleted: 0, sourceBytesCompleted: 0, chunksCompleted: 0, embeddingBytesCompleted: 0, errors: 0 } };
 			this.#jobs.set(job.refreshId, job);
 			try { await this.persist(); } catch (error) { this.#jobs.delete(job.refreshId); throw error; }
@@ -211,6 +219,12 @@ export class MaintenanceCoordinator {
 		const previous = this.#tail;
 		const operation = (async () => {
 			await previous.catch(() => undefined);
+			// A queued scope cannot begin while its latest merge is still being written.
+			let admission = this.#admissions.get(job.key);
+			while (admission) {
+				await admission.catch(() => undefined);
+				admission = this.#admissions.get(job.key);
+			}
 			throwIfAborted(controller.signal);
 			job.state = "running"; job.phase = "scanning"; job.updatedAt = new Date().toISOString();
 			const report: MaintenanceReport = (phase, update) => {
