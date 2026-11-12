@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { truncateHead } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -14,6 +14,8 @@ import {
 import { HARD_MAX_RESULT_BYTES, HARD_MAX_RESULT_LINES, loadMarkdownDatastoreConfig, projectDatastoreConfigPath } from "./config.ts";
 import { DatastoreError, datastoreError } from "./errors.ts";
 import { discoverQmdBinding, QmdAdapter } from "./qmd-adapter.ts";
+import { MaintenanceCoordinator } from "./maintenance-coordinator.ts";
+import { MetadataIndex, registerMetadata } from "./metadata-index.ts";
 import { MarkdownDatastoreService } from "./service.ts";
 import { SharedIndexClient } from "./shared-client.ts";
 
@@ -61,7 +63,7 @@ const Schemas = {
 		properties: {
 			action: { type: "string", enum: ["start", "cancel"], description: "Start derived-state maintenance, or cancel one lexical or semantic job." },
 			store: { type: "string", description: "Configured store to refresh. Valid only for start; omit to refresh all stores." },
-			mode: { type: "string", enum: ["direct", "lexical", "semantic", "all"], description: "Derived state to refresh. Valid only for start." },
+			mode: { type: "string", enum: ["direct", "lexical", "semantic", "all", "metadata"], description: "Derived state to refresh. Valid only for start." },
 			refreshId: { type: "string", pattern: "^[0-9a-f]{32}$", description: "Lexical or semantic job ID returned by a prior start. Required only for cancel." },
 		},
 		additionalProperties: false,
@@ -214,6 +216,10 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 			const sharedClients = new Map([...config.stores.values()].filter((store) => store.shared).map((store) => [store.name, new SharedIndexClient(store.shared!)]));
 			if (generation !== ownGeneration) { await Promise.allSettled([qmd?.shutdown(), ...[...sharedClients.values()].map((client) => client.shutdown())].filter((operation): operation is Promise<void> => operation !== undefined)); return; }
 			service = new MarkdownDatastoreService(config, undefined, qmd, sharedClients);
+			const coordinator = qmd?.coordinator ?? new MaintenanceCoordinator(join(config.stateRoot, "jobs.json"), () => new Set(config.stores.keys()));
+			const indexes = new Map(privateStores.map((store) => [store.name, new MetadataIndex(qmd?.root ?? config.stateRoot)]));
+			if (indexes.size) registerMetadata(coordinator, indexes, config.stores);
+			service.bindMetadata(coordinator, indexes);
 			if (qmd) void qmd.startupReconcile(privateStores).catch(() => undefined);
 			ctx.ui.setStatus("markdown-datastore", "datastore: ready");
 		});

@@ -1,5 +1,6 @@
 import type { Server, Socket } from "node:net";
 import { discoverQmdBinding, prepareQmdStateDirectory, QmdAdapter } from "./qmd-adapter.ts";
+import { MetadataIndex, registerMetadata } from "./metadata-index.ts";
 import type { MarkdownDatastoreConfig, StoreConfig } from "./config.ts";
 import { DatastoreError } from "./errors.ts";
 import { loadSharedCatalog, type SharedCatalog, type SharedStoreDefinition } from "./shared-catalog.ts";
@@ -47,6 +48,7 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 			try { await adapter.acquireOwnership(); }
 			catch (error) { await adapter.shutdown(); throw error; }
 			adapters.set(definition.id, adapter);
+			registerMetadata(adapter.coordinator, new Map([[definition.id, new MetadataIndex(adapter.root)]]), config.stores);
 		}
 		server = await listenOwnedSocket(catalog.socketPath, (socket) => {
 		sockets.add(socket);

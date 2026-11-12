@@ -5,6 +5,7 @@ import { basename, dirname, extname, join } from "node:path";
 import type { StoreConfig } from "./config.ts";
 import { safeInspectContainedFile, safeOpenNote, walkSafeAttachmentPaths, walkSafeNoteMetadata, type SafeNoteMetadata } from "./containment.ts";
 import { DatastoreError, throwIfAborted } from "./errors.ts";
+import type { MaintenanceCoordinator } from "./maintenance-coordinator.ts";
 import { parseMarkdown } from "./markdown.ts";
 import { extractWikilinks, tagIdentity, type WikiReference } from "./wiki.ts";
 
@@ -60,6 +61,11 @@ export class MetadataIndex {
 		}
 	}
 	async snapshot(): Promise<MetadataSnapshot | undefined> { return this.load(); }
+	async requireSnapshot(): Promise<MetadataSnapshot> { const snapshot = await this.load(); if (!snapshot) throw new DatastoreError("STALE_INDEX"); return snapshot; }
+	async links(path: string): Promise<MetadataEdge[]> { return (await this.requireSnapshot()).edges.filter((edge) => edge.source === path); }
+	async backlinks(path: string): Promise<MetadataEdge[]> { return (await this.requireSnapshot()).edges.filter((edge) => edge.target === path && edge.targetKind !== "unresolved" && edge.targetKind !== "ambiguous"); }
+	async tagPages(identity: string): Promise<string[]> { return (await this.requireSnapshot()).tags.find((tag) => tag.identity === identity)?.pages ?? []; }
+	async catalog(): Promise<MetadataTag[]> { return (await this.requireSnapshot()).tags; }
 	async refresh(store: StoreConfig, signal?: AbortSignal): Promise<MetadataSnapshot> {
 		throwIfAborted(signal);
 		await mkdir(this.root, { recursive: true, mode: 0o700 });
@@ -123,6 +129,19 @@ function resolveTarget(store: StoreConfig, source: string, ref: WikiReference, p
 	if (all.length > 1) return { target: raw, targetKind: "ambiguous" };
 	void store; void matches;
 	return { target: raw, targetKind: "unresolved" };
+}
+
+export function registerMetadata(coordinator: MaintenanceCoordinator, indexes: Map<string, MetadataIndex>, stores: ReadonlyMap<string, StoreConfig>): void {
+	coordinator.register("metadata", async (job, signal) => {
+		let revision = "";
+		for (const name of job.stores) {
+			const index = indexes.get(name);
+			const store = stores.get(name);
+			if (!index || !store) throw new DatastoreError("STORE_UNKNOWN");
+			revision = (await index.refresh(store, signal)).revision;
+		}
+		return { generation: revision };
+	});
 }
 
 export function pageItems<T>(items: T[], offset: number, budget: { maxBytes: number; maxLines: number }): { items: T[]; next?: number } {
