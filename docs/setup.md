@@ -98,7 +98,7 @@ refresh runs immediately through the serialized maintenance queue. Startup
 reconciles lexical state asynchronously. A fixed five-minute batch performs
 semantic work after lexical refresh; clean ticks do no work. Publication batching
 of lexical updates is not implemented: integrations must continue requesting
-explicit lexical refresh when needed. External filesystem edits require refresh.
+explicit lexical refresh when needed. The common five-minute reconciliation also discovers external filesystem edits; request an explicit refresh when they must be visible sooner.
 
 `datastore_refresh` mode `metadata` updates the wikilink and frontmatter-tag index without qmd. Optional `paths` names the changed relative files; without them, or with mode `rebuild`, the index is rebuilt from source and ignores stored timestamps. A five-minute reconciliation on the common coordinator stats the store and updates changed paths before any lexical job. It runs for private and shared owners even when qmd is disabled. Publishing metadata does not mark qmd current.  `datastore_status` reports that index's readiness, revision, completeness, and job progress even when qmd is disabled or unavailable. `datastore_tags` lists tag identity, display spelling, and distinct page count. `datastore_read` views `links` and `backlinks` read that index. An attachment backlink is inspected, not opened as Markdown. A continuation on those results is bound to the store, revision, and query, and uses the same read budget check as the first page.
 
@@ -137,21 +137,81 @@ For example, a catalog can use this shape. The numeric settings repeat the priva
 
 The source root and the state/socket parents must exist. The host creates and validates its protected state directory without changing source permissions. Keep socket paths within the operating system's native Unix-socket support; an OS path error is not permission to move source files or invent a new application length policy.
 
-Start the service in the foreground after building:
+### Manual foreground check
+
+The service runs in the foreground; an operator or service manager owns that process. For a manual check after building:
 
 ```bash
 node dist/shared-service-main.js --catalog /absolute/catalog.json
 ```
 
-Do not install a LaunchAgent or start it from a project session. A project store that should use it contains only the reference:
+Do not run a manual instance alongside a managed instance for the same index. `SIGINT` or `SIGTERM` requests graceful worker shutdown and ownership release.
+
+### macOS startup at login
+
+Configure one operator-managed user LaunchAgent for the shared catalog, not one per connected project. It starts when its OS account logs in, remains running with zero connected clients, and stops independently of client connections. After reboot, a user LaunchAgent requires that login; it is not a pre-login system daemon.
+
+Use a reviewed installed package and an absolute Node 24.14.1-or-later executable, not a mutable development checkout or a shell-only `nvm` command. Create the log directory and save the following as `~/Library/LaunchAgents/com.example.markdown-datastore.plist`, replacing every example path:
+
+```bash
+mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/markdown-datastore"
+```
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.markdown-datastore</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/absolute/path/to/node</string>
+    <string>/absolute/installed/pi-markdown-datastore/dist/shared-service-main.js</string>
+    <string>--catalog</string>
+    <string>/absolute/catalog.json</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/example/Library/Logs/markdown-datastore/stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/example/Library/Logs/markdown-datastore/stderr.log</string>
+</dict>
+</plist>
+```
+
+Launchd does not expand `~`, `$HOME`, or shell commands inside `ProgramArguments` or log paths, and it does not load shell startup files. Keep catalog, state and socket paths absolute. An absolute qmd `packageRoot` avoids executable discovery through a shell-specific `PATH`; configure any needed supported model/cache environment explicitly. The catalog and source safety checks above still apply.
+
+This example uses `RunAtLoad` for login startup. It deliberately does not select a `KeepAlive` crash-retry policy or add a custom termination deadline. If the service exits, inspect the error and restart it deliberately; startup at login is not a health guarantee.
+
+The following commands change the account's running service. Run them only after deployment is authorized, not as part of checking this example:
+
+```bash
+plist="$HOME/Library/LaunchAgents/com.example.markdown-datastore.plist"
+domain="gui/$(id -u)"
+job="$domain/com.example.markdown-datastore"
+
+plutil -lint "$plist"
+launchctl bootstrap "$domain" "$plist"
+launchctl print "$job"
+```
+
+`bootstrap` registers the job and `RunAtLoad` starts it now; retaining the plist in `~/Library/LaunchAgents` provides startup at later logins. Inspect the reported PID/state/last exit status, the configured logs, and `datastore_status` from an attached project. If the job is registered but stopped after a fault is repaired, `launchctl kickstart "$job"` starts it without forcing replacement of a running process.
+
+For an authorized stop or package/catalog update, use `launchctl bootout "$job"` first and verify the process has exited. Update only the intended installed package/plist/catalog, lint the plist, then bootstrap again. Roll back to the previous reviewed package and plist if needed while preserving source, the catalog's state root and job history. Do not also launch a foreground copy, delete live ownership records, or treat a shared-service update as permission to restart a client's Pi process.
+
+### Project attachments
+
+Project sessions do not install, start, stop, or own the LaunchAgent. First connection does not launch the service; last disconnection does not stop it. A project store that should use it contains only the reference:
 
 ```json
 "notes": { "shared": { "catalog": "/absolute/catalog.json", "store": "notebook" } }
 ```
 
-The local name may differ from the catalog id. Search and refresh fail while the service is down. Direct find and read still use the catalog's source root. Stopping the project does not stop the service. Reusing a native collection name in an independent index is allowed; a local alias does not allocate another index.
+The local name may differ from the catalog id. Search and refresh fail while the service is down. Direct find and read still use the catalog's source root. Stopping the project does not stop the service. Reusing a native collection name in an independent index is allowed; a local alias does not allocate another index. Deliberately configuring a separate private store over the same source folder creates an independent index, not a private cache of the shared one; projects referencing the same canonical catalog entry share its index.
 
-A second host cannot claim an already-owned index by selecting a different socket or catalog path. On graceful shutdown, the common maintenance unit closes its workers and releases ownership. After a crash, the operator may run the same foreground command again: proven-dead owner/worker records are reclaimed, interrupted receipts are recovered and reconciliation runs. No manual dead-lock-file deletion, autostart or lease timer is required. If a recorded process is still live or cannot be verified dead, startup reports unavailable; inspect ownership rather than deleting its records or automatically killing that process.
+A second host cannot claim an already-owned index by selecting a different socket or catalog path. On graceful shutdown, the common maintenance unit closes its workers and releases ownership. After a crash, the operator may run the same foreground command again: proven-dead owner/worker records are reclaimed, interrupted receipts are recovered and reconciliation runs. No manual dead-lock-file deletion or ownership lease timer is required; login startup is the operator's LaunchAgent responsibility, not a client attachment behavior. If a recorded process is still live or cannot be verified dead, startup reports unavailable; inspect ownership rather than deleting its records or automatically killing that process.
 
 Catalog and project definitions are loaded at startup, not hot-reloaded. Deliberate definition changes require reloading the corresponding host/project; changed source-root identities invalidate old attachments rather than silently redirecting them.
 
@@ -162,8 +222,7 @@ retryable `SEMANTIC_UNAVAILABLE` (embedding underway; try again later). Strict
 freshness still rejects unreconciled state. Run maintenance through this
 coordinator; independently launched writers are not tracked.
 
-Derived state resides below `.pi/markdown-datastore/state/`, in a directory
-specific to the qmd release and configured source identities. Directory/file
+Private derived state resides below `.pi/markdown-datastore/state/`; shared state uses the catalog's `stateRoot`. The common ledger and metadata JSON stay at the application state root. Qmd's opaque child directory is specific to its release and configured source identities. Directory/file
 permissions are 0700/0600. Use qmd to build these indexes from source, rather than
 copying a global index. Search failure does not prevent direct reads. Native
 embedding has qmd's SDK session cap; native update/embed worker requests also
@@ -171,9 +230,7 @@ have a 35-minute deadline excluding prior maintenance queueing and metadata
 scanning. Before update, preflight checks selected-file filesystem metadata,
 containment/types/links, per-file sizes and aggregate document/byte limits. It
 does not open and decode every note; later content reads and result validation
-are separate. Partial or failed jobs remain observable and require an
-explicit retry. Do not assume that an interrupted refresh preserves an unchanged
-previous index.
+are separate. Failed receipts remain observable. The common cycle keeps due lexical reconciliation separate from graph currency; failed embedding jobs are not replayed automatically and require an explicit retry. Do not assume that an interrupted refresh preserves an unchanged previous index.
 
 ## Integration and troubleshooting
 
