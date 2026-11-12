@@ -73,6 +73,10 @@ export class MaintenanceCoordinator {
 	#hostClosing = false;
 	#explicitCancel = new Set<string>();
 	#pendingPaths = new Map<string, Set<string>>();
+	#qmdDirty = new Set<string>();
+	#cycleTimer?: ReturnType<typeof setTimeout>;
+	#cycle: Promise<void> = Promise.resolve();
+	#cycleFailure?: unknown;
 	readonly jobsPath: string;
 	readonly knownStores: () => ReadonlySet<string>;
 	readonly definitionFor?: (job: { mode: string; stores: string[] }) => string;
@@ -81,8 +85,19 @@ export class MaintenanceCoordinator {
 	hasRunner(mode: Mode): boolean { return this.#runners.has(mode); }
 	notePaths(store: string, paths: string[]): void { const set = this.#pendingPaths.get(store) ?? new Set<string>(); for (const path of paths) set.add(path); this.#pendingPaths.set(store, set); }
 	takePaths(store: string): string[] { const set = this.#pendingPaths.get(store); this.#pendingPaths.delete(store); return set ? [...set] : []; }
+	noteQmd(store: string): void { this.#qmdDirty.add(store); }
+	qmdDirty(store: string): boolean { const latest = this.jobs().find((job) => job.mode === "lexical" && job.stores.includes(store)); return this.#qmdDirty.has(store) || latest?.state === "failed"; }
+	clearQmd(store: string): void { this.#qmdDirty.delete(store); }
 	startCycle(run: () => Promise<void>, intervalMs = 300_000, schedule: typeof setTimeout = setTimeout): void {
-		const arm = () => { const timer = schedule(() => { void run().finally(arm); }, intervalMs); timer.unref?.(); };
+		if (this.#closed) return;
+		const arm = () => {
+			if (this.#closed) return;
+			this.#cycleTimer = schedule(() => {
+				if (this.#closed) return;
+				this.#cycle = run().then(() => { this.#cycleFailure = undefined; }, (error) => { this.#cycleFailure = error; }).finally(() => { if (!this.#closed) arm(); });
+			}, intervalMs);
+			this.#cycleTimer.unref?.();
+		};
 		arm();
 	}
 	jobs(): QmdRefreshJob[] { return [...this.#jobs.values()].sort((left, right) => right.createdAt.localeCompare(left.createdAt)).map((job) => structuredClone(job)); }
@@ -134,7 +149,7 @@ export class MaintenanceCoordinator {
 		this.#persistTail = write;
 		return write;
 	}
-	async enqueue(mode: Mode, stores: string[], ownership: QmdRefreshJob["ownership"], definition?: string): Promise<Record<string, unknown>> {
+	async enqueue(mode: Mode, stores: string[], ownership: QmdRefreshJob["ownership"], definition?: string, intent?: "rebuild"): Promise<Record<string, unknown>> {
 		if (this.#closed) throw new DatastoreError("CANCELLED");
 		await this.ensureLoaded();
 		if (this.#closed) throw new DatastoreError("CANCELLED");
@@ -142,7 +157,7 @@ export class MaintenanceCoordinator {
 		const current = this.definitionFor?.({ mode, stores: ordered });
 		if (definition !== undefined && current !== undefined && definition !== current) throw new DatastoreError("STALE_INDEX");
 		definition ??= current;
-		const key = `${mode}:${ordered.join(",")}`;
+		const key = `${mode}:${ordered.join(",")}${intent === "rebuild" ? ":rebuild" : ""}`;
 		const inflight = this.#admissions.get(key);
 		if (inflight) {
 			await inflight;
@@ -152,8 +167,15 @@ export class MaintenanceCoordinator {
 			this.launch(admitted);
 			return { ...structuredClone(admitted), coalesced: true };
 		}
+		const pending = ordered.some((store) => this.#pendingPaths.get(store)?.size);
 		const existing = [...this.#jobs.values()].find((job) => job.key === key && (job.state === "queued" || job.state === "running") && job.definition === definition);
-		if (existing) { this.launch(existing); return { ...structuredClone(existing), coalesced: true }; }
+		if (existing?.state === "queued" || (existing && !pending)) { this.launch(existing); return { ...structuredClone(existing), coalesced: true }; }
+		if (existing?.state === "running" && pending) {
+			await this.persisted(existing.refreshId);
+			if (this.#closed) throw new DatastoreError("CANCELLED");
+			const follow = [...this.#jobs.values()].find((job) => job.key === key && job.refreshId !== existing.refreshId && (job.state === "queued" || job.state === "running") && job.definition === definition);
+			if (follow) return { ...structuredClone(follow), coalesced: true };
+		}
 		let admit!: () => void;
 		let refuse!: (error: unknown) => void;
 		const admission = new Promise<void>((resolve, reject) => { admit = resolve; refuse = reject; });
@@ -200,7 +222,9 @@ export class MaintenanceCoordinator {
 			job.state = safe.code === "CANCELLED" ? "cancelled" : "failed";
 			job.phase = job.state; job.errorCode = safe.code;
 		}).finally(async () => {
-			if (job.mode === "metadata" && ["succeeded", "failed", "cancelled"].includes(job.state)) for (const store of job.stores) if (this.#pendingPaths.get(store)?.size) void this.enqueue("metadata", [store], job.ownership);
+			if (!this.#closed && job.mode === "metadata" && ["succeeded", "failed", "cancelled"].includes(job.state)) {
+				for (const store of job.stores) if (this.#pendingPaths.get(store)?.size) await this.enqueue("metadata", [store], job.ownership).catch(() => undefined);
+			}
 			job.updatedAt = new Date().toISOString();
 			if (["succeeded", "failed", "cancelled"].includes(job.state)) job.completedAt ??= job.updatedAt;
 			this.#controllers.delete(job.refreshId);
@@ -247,6 +271,7 @@ export class MaintenanceCoordinator {
 		this.#persisted.set(refreshId, promise);
 		return promise;
 	}
-	async settled(): Promise<void> { await this.#tail.catch(() => undefined); await this.#persistTail.catch(() => undefined); }
-	shutdown(): void { this.#hostClosing = true; this.#closed = true; for (const controller of this.#controllers.values()) controller.abort(new DatastoreError("CANCELLED")); }
+	cycleFailure(): unknown { return this.#cycleFailure; }
+	async settled(): Promise<void> { await this.#cycle.catch(() => undefined); await this.#tail.catch(() => undefined); await this.#persistTail.catch(() => undefined); }
+	shutdown(): void { this.#hostClosing = true; this.#closed = true; if (this.#cycleTimer) clearTimeout(this.#cycleTimer); this.#cycleTimer = undefined; for (const controller of this.#controllers.values()) controller.abort(new DatastoreError("CANCELLED")); }
 }

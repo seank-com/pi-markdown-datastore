@@ -302,11 +302,17 @@ export async function reconcileChanged(coordinator: MaintenanceCoordinator, inde
 		await walkSafeNoteMetadata(store, (note) => { seen.add(note.note.path); const prior = snapshot?.files[note.note.path]; if (!prior || prior.mtime !== note.mtime) changed.push(note.note.path); });
 		await walkSafeAttachmentPaths(store, async (path) => { seen.add(path); const inspected = await safeInspectContainedFile(store, path); const prior = snapshot?.files[path]; if (!prior || prior.mtime !== inspected.mtime || prior.size !== inspected.size) changed.push(path); });
 		for (const path of Object.keys(snapshot?.files ?? {})) if (!seen.has(path)) changed.push(path);
-		if (!changed.length) continue;
-		coordinator.notePaths(name, changed);
-		const receipt = await coordinator.enqueue("metadata", [name], "startup-reconciliation");
-		await coordinator.persisted(String(receipt.refreshId));
-		if (coordinator.hasRunner("lexical")) await coordinator.enqueue("lexical", [name], "startup-reconciliation");
+		if (changed.length) {
+			coordinator.notePaths(name, changed);
+			coordinator.noteQmd(name);
+			const receipt = await coordinator.enqueue("metadata", [name], "startup-reconciliation");
+			await coordinator.persisted(String(receipt.refreshId));
+		}
+		if (coordinator.qmdDirty(name) && coordinator.hasRunner("lexical")) {
+			const lexical = await coordinator.enqueue("lexical", [name], "startup-reconciliation");
+			await coordinator.persisted(String(lexical.refreshId));
+			if (coordinator.get(String(lexical.refreshId))?.state === "succeeded") coordinator.clearQmd(name);
+		}
 	}
 }
 export function registerMetadata(coordinator: MaintenanceCoordinator, indexes: Map<string, MetadataIndex>, stores: ReadonlyMap<string, StoreConfig>): void {
@@ -316,7 +322,7 @@ export function registerMetadata(coordinator: MaintenanceCoordinator, indexes: M
 			const index = indexes.get(name);
 			const store = stores.get(name);
 			if (!index || !store) throw new DatastoreError("STORE_UNKNOWN");
-			const paths = coordinator.takePaths(name);
+			const paths = job.key.endsWith(":rebuild") ? [] : coordinator.takePaths(name);
 			revision = (paths.length ? await index.updatePaths(store, paths, signal) : await index.refresh(store, signal)).revision;
 		}
 		return { generation: revision };

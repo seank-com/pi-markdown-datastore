@@ -329,17 +329,18 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		}
 		const mode = input.mode ?? "direct"; const stores = input.store ? [this.store(input.store)] : [...this.config.stores.values()];
 		if (mode === "metadata" || mode === "rebuild") {
+			if (input.paths !== undefined && (mode === "rebuild" || !Array.isArray(input.paths) || input.paths.length === 0 || input.paths.some((path) => typeof path !== "string" || path.length === 0 || path.startsWith("/") || path.includes("\\") || path.split("/").includes("..") || path.split("/").includes(".")))) throw new DatastoreError("INVALID_NOTE_REF");
 			const local = stores.filter((store) => !store.shared).map((store) => store.name);
 			if (mode === "metadata" && input.paths?.length) for (const name of local) this.maintenance?.notePaths(name, input.paths);
 			const shared = stores.filter((store) => store.shared);
 			if (!local.length && !shared.length) throw new DatastoreError("STORE_UNKNOWN");
-			const receipt = local.length ? await this.maintenance?.enqueue("metadata", local, "explicit-maintenance", sourceDefinition(local.map((name) => this.store(name)))) : undefined;
+			const receipt = local.length ? await this.maintenance?.enqueue("metadata", local, "explicit-maintenance", sourceDefinition(local.map((name) => this.store(name))), mode === "rebuild" ? "rebuild" : undefined) : undefined;
 			if (local.length && !receipt) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
 			const sharedReceipts = [];
 			for (const store of shared) {
 				const client = this.sharedClients?.get(store.name);
 				if (!client) throw new DatastoreError("STORE_UNAVAILABLE");
-				sharedReceipts.push(await client.startMetadata(signal, mode === "metadata" ? input.paths : undefined));
+				sharedReceipts.push(await client.startMetadata(signal, mode === "metadata" ? input.paths : undefined, mode === "rebuild"));
 			}
 			const data = { action: "start", mode, qmd: receipt ?? sharedReceipts[0], shared: sharedReceipts, backgroundOwnership: "explicit-maintenance", durationMs: elapsed(started) };
 			return this.envelope("refresh", input.store ?? "*", data, started, JSON.stringify(data), false, undefined, [], [], undefined, 1) as RefreshResult;
