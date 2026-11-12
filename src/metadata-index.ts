@@ -99,7 +99,8 @@ export class MetadataIndex {
 			if (parsed.frontmatter.error) diagnostics.push(`${note.note.path}: ${parsed.frontmatter.error}`);
 			const rawTags = parsed.frontmatter.value?.tags;
 			if (rawTags !== undefined && typeof rawTags !== "string" && !(Array.isArray(rawTags) && rawTags.every((item) => typeof item === "string"))) diagnostics.push(`${note.note.path}: invalid tag shape`);
-			for (const spelling of parsed.frontmatter.tags) {
+			const spellings = typeof rawTags === "string" ? [rawTags] : Array.isArray(rawTags) && rawTags.every((item) => typeof item === "string") ? rawTags : [];
+			for (const spelling of spellings) {
 				const identity = tagIdentity(spelling);
 				if (!identity) continue;
 				const existing = tags.get(identity) ?? { identity, spelling, pages: [] };
