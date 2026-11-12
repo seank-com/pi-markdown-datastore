@@ -214,7 +214,7 @@ export class QmdAdapter {
 	private async startRefreshJob(stores: StoreConfig[], mode: "lexical" | "semantic", ownership: QmdRefreshJob["ownership"]): Promise<Record<string, unknown>> {
 		if (this.#closed) throw new DatastoreError("CANCELLED"); await this.validateBinding(); if (this.#closed) throw new DatastoreError("CANCELLED"); await this.ensureJobs(); if (this.#closed) throw new DatastoreError("CANCELLED");
 		for (const store of stores) this.#runtimeLexicalCurrent.delete(store.name);
-		return this.#coordinator.enqueue(mode, stores.map((store) => store.name), ownership, sourceDefinition(stores));
+		return this.#coordinator.enqueue(mode, stores.map((store) => store.name), ownership, sourceDefinition(stores, { version: this.binding.version }));
 	}
 	async cancelRefresh(refreshId: string): Promise<Record<string, unknown>> {
 		await this.ensureJobs(); return this.#coordinator.cancel(refreshId);

@@ -58,8 +58,8 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 			const stateDirectory = `${catalog.stateRoot}/${definition.id}`;
 			await prepareQmdStateDirectory(stateDirectory);
 			ownerships.set(definition.id, await acquireIndexOwnership(stateDirectory));
-			await adoptLegacyApplicationJobs(stateDirectory, `${stateDirectory}/jobs.json`, new Set([definition.id]), (version) => qmdApplicationDirectory(config, version), sourceDefinition([...config.stores.values()]));
-			coordinator = new MaintenanceCoordinator(`${stateDirectory}/jobs.json`, () => new Set([definition.id]), (names) => sourceDefinition(names.map((name) => config.stores.get(name)!)));
+			await adoptLegacyApplicationJobs(stateDirectory, `${stateDirectory}/jobs.json`, new Set([definition.id]), (version) => qmdApplicationDirectory(config, version), (job, version) => sourceDefinition(job.stores.map((name) => config.stores.get(name)!), job.mode === "metadata" ? undefined : { version }));
+			coordinator = new MaintenanceCoordinator(`${stateDirectory}/jobs.json`, () => new Set([definition.id]), (job) => sourceDefinition(job.stores.map((name) => config.stores.get(name)!), job.mode === "metadata" ? undefined : { version: adapters.get(definition.id)?.binding.version ?? "" }));
 			if (config.qmd.enabled) {
 				try {
 					const adapter = new QmdAdapter(config, await discoverQmdBinding(config), coordinator);

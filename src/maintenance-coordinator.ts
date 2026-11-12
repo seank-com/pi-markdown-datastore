@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, copyFile, lstat, mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { acquireIndexOwnership } from "./index-ownership.ts";
 import { DatastoreError, throwIfAborted } from "./errors.ts";
 import type { QmdRefreshJob, QmdRefreshPhase } from "./qmd-adapter.ts";
@@ -24,11 +24,11 @@ async function atomicJson(path: string, value: unknown): Promise<void> {
 }
 
 /** Existing queue, receipt file, coalescing and cancellation. Backends register runners; they do not keep another queue. */
-export function sourceDefinition(stores: { name: string; root: string; rootDev: number; rootIno: number; include: readonly string[]; exclude: readonly string[]; maxFileBytes: number }[]): string {
-	return createHash("sha256").update(JSON.stringify([...stores].sort((left, right) => left.name.localeCompare(right.name)).map((store) => ({ name: store.name, root: store.root, rootDev: store.rootDev, rootIno: store.rootIno, include: [...store.include], exclude: [...store.exclude], maxFileBytes: store.maxFileBytes })))).digest("hex");
+export function sourceDefinition(stores: { name: string; root: string; rootDev: number; rootIno: number; include: readonly string[]; exclude: readonly string[]; maxFileBytes: number; search?: { qmdCollection?: string } }[], backend?: { version: string }): string {
+	return createHash("sha256").update(JSON.stringify({ stores: [...stores].sort((left, right) => left.name.localeCompare(right.name)).map((store) => ({ name: store.name, root: store.root, rootDev: store.rootDev, rootIno: store.rootIno, include: [...store.include], exclude: [...store.exclude], maxFileBytes: store.maxFileBytes, qmdCollection: backend ? store.search?.qmdCollection : undefined })), backend: backend?.version })).digest("hex");
 }
 
-export async function adoptLegacyApplicationJobs(stateRoot: string, stablePath: string, knownStores: ReadonlySet<string>, expectedDirectory: (version: string) => string, definition?: string): Promise<void> {
+export async function adoptLegacyApplicationJobs(stateRoot: string, stablePath: string, knownStores: ReadonlySet<string>, expectedDirectory: (version: string) => string, identityFor?: (job: { mode: string; stores: string[] }, version: string) => string): Promise<void> {
 	try { await lstat(stablePath); return; } catch (error: any) { if (error?.code !== "ENOENT") throw error; }
 	const names = await readdir(stateRoot).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return []; throw error; });
 	const matches: { directory: string; path: string }[] = [];
@@ -53,7 +53,7 @@ export async function adoptLegacyApplicationJobs(stateRoot: string, stablePath: 
 		const temp = `${stablePath}.adopting-${randomBytes(8).toString("hex")}`;
 		await copyFile(matches[0].path, temp);
 		const probe = new MaintenanceCoordinator(temp, () => knownStores);
-		try { await probe.ensureLoaded(); if (definition) await probe.stampMissingDefinition(definition); probe.shutdown(); await rename(temp, stablePath); }
+		try { await probe.ensureLoaded(); if (identityFor) await probe.stampMissingDefinition(identityFor, basename(matches[0].directory).slice("qmd-public-".length, -17)); probe.shutdown(); await rename(temp, stablePath); }
 		catch (error) { probe.shutdown(); await rm(temp, { force: true }).catch(() => undefined); throw error; }
 	} finally { await lease.release(); }
 }
@@ -61,6 +61,8 @@ export async function adoptLegacyApplicationJobs(stateRoot: string, stablePath: 
 export class MaintenanceCoordinator {
 	#jobs = new Map<string, QmdRefreshJob>();
 	#controllers = new Map<string, AbortController>();
+	#persisted = new Map<string, Promise<void>>();
+	#settlePersist = new Map<string, { resolve: () => void; reject: (error: unknown) => void }>();
 	#runners = new Map<Mode, MaintenanceRunner>();
 	#loaded = false;
 	#loading?: Promise<void>;
@@ -71,8 +73,8 @@ export class MaintenanceCoordinator {
 	#explicitCancel = new Set<string>();
 	readonly jobsPath: string;
 	readonly knownStores: () => ReadonlySet<string>;
-	readonly definitionFor?: (stores: string[]) => string;
-	constructor(jobsPath: string, knownStores: () => ReadonlySet<string>, definitionFor?: (stores: string[]) => string) { this.jobsPath = jobsPath; this.knownStores = knownStores; this.definitionFor = definitionFor; }
+	readonly definitionFor?: (job: { mode: string; stores: string[] }) => string;
+	constructor(jobsPath: string, knownStores: () => ReadonlySet<string>, definitionFor?: (job: { mode: string; stores: string[] }) => string) { this.jobsPath = jobsPath; this.knownStores = knownStores; this.definitionFor = definitionFor; }
 	register(mode: Mode, runner: MaintenanceRunner): void { this.#runners.set(mode, runner); }
 	jobs(): QmdRefreshJob[] { return [...this.#jobs.values()].sort((left, right) => right.createdAt.localeCompare(left.createdAt)).map((job) => structuredClone(job)); }
 	get(refreshId: string): QmdRefreshJob | undefined { return this.#jobs.get(refreshId); }
@@ -143,7 +145,7 @@ export class MaintenanceCoordinator {
 	relaunchQueued(): void { for (const job of this.#jobs.values()) if (job.state === "queued") this.launch(job); }
 	private launch(job: QmdRefreshJob): void {
 		if (this.#closed || this.#controllers.has(job.refreshId) || job.state !== "queued") return;
-		if (this.definitionFor && job.definition !== this.definitionFor(job.stores)) return;
+		if (this.definitionFor && job.definition !== this.definitionFor(job)) return;
 		const mode = job.mode;
 		const runner = this.#runners.get(mode);
 		if (!runner) return;
@@ -171,7 +173,8 @@ export class MaintenanceCoordinator {
 			job.updatedAt = new Date().toISOString();
 			if (["succeeded", "failed", "cancelled"].includes(job.state)) job.completedAt ??= job.updatedAt;
 			this.#controllers.delete(job.refreshId);
-			try { await this.persist(); } catch { job.state = "failed"; job.phase = "failed"; job.errorCode = "INDEX_CORRUPT"; job.completedAt = job.updatedAt; }
+			try { await this.persist(); this.#settlePersist.get(job.refreshId)?.resolve(); }
+			catch (error) { job.state = "failed"; job.phase = "failed"; job.errorCode = "INDEX_CORRUPT"; job.completedAt = job.updatedAt; this.#settlePersist.get(job.refreshId)?.reject(error); }
 		});
 		this.#tail = operation.then(() => undefined, () => undefined);
 	}
@@ -185,12 +188,26 @@ export class MaintenanceCoordinator {
 		if (job.state === "queued") { job.state = "cancelled"; job.phase = "cancelled"; job.errorCode = "CANCELLED"; job.updatedAt = new Date().toISOString(); job.completedAt = job.updatedAt; await this.persist(); }
 		return { ...structuredClone(job), cancellationRequested: controller !== undefined || job.state === "cancelled" };
 	}
-	async stampMissingDefinition(identity: string): Promise<void> {
+	async stampMissingDefinition(identityFor: (job: { mode: string; stores: string[] }, version: string) => string, version: string): Promise<void> {
 		for (const job of this.#jobs.values()) {
+			const identity = identityFor(job, version);
 			if (job.definition && job.definition !== identity) throw new DatastoreError("INDEX_CORRUPT");
 			job.definition = identity;
 		}
 		await this.persist();
+	}
+	persisted(refreshId: string): Promise<void> {
+		const existing = this.#persisted.get(refreshId);
+		if (existing) return existing;
+		const terminal = (id: string) => { const job = this.#jobs.get(id); return Boolean(job && ["succeeded", "failed", "cancelled"].includes(job.state) && !this.#controllers.has(id)); };
+		if (terminal(refreshId)) return this.#persistTail.then(() => undefined);
+		let resolve!: () => void;
+		let reject!: (error: unknown) => void;
+		const promise = new Promise<void>((accept, fail) => { resolve = accept; reject = fail; });
+		this.#settlePersist.set(refreshId, { resolve, reject });
+		if (terminal(refreshId)) { this.#settlePersist.delete(refreshId); return this.#persistTail.then(() => undefined); }
+		this.#persisted.set(refreshId, promise);
+		return promise;
 	}
 	async settled(): Promise<void> { await this.#tail.catch(() => undefined); await this.#persistTail.catch(() => undefined); }
 	shutdown(): void { this.#hostClosing = true; this.#closed = true; for (const controller of this.#controllers.values()) controller.abort(new DatastoreError("CANCELLED")); }

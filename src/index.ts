@@ -227,9 +227,9 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 			if (generation !== ownGeneration) { await ownership.release(); return; }
 			const jobsPath = join(config.stateRoot, "jobs.json");
 			const qmdConfig = { ...config, stores: new Map(privateStores.map((store) => [store.name, store])) };
-			try { await adoptLegacyApplicationJobs(config.stateRoot, jobsPath, new Set(privateStores.map((store) => store.name)), (version) => qmdApplicationDirectory(qmdConfig, version), sourceDefinition(privateStores)); }
+			try { await adoptLegacyApplicationJobs(config.stateRoot, jobsPath, new Set(privateStores.map((store) => store.name)), (version) => qmdApplicationDirectory(qmdConfig, version), (job, version) => sourceDefinition(job.stores.map((name) => qmdConfig.stores.get(name)!), job.mode === "metadata" ? undefined : { version })); }
 			catch (error) { await ownership.release(); if (generation !== ownGeneration) return; unavailable = datastoreError(error, "INDEX_CORRUPT"); ctx.ui.setStatus("markdown-datastore", `datastore: disabled (${unavailable.code})`); return; }
-			const coordinator = new MaintenanceCoordinator(jobsPath, () => new Set(config.stores.keys()), (names) => sourceDefinition(names.map((name) => config.stores.get(name)!)));
+			const coordinator = new MaintenanceCoordinator(jobsPath, () => new Set(config.stores.keys()), (job) => sourceDefinition(job.stores.map((name) => config.stores.get(name)!), job.mode === "metadata" || !qmd ? undefined : { version: qmd.binding.version }));
 			if (config.qmd.enabled && privateStores.length) try { qmd = await (options.createQmd ?? createQmd)({ ...config, stores: new Map(privateStores.map((store) => [store.name, store])) }, coordinator); } catch {}
 			const indexes = new Map(privateStores.map((store) => [store.name, new MetadataIndex(join(config.stateRoot, `metadata-${store.name}`))]));
 			if (indexes.size) registerMetadata(coordinator, indexes, config.stores);
