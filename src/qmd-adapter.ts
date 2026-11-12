@@ -10,6 +10,7 @@ import { HARD_MAX_CANDIDATES } from "./config.ts";
 import { validateRelativeNotePath, walkSafeNoteMetadata } from "./containment.ts";
 import { abortError, DatastoreError, throwIfAborted } from "./errors.ts";
 import { QmdWorkerClient, type QmdWorkerProgress, type QmdWorkerRequest } from "./qmd-worker-client.ts";
+import { MaintenanceCoordinator } from "./maintenance-coordinator.ts";
 import { acquireIndexOwnership, type IndexOwnership } from "./index-ownership.ts";
 
 const TESTED_QMD_VERSIONS = new Set(["2.8.3"]);
@@ -24,7 +25,7 @@ export interface QmdCandidate { path: string; backendRank: number; score?: numbe
 export interface QmdSearchResult { candidates: QmdCandidate[]; rejectedCandidates: number; manifest: QmdManifest; generation: string; requestedMode: SearchMode; effectiveMode: SearchMode; embeddingActive: boolean; queueMs: number; operationMs: number; workerId?: number }
 export type QmdRefreshPhase = "queued" | "scanning" | "updating" | "embedding" | "validating" | "promoting" | "succeeded" | "failed" | "cancelled";
 export interface QmdRefreshJob {
-	version: 1; refreshId: string; key: string; mode: "lexical" | "semantic"; stores: string[]; ownership: "startup-reconciliation" | "explicit-maintenance";
+	version: 1; refreshId: string; key: string; mode: "lexical" | "semantic" | "metadata"; stores: string[]; ownership: "startup-reconciliation" | "explicit-maintenance";
 	state: "queued" | "running" | "succeeded" | "failed" | "cancelled"; phase: QmdRefreshPhase;
 	createdAt: string; updatedAt: string; completedAt?: string; generation?: string; errorCode?: string;
 	progress: { documentsCompleted: number; documentsTotal?: number; sourceBytesCompleted: number; sourceBytesTotal?: number; chunksCompleted: number; chunksTotal?: number; embeddingBytesCompleted: number; embeddingBytesTotal?: number; errors: number };
@@ -95,8 +96,7 @@ export class QmdAdapter {
  #reader: QmdWorkerClient; #writer: QmdWorkerClient;
  #readTail: Promise<void> = Promise.resolve(); #refreshTail: Promise<void> = Promise.resolve();
  #rebuilding = false; #needsRebuild = false; #embeddingActive = false; #closed = false; #lifecycle = new AbortController(); #refreshActive = false;
- #runningJobs = new Set<Promise<void>>(); #jobs = new Map<string, QmdRefreshJob>(); #jobControllers = new Map<string, AbortController>();
- #jobsLoaded = false; #jobsLoad?: Promise<void>; #persistTail: Promise<void> = Promise.resolve();
+ #runningJobs = new Set<Promise<void>>(); #coordinator: MaintenanceCoordinator;
  #runtimeLexicalCurrent = new Set<string>(); #startup?: Promise<Record<string, unknown>>;
  #metadataLoaded = false; #manifest?: QmdManifest; #generation = `gen-${randomBytes(16).toString("hex")}`;
  #semanticStores = new Set<StoreConfig>(); #semanticBatchError?: string;
@@ -112,6 +112,16 @@ export class QmdAdapter {
   this.root = join(config.stateRoot, `qmd-public-${binding.version}-${this.configFingerprint.slice(0,16)}`);
   this.#reader = new QmdWorkerClient(config.defaults.operationTimeoutMs);
   this.#writer = new QmdWorkerClient(35 * 60_000);
+  this.#coordinator = new MaintenanceCoordinator(join(this.root, "jobs.json"), () => new Set(this.config.stores.keys()));
+  const run = async (job: QmdRefreshJob, signal: AbortSignal, report: (phase: QmdRefreshPhase) => void) => {
+    const stores = job.stores.map((name) => this.config.stores.get(name)!);
+    const result = await this.refreshInner(stores, job.mode === "semantic", signal, report);
+    for (const name of result.reconciledStores) if (!this.#coordinator.jobs().some((other) => other.refreshId !== job.refreshId && ["queued", "running"].includes(other.state) && other.stores.includes(name))) this.#runtimeLexicalCurrent.add(name);
+    if (job.mode === "lexical") { for (const name of result.reconciledStores) this.#semanticStores.add(this.config.stores.get(name)!); this.#semanticBatch.schedule(); }
+    return result;
+  };
+  this.#coordinator.register("lexical", run);
+  this.#coordinator.register("semantic", run);
  }
  async acquireOwnership(): Promise<IndexOwnership> {
   if (this.#closed) throw new DatastoreError("CANCELLED");
@@ -151,11 +161,11 @@ export class QmdAdapter {
  private waitFor<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
   throwIfAborted(signal); return new Promise((resolve,reject) => { const abort = () => reject(abortError(signal)); signal.addEventListener("abort",abort,{once:true}); operation.then(value => { signal.removeEventListener("abort",abort);resolve(value); },error => {signal.removeEventListener("abort",abort);reject(error);}); });
  }
- activity() { const jobs = this.jobStatuses(); const active = this.#refreshActive; const queued = jobs.some(j=>j.state === "queued"); return { state: active ? "running" as const : queued ? "queued" as const : "idle" as const, active, queued, embeddingActive: this.#embeddingActive, jobs, semanticBatchError: this.#semanticBatchError }; }
+ activity() { const jobs = this.#coordinator.jobs(); const active = this.#refreshActive; const queued = jobs.some(j=>j.state === "queued"); return { state: active ? "running" as const : queued ? "queued" as const : "idle" as const, active, queued, embeddingActive: this.#embeddingActive, jobs, semanticBatchError: this.#semanticBatchError }; }
  async refresh(stores: StoreConfig[], semantic: boolean, signal?: AbortSignal): Promise<Record<string, unknown>> {
   const receipt = await this.startRefreshJob(stores, semantic ? "semantic" : "lexical", "explicit-maintenance");
   const activeSignal = this.operationSignal(signal);
-  while (true) { throwIfAborted(activeSignal); const job = this.#jobs.get(String(receipt.refreshId))!; if (job.state === "succeeded") return {generation:job.generation}; if (job.state === "failed" || job.state === "cancelled") throw new DatastoreError(job.errorCode as any ?? "BACKEND_FAILED"); await this.waitFor(new Promise(r=>setTimeout(r,10)),activeSignal); }
+  while (true) { throwIfAborted(activeSignal); const job = this.#coordinator.get(String(receipt.refreshId)); if (!job) throw new DatastoreError("INVALID_NOTE_REF"); if (job.state === "succeeded") return {generation:job.generation}; if (job.state === "failed" || job.state === "cancelled") throw new DatastoreError(job.errorCode as any ?? "BACKEND_FAILED"); await this.waitFor(new Promise(r=>setTimeout(r,10)),activeSignal); }
  }
  private async refreshInner(stores: StoreConfig[], semantic: boolean, signal?: AbortSignal, report?: (phase: QmdRefreshPhase, progress?: QmdWorkerProgress) => void): Promise<{ generation: string; reconciledStores: string[] }> {
   const activeSignal = this.operationSignal(signal); throwIfAborted(activeSignal);
@@ -184,61 +194,24 @@ export class QmdAdapter {
   } catch(error) { this.#manifest=undefined; this.#runtimeLexicalCurrent.clear(); throw error; }
   finally { this.#refreshActive=false; this.#embeddingActive=false; this.#rebuilding=false; }
  }
-	private jobStatuses(): QmdRefreshJob[] { return [...this.#jobs.values()].sort((left, right) => right.createdAt.localeCompare(left.createdAt)).map((job) => structuredClone(job)); }
 	private async ensureJobs(): Promise<void> {
 		await this.acquireOwnership();
-		if (this.#jobsLoaded) return; if (this.#jobsLoad) return this.#jobsLoad;
-		this.#jobsLoad = this.loadJobs(); try { await this.#jobsLoad; } finally { this.#jobsLoad = undefined; }
-	}
-	private async loadJobs(): Promise<void> {
-		await protectedDir(this.config.stateRoot); await protectedDir(this.root); const path = join(this.root, "jobs.json"); let raw: any;
-		try { const info = await lstat(path); if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0 || info.size > 256 * 1024) throw new DatastoreError("INDEX_CORRUPT"); raw = JSON.parse(await readFile(path, "utf8")); } catch (error: any) { if (error?.code !== "ENOENT") { if (error instanceof DatastoreError) throw error; throw new DatastoreError("INDEX_CORRUPT"); } raw = { version: 1, jobs: [] }; }
-		if (raw?.version !== 1 || !Array.isArray(raw.jobs) || raw.jobs.length > TERMINAL_JOB_LIMIT || Object.keys(raw).some((key) => !["version", "jobs"].includes(key))) throw new DatastoreError("INDEX_CORRUPT");
-		for (const value of raw.jobs) {
-			const jobRaw = value as Record<string, unknown>; const allowed = ["version", "refreshId", "key", "mode", "stores", "ownership", "state", "phase", "createdAt", "updatedAt", "completedAt", "generation", "errorCode", "progress"];
-			if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(jobRaw).some((key) => !allowed.includes(key)) || jobRaw.version !== 1 || typeof jobRaw.refreshId !== "string" || !/^[0-9a-f]{32}$/.test(jobRaw.refreshId) || !["lexical", "semantic"].includes(String(jobRaw.mode)) || !Array.isArray(jobRaw.stores) || jobRaw.stores.some((name) => typeof name !== "string" || !this.config.stores.has(name)) || new Set(jobRaw.stores).size !== jobRaw.stores.length || !["startup-reconciliation", "explicit-maintenance"].includes(String(jobRaw.ownership)) || !["queued", "running", "succeeded", "failed", "cancelled"].includes(String(jobRaw.state)) || !["queued", "scanning", "updating", "embedding", "validating", "promoting", "succeeded", "failed", "cancelled"].includes(String(jobRaw.phase)) || typeof jobRaw.createdAt !== "string" || typeof jobRaw.updatedAt !== "string" || (jobRaw.completedAt !== undefined && typeof jobRaw.completedAt !== "string") || (jobRaw.generation !== undefined && (typeof jobRaw.generation !== "string" || !/^gen-[0-9a-f]{32}$/.test(jobRaw.generation))) || (jobRaw.errorCode !== undefined && (typeof jobRaw.errorCode !== "string" || !/^[A-Z_]{3,64}$/.test(jobRaw.errorCode))) || !jobRaw.progress || typeof jobRaw.progress !== "object" || Array.isArray(jobRaw.progress)) throw new DatastoreError("INDEX_CORRUPT");
-			const stores = [...jobRaw.stores as string[]].sort(); const mode = jobRaw.mode as "lexical" | "semantic"; const key = `${mode}:${stores.join(",")}`; if (jobRaw.key !== key) throw new DatastoreError("INDEX_CORRUPT"); const progressRaw = jobRaw.progress as Record<string, unknown>; const progressAllowed = ["documentsCompleted", "documentsTotal", "sourceBytesCompleted", "sourceBytesTotal", "chunksCompleted", "chunksTotal", "embeddingBytesCompleted", "embeddingBytesTotal", "errors"]; if (Object.keys(progressRaw).some((field) => !progressAllowed.includes(field))) throw new DatastoreError("INDEX_CORRUPT"); for (const field of progressAllowed) if (progressRaw[field] !== undefined && (!Number.isSafeInteger(progressRaw[field]) || (progressRaw[field] as number) < 0)) throw new DatastoreError("INDEX_CORRUPT");
-			const job: QmdRefreshJob = { version: 1, refreshId: jobRaw.refreshId, key, mode, stores, ownership: jobRaw.ownership as QmdRefreshJob["ownership"], state: jobRaw.state as QmdRefreshJob["state"], phase: jobRaw.phase as QmdRefreshPhase, createdAt: jobRaw.createdAt, updatedAt: jobRaw.updatedAt, completedAt: jobRaw.completedAt as string | undefined, generation: jobRaw.generation as string | undefined, errorCode: jobRaw.errorCode as string | undefined, progress: { documentsCompleted: Number(progressRaw.documentsCompleted ?? 0), documentsTotal: progressRaw.documentsTotal as number | undefined, sourceBytesCompleted: Number(progressRaw.sourceBytesCompleted ?? 0), sourceBytesTotal: progressRaw.sourceBytesTotal as number | undefined, chunksCompleted: Number(progressRaw.chunksCompleted ?? 0), chunksTotal: progressRaw.chunksTotal as number | undefined, embeddingBytesCompleted: Number(progressRaw.embeddingBytesCompleted ?? 0), embeddingBytesTotal: progressRaw.embeddingBytesTotal as number | undefined, errors: Number(progressRaw.errors ?? 0) } };
-			if (job.state === "queued" || job.state === "running") { job.state = "queued"; job.phase = "queued"; delete job.errorCode; delete job.completedAt; job.updatedAt = new Date().toISOString(); } this.#jobs.set(job.refreshId, job);
-		}
-		this.#jobsLoaded = true; await this.persistJobs();
-	}
-	private pruneJobs(reserve = 0): void { const terminal = this.jobStatuses().filter((job) => !["queued", "running"].includes(job.state)).sort((left, right) => left.updatedAt.localeCompare(right.updatedAt)); while (this.#jobs.size + reserve > TERMINAL_JOB_LIMIT && terminal.length) this.#jobs.delete(terminal.shift()!.refreshId); if (this.#jobs.size + reserve > TERMINAL_JOB_LIMIT) throw new DatastoreError("RESULT_LIMIT_EXCEEDED"); }
-	private persistJobs(): Promise<void> {
-		this.pruneJobs(); const snapshot = { version: 1, jobs: this.jobStatuses() }; const write = this.#persistTail.catch(() => undefined).then(() => atomicJson(join(this.root, "jobs.json"), snapshot)); this.#persistTail = write; return write;
+		await this.#coordinator.ensureLoaded();
 	}
 	async startLexicalRefresh(stores: StoreConfig[], ownership: QmdRefreshJob["ownership"] = "explicit-maintenance"): Promise<Record<string, unknown>> { return this.startRefreshJob(stores, "lexical", ownership); }
 	async startSemanticRefresh(stores: StoreConfig[]): Promise<Record<string, unknown>> { return this.startRefreshJob(stores, "semantic", "explicit-maintenance"); }
 	startupReconcile(stores: StoreConfig[]): Promise<Record<string, unknown>> {
 		if (this.#startup) return this.#startup;
-		const operation = (async () => { if (this.#closed) throw new DatastoreError("CANCELLED"); await this.ensureJobs(); if (this.#closed) throw new DatastoreError("CANCELLED"); for (const job of this.#jobs.values()) if (job.state === "queued") this.launchJob(job); if (this.#closed) throw new DatastoreError("CANCELLED"); return this.startRefreshJob(stores, "lexical", "startup-reconciliation"); })(); this.#startup = operation; return operation;
+		const operation = (async () => { if (this.#closed) throw new DatastoreError("CANCELLED"); await this.ensureJobs(); if (this.#closed) throw new DatastoreError("CANCELLED"); this.#coordinator.relaunchQueued(); if (this.#closed) throw new DatastoreError("CANCELLED"); return this.startRefreshJob(stores, "lexical", "startup-reconciliation"); })(); this.#startup = operation; return operation;
 	}
 	isLexicallyCurrent(store: string): boolean { return this.#runtimeLexicalCurrent.has(store); }
 	private async startRefreshJob(stores: StoreConfig[], mode: "lexical" | "semantic", ownership: QmdRefreshJob["ownership"]): Promise<Record<string, unknown>> {
-		if (this.#closed) throw new DatastoreError("CANCELLED"); await this.validateBinding(); if (this.#closed) throw new DatastoreError("CANCELLED"); await this.ensureJobs(); if (this.#closed) throw new DatastoreError("CANCELLED"); const ordered = [...stores].sort((a, b) => a.name.localeCompare(b.name)); const key = `${mode}:${ordered.map((store) => store.name).join(",")}`;
-		const existing = [...this.#jobs.values()].find((job) => job.key === key && (job.state === "queued" || job.state === "running")); if (existing) { this.launchJob(existing); return { ...structuredClone(existing), coalesced: true }; } this.pruneJobs(1);
-		for (const store of ordered) this.#runtimeLexicalCurrent.delete(store.name);
-		const now = new Date().toISOString(); const job: QmdRefreshJob = { version: 1, refreshId: randomBytes(16).toString("hex"), key, mode, stores: ordered.map((store) => store.name), ownership, state: "queued", phase: "queued", createdAt: now, updatedAt: now, progress: { documentsCompleted: 0, sourceBytesCompleted: 0, chunksCompleted: 0, embeddingBytesCompleted: 0, errors: 0 } }; this.#jobs.set(job.refreshId, job); try { await this.persistJobs(); } catch (error) { this.#jobs.delete(job.refreshId); throw error; }
-		this.launchJob(job); return { ...structuredClone(job), coalesced: false };
-	}
-	private launchJob(job: QmdRefreshJob): void {
-		if (this.#closed || this.#jobControllers.has(job.refreshId) || job.state !== "queued") return; const stores = job.stores.map((name) => this.config.stores.get(name)!); const controller = new AbortController(); this.#jobControllers.set(job.refreshId, controller); const task = this.runRefreshJob(job, stores, controller); this.#runningJobs.add(task); void task.finally(() => this.#runningJobs.delete(task)).catch(() => undefined);
-	}
-	private async runRefreshJob(job: QmdRefreshJob, stores: StoreConfig[], controller: AbortController): Promise<void> {
-		const previous = this.#refreshTail; const signal = AbortSignal.any([controller.signal, this.#lifecycle.signal]); let lastPersisted = 0;
-		const report = (phase: QmdRefreshPhase, update?: QmdWorkerProgress | { documentsCompleted: number; sourceBytesCompleted: number; documentsTotal?: number; sourceBytesTotal?: number }): void => {
-			if (["succeeded", "failed", "cancelled"].includes(job.phase)) return; const changedPhase = job.phase !== phase; job.phase = phase; job.state = phase === "queued" ? "queued" : "running"; job.updatedAt = new Date().toISOString();
-			if (update && "documentsCompleted" in update) { job.progress.documentsCompleted = update.documentsCompleted; job.progress.sourceBytesCompleted = update.sourceBytesCompleted; if (update.documentsTotal !== undefined) job.progress.documentsTotal = update.documentsTotal; if (update.sourceBytesTotal !== undefined) job.progress.sourceBytesTotal = update.sourceBytesTotal; }
-			else if (update) { const workerProgress = update as QmdWorkerProgress; if (workerProgress.documents) { job.progress.documentsCompleted = workerProgress.documents.completed; job.progress.documentsTotal = workerProgress.documents.total; } if (workerProgress.chunks) { job.progress.chunksCompleted = workerProgress.chunks.completed; job.progress.chunksTotal = workerProgress.chunks.total; } if (workerProgress.bytes) { job.progress.embeddingBytesCompleted = workerProgress.bytes.completed; job.progress.embeddingBytesTotal = workerProgress.bytes.total; } if (workerProgress.errors !== undefined) job.progress.errors = workerProgress.errors; }
-			if (changedPhase || Date.now() - lastPersisted >= 1000) { lastPersisted = Date.now(); void this.persistJobs().catch(() => controller.abort(new DatastoreError("INDEX_CORRUPT"))); }
-		};
-		const operation = (async () => { await previous.catch(() => undefined); throwIfAborted(signal); return this.refreshInner(stores, job.mode === "semantic", signal, report); })(); this.#refreshTail = operation.then(() => undefined, () => undefined);
-		try { const result = await operation; job.state = "succeeded"; job.phase = "succeeded"; job.generation = result.generation; for (const name of result.reconciledStores) if (![...this.#jobs.values()].some(other => other.refreshId !== job.refreshId && ["queued", "running"].includes(other.state) && other.stores.includes(name))) this.#runtimeLexicalCurrent.add(name); if (job.mode === "lexical") { for (const name of result.reconciledStores) this.#semanticStores.add(this.config.stores.get(name)!); this.#semanticBatch.schedule(); } }
-		catch (error) { const safe = error instanceof DatastoreError ? error : new DatastoreError("BACKEND_FAILED"); if (this.#lifecycle.signal.aborted && !controller.signal.aborted) { job.state = "queued"; job.phase = "queued"; delete job.errorCode; delete job.completedAt; } else { job.state = safe.code === "CANCELLED" ? "cancelled" : "failed"; job.phase = job.state; job.errorCode = safe.code; job.completedAt = new Date().toISOString(); } }
-		finally { job.updatedAt = new Date().toISOString(); if (["succeeded", "failed", "cancelled"].includes(job.state)) job.completedAt ??= job.updatedAt; this.#jobControllers.delete(job.refreshId); await this.persistJobs().catch(() => { job.state="failed"; job.phase="failed"; job.errorCode="INDEX_CORRUPT"; }); }
+		if (this.#closed) throw new DatastoreError("CANCELLED"); await this.validateBinding(); if (this.#closed) throw new DatastoreError("CANCELLED"); await this.ensureJobs(); if (this.#closed) throw new DatastoreError("CANCELLED");
+		for (const store of stores) this.#runtimeLexicalCurrent.delete(store.name);
+		return this.#coordinator.enqueue(mode, stores.map((store) => store.name), ownership);
 	}
 	async cancelRefresh(refreshId: string): Promise<Record<string, unknown>> {
-		await this.ensureJobs(); const job = this.#jobs.get(refreshId); if (!job) throw new DatastoreError("INVALID_NOTE_REF"); const controller = this.#jobControllers.get(refreshId); if (controller) controller.abort(new DatastoreError("CANCELLED")); if (job.state === "queued") { job.state = "cancelled"; job.phase = "cancelled"; job.errorCode = "CANCELLED"; job.updatedAt = new Date().toISOString(); job.completedAt = job.updatedAt; await this.persistJobs(); } return { ...structuredClone(job), cancellationRequested: controller !== undefined || job.state === "cancelled" };
+		await this.ensureJobs(); return this.#coordinator.cancel(refreshId);
 	}
 	async cancelSemanticRefresh(refreshId: string): Promise<Record<string, unknown>> { return this.cancelRefresh(refreshId); }
 
@@ -275,7 +248,7 @@ export class QmdAdapter {
   if (this.#refreshActive) return {state:"degraded",reasonCode:this.#embeddingActive ? "SEMANTIC_UNAVAILABLE" : "STALE_INDEX",version:this.binding.version,refresh:this.activity(),stores:{}};
   const previous=this.#readTail;const operation=(async()=>{await this.waitFor(previous,activeSignal);await this.validateBinding();await this.prepare();const raw=await this.#reader.request(this.request("status"),{signal:activeSignal});return {state:"ready",version:this.binding.version,generatedAt:this.#manifest?.generatedAt,semanticAt:raw.status.needsEmbedding===0 && raw.status.hasVectorIndex ? this.#manifest?.semanticAt : undefined,documentCount:raw.status.totalDocuments,pendingEmbeddings:raw.status.needsEmbedding,hasVectorIndex:raw.status.hasVectorIndex,refresh:this.activity(),stores:Object.fromEntries([...this.config.stores.values()].map(s=>[s.name,{documentCount:raw.collections.find((c:any)=>c.name===s.search.qmdCollection)?.active_count,runtimeLexicalCurrent:this.isLexicallyCurrent(s.name)}]))};})();this.#readTail=operation.then(()=>undefined,()=>undefined);return operation;
  }
- async shutdown(): Promise<void> { if(this.#closed)return;this.#closed=true;this.#lifecycle.abort(new DatastoreError("CANCELLED"));await this.#semanticBatch.close();await Promise.allSettled([...this.#runningJobs,this.#refreshTail,this.#readTail,...(this.#startup?[this.#startup]:[])]);await Promise.all([this.#reader.shutdown(),this.#writer.shutdown()]);await this.#persistTail.catch(()=>undefined); await this.#ownershipPromise?.then(ownership => ownership.release(), () => undefined); }
+ async shutdown(): Promise<void> { if(this.#closed)return;this.#closed=true;this.#coordinator.shutdown();this.#lifecycle.abort(new DatastoreError("CANCELLED"));await this.#semanticBatch.close();await Promise.allSettled([this.#refreshTail,this.#readTail,this.#coordinator.settled(),...(this.#startup?[this.#startup]:[])]);await Promise.all([this.#reader.shutdown(),this.#writer.shutdown()]); await this.#ownershipPromise?.then(ownership => ownership.release(), () => undefined); }
 }
 export function decodeQmdUri(uri: unknown, expectedCollection: string): string {
  if(typeof uri!=="string" || uri.includes("?") || uri.includes("#") || !uri.startsWith(`qmd://${expectedCollection}/`))throw new DatastoreError("BACKEND_OUTPUT_INVALID");

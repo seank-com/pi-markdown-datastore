@@ -42,7 +42,7 @@ async function atomicJson(path: string, value: unknown): Promise<void> {
 export class MetadataIndex {
 	readonly root: string;
 	#snapshot?: MetadataSnapshot;
-	constructor(private readonly stateRoot: string) { this.root = join(stateRoot, "metadata"); }
+	constructor(stateRoot: string) { this.root = join(stateRoot, "metadata"); }
 	private async load(): Promise<MetadataSnapshot | undefined> {
 		if (this.#snapshot) return this.#snapshot;
 		const path = join(this.root, "index.json");
