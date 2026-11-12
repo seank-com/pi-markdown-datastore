@@ -2,7 +2,23 @@ import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
+
+function cleanup(t: TestContext) {
+	const clients: { shutdown(): Promise<void> }[] = [];
+	const hosts: { close(): Promise<void> }[] = [];
+	const paths: string[] = [];
+	t.after(async () => {
+		for (const client of clients) await client.shutdown();
+		for (const host of hosts) await host.close();
+		for (const path of paths) await rm(path, { recursive: true, force: true });
+	});
+	return {
+		client(client: { shutdown(): Promise<void> }) { clients.push(client); },
+		host(host: { close(): Promise<void> }) { hosts.push(host); },
+		remove(...entries: string[]) { paths.push(...entries); },
+	};
+}
 import { loadMarkdownDatastoreConfig } from "../src/config.ts";
 import { MaintenanceCoordinator } from "../src/maintenance-coordinator.ts";
 import { MetadataIndex, registerMetadata } from "../src/metadata-index.ts";
@@ -80,7 +96,8 @@ test("graph-only shared host refreshes metadata without qmd", async (t) => {
 	const socketDir = `/tmp/dsm${process.pid}`;
 	await mkdir(socketDir, { mode: 0o700 });
 	await chmod(socketDir, 0o700);
-	t.after(async () => { await rm(socketDir, { recursive: true, force: true }); await rm(root, { recursive: true, force: true }); });
+	const done = cleanup(t);
+	done.remove(socketDir, root);
 	const notes = join(root, "notes");
 	await mkdir(notes, { recursive: true });
 	await writeFile(join(notes, "alpha.md"), "See [[beta]].\n");
@@ -90,11 +107,11 @@ test("graph-only shared host refreshes metadata without qmd", async (t) => {
 	const catalogPath = join(root, "catalog.json");
 	await writeFile(catalogPath, JSON.stringify({ schemaVersion: 1, socketPath: join(socketDir, "s.sock"), stateRoot: state, defaults: { maxResultBytes: 8192, maxResultLines: 100, operationTimeoutMs: 3000 }, qmd: { enabled: false, installation: { executable: "qmd" }, minimumVersion: "2.8.3" }, stores: { notebook: { root: notes, include: ["**/*.md"], exclude: [], maxFileBytes: 4096, search: { defaultMode: "lexical", qmdCollection: "notebook" } } } }), { mode: 0o600 });
 	const host = await startSharedHost(catalogPath);
-	t.after(() => host.close());
+	done.host(host);
 	const catalog = await import("../src/shared-catalog.ts").then((mod) => mod.loadSharedCatalog(catalogPath));
 	const defined = catalog.stores.get("notebook")!;
 	const client = new SharedIndexClient({ socketPath: join(socketDir, "s.sock"), store: "notebook", definitionRevision: defined.definitionRevision });
-	t.after(() => client.shutdown());
+	done.client(client);
 	const receipt = await client.startMetadata();
 	assert.equal(receipt.coalesced, false);
 	await host.coordinators.get("notebook")?.settled();
@@ -111,7 +128,8 @@ test("a second graph-only endpoint cannot own the same index, and close waits fo
 	await mkdir(socketB, { mode: 0o700 });
 	await chmod(socketA, 0o700);
 	await chmod(socketB, 0o700);
-	t.after(async () => { await rm(socketA, { recursive: true, force: true }); await rm(socketB, { recursive: true, force: true }); await rm(root, { recursive: true, force: true }); });
+	const done = cleanup(t);
+	done.remove(socketA, socketB, root);
 	const notes = join(root, "notes");
 	await mkdir(notes, { recursive: true });
 	await writeFile(join(notes, "alpha.md"), "See [[beta]].\n");
@@ -124,6 +142,7 @@ test("a second graph-only endpoint cannot own the same index, and close waits fo
 	await writeCatalog(firstPath, socketA);
 	await writeCatalog(secondPath, socketB);
 	const first = await startSharedHost(firstPath);
+	done.host(first);
 	await assert.rejects(startSharedHost(secondPath), { code: "STORE_UNAVAILABLE" });
 	let started!: () => void;
 	const holding = new Promise<void>((resolve) => { started = resolve; });
