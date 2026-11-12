@@ -5,7 +5,7 @@ import type {
 } from "./contract.ts";
 import type { MarkdownDatastoreConfig, StoreConfig } from "./config.ts";
 import { clampReadBudget, HARD_MAX_RESULT_BYTES, HARD_MAX_RESULT_LINES } from "./config.ts";
-import { assertRootIdentity, inspectDestination, ownsDestination, noteUriToRef, redactedRoot, safeOpenNote, validateRelativeNotePath } from "./containment.ts";
+import { assertRootIdentity, inspectDestination, ownsDestination, noteUriToRef, redactedRoot, safeOpenNote, validateRelativeContainedPath, validateRelativeNotePath } from "./containment.ts";
 import { ContinuationRegistry, type ContinuationDescriptor } from "./continuations.ts";
 import { DatastoreError, throwIfAborted } from "./errors.ts";
 import { boundedPage, contentWithoutSections, parseMarkdown, sectionText, selectSection, type SectionDescriptor } from "./markdown.ts";
@@ -329,7 +329,8 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		}
 		const mode = input.mode ?? "direct"; const stores = input.store ? [this.store(input.store)] : [...this.config.stores.values()];
 		if (mode === "metadata" || mode === "rebuild") {
-			if (input.paths !== undefined && (mode === "rebuild" || !Array.isArray(input.paths) || input.paths.length === 0 || input.paths.some((path) => typeof path !== "string" || path.length === 0 || path.startsWith("/") || path.includes("\\") || path.split("/").includes("..") || path.split("/").includes(".")))) throw new DatastoreError("INVALID_NOTE_REF");
+			if (input.paths !== undefined && mode !== "metadata") throw new DatastoreError("INVALID_NOTE_REF");
+			if (mode === "metadata" && input.paths !== undefined) { if (!Array.isArray(input.paths) || input.paths.length === 0) throw new DatastoreError("INVALID_NOTE_REF"); for (const path of input.paths) validateRelativeContainedPath(path); }
 			const local = stores.filter((store) => !store.shared).map((store) => store.name);
 			if (mode === "metadata" && input.paths?.length) for (const name of local) this.maintenance?.notePaths(name, input.paths);
 			const shared = stores.filter((store) => store.shared);

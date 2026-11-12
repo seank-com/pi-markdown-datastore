@@ -5,6 +5,7 @@ import { acquireIndexOwnership, type IndexOwnership } from "./index-ownership.ts
 import { adoptLegacyApplicationJobs, MaintenanceCoordinator, sourceDefinition } from "./maintenance-coordinator.ts";
 import { MetadataIndex, registerMetadata, reconcileChanged, pageRendered, continuationOffset, continuationToken, tagCandidate } from "./metadata-index.ts";
 import { clampReadBudget, type MarkdownDatastoreConfig, type StoreConfig } from "./config.ts";
+import { validateRelativeContainedPath } from "./containment.ts";
 import { DatastoreError } from "./errors.ts";
 import { loadSharedCatalog, type SharedCatalog, type SharedStoreDefinition } from "./shared-catalog.ts";
 import { attachSharedParser, encodeSharedMessage, generationId, listenOwnedSocket, parseSharedRequest, type SharedCall, type SharedHello, type SharedReply } from "./shared-ipc.ts";
@@ -108,7 +109,13 @@ export async function startSharedHost(catalogPath: string, options: { schedule?:
 			try {
 				const store = adapter?.config.stores.get(message.store);
 				let result: unknown;
-				if (call.operation === "startMetadata") { const paths = Array.isArray(call.input?.paths) ? call.input.paths.filter((path): path is string => typeof path === "string") : []; if (call.input?.rebuild === true && paths.length) throw new DatastoreError("INVALID_NOTE_REF"); if (paths.length) coordinator.notePaths(message.store, paths); result = await coordinator.enqueue("metadata", [message.store], "explicit-maintenance", sourceDefinition([storeConfig(catalog, definition).stores.get(message.store)!]), call.input?.rebuild === true ? "rebuild" : undefined); }
+				if (call.operation === "startMetadata") {
+					if (call.input?.paths !== undefined && (!Array.isArray(call.input.paths) || call.input.paths.some((path) => typeof path !== "string"))) throw new DatastoreError("INVALID_NOTE_REF");
+					const paths = Array.isArray(call.input?.paths) ? call.input.paths.map((path) => validateRelativeContainedPath(path as string)) : [];
+					if (call.input?.rebuild === true && paths.length) throw new DatastoreError("INVALID_NOTE_REF");
+					if (paths.length) coordinator.notePaths(message.store, paths);
+					result = await coordinator.enqueue("metadata", [message.store], "explicit-maintenance", sourceDefinition([storeConfig(catalog, definition).stores.get(message.store)!]), call.input?.rebuild === true ? "rebuild" : undefined);
+				}
 				else if (call.operation === "links" || call.operation === "backlinks" || call.operation === "tagPages" || call.operation === "tags") {
 					const store = storeConfig(catalog, definition).stores.get(message.store);
 					if (!store) throw new DatastoreError("STORE_UNAVAILABLE");

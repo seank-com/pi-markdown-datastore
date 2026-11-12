@@ -84,6 +84,7 @@ export class MaintenanceCoordinator {
 	register(mode: Mode, runner: MaintenanceRunner): void { this.#runners.set(mode, runner); }
 	hasRunner(mode: Mode): boolean { return this.#runners.has(mode); }
 	notePaths(store: string, paths: string[]): void { const set = this.#pendingPaths.get(store) ?? new Set<string>(); for (const path of paths) set.add(path); this.#pendingPaths.set(store, set); }
+	#claimPaths(stores: string[]): string[] { const claimed: string[] = []; for (const store of stores) { const set = this.#pendingPaths.get(store); if (!set) continue; claimed.push(...set); this.#pendingPaths.delete(store); } return [...new Set(claimed)].sort(); }
 	takePaths(store: string): string[] { const set = this.#pendingPaths.get(store); this.#pendingPaths.delete(store); return set ? [...set] : []; }
 	noteQmd(store: string): void { this.#qmdDirty.add(store); }
 	qmdDirty(store: string): boolean { const latest = this.jobs().find((job) => job.mode === "lexical" && job.stores.includes(store)); return this.#qmdDirty.has(store) || latest?.state === "failed"; }
@@ -121,11 +122,14 @@ export class MaintenanceCoordinator {
 		if (raw?.version !== 1 || !Array.isArray(raw.jobs) || raw.jobs.length > TERMINAL_JOB_LIMIT) throw new DatastoreError("INDEX_CORRUPT");
 		for (const value of raw.jobs) {
 			const jobRaw = value as Record<string, unknown>;
-			const allowed = ["version", "refreshId", "key", "mode", "stores", "ownership", "state", "phase", "createdAt", "updatedAt", "completedAt", "generation", "errorCode", "definition", "progress"];
+			const allowed = ["version", "refreshId", "key", "mode", "stores", "ownership", "state", "phase", "createdAt", "updatedAt", "completedAt", "generation", "errorCode", "definition", "progress", "intent", "paths"];
 			if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(jobRaw).some((key) => !allowed.includes(key)) || jobRaw.version !== 1 || typeof jobRaw.refreshId !== "string" || !/^[0-9a-f]{32}$/.test(jobRaw.refreshId) || !["lexical", "semantic", "metadata"].includes(String(jobRaw.mode)) || !Array.isArray(jobRaw.stores) || jobRaw.stores.some((name) => typeof name !== "string" || !this.knownStores().has(name)) || new Set(jobRaw.stores as string[]).size !== jobRaw.stores.length || !["startup-reconciliation", "explicit-maintenance"].includes(String(jobRaw.ownership)) || !["queued", "running", "succeeded", "failed", "cancelled"].includes(String(jobRaw.state)) || !["queued", "scanning", "updating", "embedding", "validating", "promoting", "succeeded", "failed", "cancelled"].includes(String(jobRaw.phase)) || typeof jobRaw.createdAt !== "string" || typeof jobRaw.updatedAt !== "string") throw new DatastoreError("INDEX_CORRUPT");
 			const stores = [...jobRaw.stores as string[]].sort();
 			const mode = String(jobRaw.mode) as Mode;
-			if (jobRaw.key !== `${mode}:${stores.join(",")}`) throw new DatastoreError("INDEX_CORRUPT");
+			const intent = jobRaw.intent === "rebuild" ? "rebuild" as const : undefined;
+			if (jobRaw.intent !== undefined && intent === undefined) throw new DatastoreError("INDEX_CORRUPT");
+			if (jobRaw.paths !== undefined && (!Array.isArray(jobRaw.paths) || jobRaw.paths.some((path) => typeof path !== "string"))) throw new DatastoreError("INDEX_CORRUPT");
+			if (jobRaw.key !== `${mode}:${stores.join(",")}${intent === "rebuild" ? ":rebuild" : ""}`) throw new DatastoreError("INDEX_CORRUPT");
 			if (jobRaw.completedAt !== undefined && typeof jobRaw.completedAt !== "string") throw new DatastoreError("INDEX_CORRUPT");
 			if (jobRaw.errorCode !== undefined && (typeof jobRaw.errorCode !== "string" || !/^[A-Z_]{3,64}$/.test(jobRaw.errorCode))) throw new DatastoreError("INDEX_CORRUPT");
 			const generationPattern = mode === "metadata" ? /^(?:gen|meta)-[0-9a-f]{32}$/ : /^gen-[0-9a-f]{32}$/;
@@ -135,7 +139,7 @@ export class MaintenanceCoordinator {
 			const progressAllowed = ["documentsCompleted", "documentsTotal", "sourceBytesCompleted", "sourceBytesTotal", "chunksCompleted", "chunksTotal", "embeddingBytesCompleted", "embeddingBytesTotal", "errors"];
 			if (!progressRaw || typeof progressRaw !== "object" || Array.isArray(progressRaw) || Object.keys(progressRaw).some((field) => !progressAllowed.includes(field))) throw new DatastoreError("INDEX_CORRUPT");
 			for (const field of progressAllowed) if (progressRaw[field] !== undefined && (!Number.isSafeInteger(progressRaw[field]) || (progressRaw[field] as number) < 0)) throw new DatastoreError("INDEX_CORRUPT");
-			const job: QmdRefreshJob = { version: 1, refreshId: jobRaw.refreshId, key: jobRaw.key, mode, stores, ownership: jobRaw.ownership as QmdRefreshJob["ownership"], state: jobRaw.state as QmdRefreshJob["state"], phase: jobRaw.phase as QmdRefreshPhase, createdAt: jobRaw.createdAt, updatedAt: jobRaw.updatedAt, completedAt: typeof jobRaw.completedAt === "string" ? jobRaw.completedAt : undefined, generation: typeof jobRaw.generation === "string" ? jobRaw.generation : undefined, errorCode: typeof jobRaw.errorCode === "string" ? jobRaw.errorCode : undefined, definition: typeof jobRaw.definition === "string" ? jobRaw.definition : undefined, progress: { documentsCompleted: Number(progressRaw.documentsCompleted ?? 0), documentsTotal: progressRaw.documentsTotal as number | undefined, sourceBytesCompleted: Number(progressRaw.sourceBytesCompleted ?? 0), sourceBytesTotal: progressRaw.sourceBytesTotal as number | undefined, chunksCompleted: Number(progressRaw.chunksCompleted ?? 0), chunksTotal: progressRaw.chunksTotal as number | undefined, embeddingBytesCompleted: Number(progressRaw.embeddingBytesCompleted ?? 0), embeddingBytesTotal: progressRaw.embeddingBytesTotal as number | undefined, errors: Number(progressRaw.errors ?? 0) } };
+			const job: QmdRefreshJob = { version: 1, refreshId: jobRaw.refreshId, key: jobRaw.key, mode, stores, ownership: jobRaw.ownership as QmdRefreshJob["ownership"], intent, paths: Array.isArray(jobRaw.paths) ? jobRaw.paths as string[] : undefined, state: jobRaw.state as QmdRefreshJob["state"], phase: jobRaw.phase as QmdRefreshPhase, createdAt: jobRaw.createdAt, updatedAt: jobRaw.updatedAt, completedAt: typeof jobRaw.completedAt === "string" ? jobRaw.completedAt : undefined, generation: typeof jobRaw.generation === "string" ? jobRaw.generation : undefined, errorCode: typeof jobRaw.errorCode === "string" ? jobRaw.errorCode : undefined, definition: typeof jobRaw.definition === "string" ? jobRaw.definition : undefined, progress: { documentsCompleted: Number(progressRaw.documentsCompleted ?? 0), documentsTotal: progressRaw.documentsTotal as number | undefined, sourceBytesCompleted: Number(progressRaw.sourceBytesCompleted ?? 0), sourceBytesTotal: progressRaw.sourceBytesTotal as number | undefined, chunksCompleted: Number(progressRaw.chunksCompleted ?? 0), chunksTotal: progressRaw.chunksTotal as number | undefined, embeddingBytesCompleted: Number(progressRaw.embeddingBytesCompleted ?? 0), embeddingBytesTotal: progressRaw.embeddingBytesTotal as number | undefined, errors: Number(progressRaw.errors ?? 0) } };
 			if (job.state === "queued" || job.state === "running") { job.state = "queued"; job.phase = "queued"; delete job.errorCode; delete job.completedAt; job.updatedAt = new Date().toISOString(); }
 			this.#jobs.set(job.refreshId, job);
 		}
@@ -167,15 +171,15 @@ export class MaintenanceCoordinator {
 			this.launch(admitted);
 			return { ...structuredClone(admitted), coalesced: true };
 		}
-		const pending = ordered.some((store) => this.#pendingPaths.get(store)?.size);
-		const existing = [...this.#jobs.values()].find((job) => job.key === key && (job.state === "queued" || job.state === "running") && job.definition === definition);
-		if (existing?.state === "queued" || (existing && !pending)) { this.launch(existing); return { ...structuredClone(existing), coalesced: true }; }
-		if (existing?.state === "running" && pending) {
-			await this.persisted(existing.refreshId);
-			if (this.#closed) throw new DatastoreError("CANCELLED");
-			const follow = [...this.#jobs.values()].find((job) => job.key === key && job.refreshId !== existing.refreshId && (job.state === "queued" || job.state === "running") && job.definition === definition);
-			if (follow) return { ...structuredClone(follow), coalesced: true };
+		const queued = [...this.#jobs.values()].find((job) => job.key === key && job.state === "queued" && job.definition === definition);
+		if (queued) {
+			const claimed = intent === "rebuild" ? [] : this.#claimPaths(ordered);
+			if (claimed.length) { queued.paths = [...new Set([...(queued.paths ?? []), ...claimed])].sort(); await this.persist(); }
+			this.launch(queued);
+			return { ...structuredClone(queued), coalesced: true };
 		}
+		const running = [...this.#jobs.values()].find((job) => job.key === key && job.state === "running" && job.definition === definition);
+		if (running && !ordered.some((store) => this.#pendingPaths.get(store)?.size)) { this.launch(running); return { ...structuredClone(running), coalesced: true }; }
 		let admit!: () => void;
 		let refuse!: (error: unknown) => void;
 		const admission = new Promise<void>((resolve, reject) => { admit = resolve; refuse = reject; });
@@ -186,7 +190,8 @@ export class MaintenanceCoordinator {
 			while (this.#jobs.size + 1 > TERMINAL_JOB_LIMIT && terminal.length) this.#jobs.delete(terminal.shift()!.refreshId);
 			if (this.#jobs.size + 1 > TERMINAL_JOB_LIMIT) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
 			const now = new Date().toISOString();
-			const job: QmdRefreshJob = { version: 1, refreshId: randomBytes(16).toString("hex"), key, mode, stores: ordered, ownership, definition, state: "queued", phase: "queued", createdAt: now, updatedAt: now, progress: { documentsCompleted: 0, sourceBytesCompleted: 0, chunksCompleted: 0, embeddingBytesCompleted: 0, errors: 0 } };
+			const claimed = intent === "rebuild" ? [] : this.#claimPaths(ordered);
+			const job: QmdRefreshJob = { version: 1, refreshId: randomBytes(16).toString("hex"), key, mode, stores: ordered, ownership, intent, paths: claimed.length ? claimed : undefined, definition, state: "queued", phase: "queued", createdAt: now, updatedAt: now, progress: { documentsCompleted: 0, sourceBytesCompleted: 0, chunksCompleted: 0, embeddingBytesCompleted: 0, errors: 0 } };
 			this.#jobs.set(job.refreshId, job);
 			try { await this.persist(); } catch (error) { this.#jobs.delete(job.refreshId); throw error; }
 			admit();
@@ -217,7 +222,7 @@ export class MaintenanceCoordinator {
 			const result = await runner(job, controller.signal, report);
 			job.state = "succeeded"; job.phase = "succeeded"; if (result && "generation" in result && result.generation) job.generation = result.generation;
 		})().catch((error: unknown) => {
-			if (this.#hostClosing && !this.#explicitCancel.has(job.refreshId)) { job.state = "queued"; job.phase = "queued"; delete job.errorCode; delete job.completedAt; return; }
+			if (this.#hostClosing && !this.#explicitCancel.has(job.refreshId)) { job.state = "queued"; job.phase = "queued"; delete job.errorCode; delete job.completedAt; this.#finish(job.refreshId); return; }
 			const safe = error instanceof DatastoreError ? error : new DatastoreError("BACKEND_FAILED");
 			job.state = safe.code === "CANCELLED" ? "cancelled" : "failed";
 			job.phase = job.state; job.errorCode = safe.code;

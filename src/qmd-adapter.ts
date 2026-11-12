@@ -25,7 +25,7 @@ export interface QmdCandidate { path: string; backendRank: number; score?: numbe
 export interface QmdSearchResult { candidates: QmdCandidate[]; rejectedCandidates: number; manifest: QmdManifest; generation: string; requestedMode: SearchMode; effectiveMode: SearchMode; embeddingActive: boolean; queueMs: number; operationMs: number; workerId?: number }
 export type QmdRefreshPhase = "queued" | "scanning" | "updating" | "embedding" | "validating" | "promoting" | "succeeded" | "failed" | "cancelled";
 export interface QmdRefreshJob {
-	version: 1; refreshId: string; key: string; mode: "lexical" | "semantic" | "metadata"; stores: string[]; ownership: "startup-reconciliation" | "explicit-maintenance";
+	version: 1; refreshId: string; key: string; mode: "lexical" | "semantic" | "metadata"; stores: string[]; ownership: "startup-reconciliation" | "explicit-maintenance"; intent?: "rebuild"; paths?: string[];
 	state: "queued" | "running" | "succeeded" | "failed" | "cancelled"; phase: QmdRefreshPhase;
 	createdAt: string; updatedAt: string; completedAt?: string; generation?: string; errorCode?: string; definition?: string;
 	progress: { documentsCompleted: number; documentsTotal?: number; sourceBytesCompleted: number; sourceBytesTotal?: number; chunksCompleted: number; chunksTotal?: number; embeddingBytesCompleted: number; embeddingBytesTotal?: number; errors: number };

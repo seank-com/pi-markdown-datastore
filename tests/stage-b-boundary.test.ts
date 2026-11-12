@@ -27,6 +27,71 @@ async function store() {
 	return { root, notes, state, config };
 }
 
+test("cancelled path scope is not replayed and a rebuild receipt reloads", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "stage-b-own-")));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const coordinator = new MaintenanceCoordinator(join(root, "jobs.json"), () => new Set(["a", "b"]));
+	let release!: () => void;
+	const entered = new Promise<void>((resolve) => { coordinator.register("metadata", async (job) => { if (job.stores[0] === "a") { resolve(); await new Promise<void>((done) => { release = done; }); } }); });
+	coordinator.notePaths("a", ["first.md"]);
+	await coordinator.enqueue("metadata", ["a"], "explicit-maintenance");
+	await entered;
+	coordinator.notePaths("b", ["cancelled.md"]);
+	const cancelled = await coordinator.enqueue("metadata", ["b"], "explicit-maintenance");
+	await coordinator.cancel(String(cancelled.refreshId));
+	coordinator.notePaths("b", ["newer.md"]);
+	const newer = await coordinator.enqueue("metadata", ["b"], "explicit-maintenance");
+	release();
+	await coordinator.settled();
+	assert.equal(coordinator.get(String(cancelled.refreshId))?.state, "cancelled");
+	assert.equal(coordinator.get(String(newer.refreshId))?.state, "succeeded");
+	assert.deepEqual(coordinator.get(String(newer.refreshId))?.paths, ["newer.md"]);
+	const rebuild = new MaintenanceCoordinator(join(root, "rebuild.json"), () => new Set(["a"]));
+	await rebuild.enqueue("metadata", ["a"], "explicit-maintenance", undefined, "rebuild");
+	rebuild.shutdown();
+	await rebuild.settled();
+	const reopened = new MaintenanceCoordinator(join(root, "rebuild.json"), () => new Set(["a"]));
+	await reopened.ensureLoaded();
+	assert.equal(reopened.jobs()[0]?.intent, "rebuild");
+	reopened.shutdown();
+});
+
+test("a follow-up receipt is durable before the running job finishes", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "stage-b-follow-")));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const coordinator = new MaintenanceCoordinator(join(root, "jobs.json"), () => new Set(["notes"]));
+	let release!: () => void;
+	const entered = new Promise<void>((resolve) => { coordinator.register("metadata", async () => { resolve(); await new Promise<void>((done) => { release = done; }); }); });
+	coordinator.notePaths("notes", ["a.md"]);
+	const first = await coordinator.enqueue("metadata", ["notes"], "explicit-maintenance");
+	await entered;
+	coordinator.notePaths("notes", ["b.md"]);
+	const follow = await coordinator.enqueue("metadata", ["notes"], "explicit-maintenance");
+	assert.notEqual(follow.refreshId, first.refreshId);
+	assert.equal(coordinator.get(String(follow.refreshId))?.state, "queued");
+	await coordinator.cancel(String(follow.refreshId));
+	release();
+	await coordinator.settled();
+	assert.equal(coordinator.get(String(follow.refreshId))?.state, "cancelled");
+	assert.equal(coordinator.jobs().some((job) => job.paths?.includes("b.md") && job.state === "succeeded"), false);
+});
+
+test("shutdown during reconciliation settles without finishing the recovered job", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "stage-b-close-")));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const coordinator = new MaintenanceCoordinator(join(root, "jobs.json"), () => new Set(["notes"]));
+	let release!: () => void;
+	const entered = new Promise<void>((resolve) => { coordinator.register("metadata", async (_job, signal) => { resolve(); await new Promise<void>((_done, reject) => { release = () => reject(signal.reason); signal.addEventListener("abort", () => reject(signal.reason)); }); }); });
+	const receipt = await coordinator.enqueue("metadata", ["notes"], "startup-reconciliation");
+	const waiting = coordinator.persisted(String(receipt.refreshId));
+	await entered;
+	coordinator.shutdown();
+	release();
+	await waiting;
+	await coordinator.settled();
+	assert.equal(coordinator.get(String(receipt.refreshId))?.state, "queued");
+});
+
 test("shutdown disposes the cycle before its callback can run or rearm", async () => {
 	const coordinator = new MaintenanceCoordinator(join(tmpdir(), `cycle-${Date.now()}.json`), () => new Set());
 	let runs = 0;
