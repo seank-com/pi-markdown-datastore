@@ -223,7 +223,7 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 			if (generation !== ownGeneration) { await Promise.allSettled([qmd?.shutdown(), ...[...sharedClients.values()].map((client) => client.shutdown())].filter((operation): operation is Promise<void> => operation !== undefined)); return; }
 			const next = new MarkdownDatastoreService(config, undefined, qmd, sharedClients);
 			let ownership;
-			try { ownership = qmd ? undefined : await (async () => { await prepareQmdStateDirectory(config.stateRoot); return acquireIndexOwnership(config.stateRoot); })(); }
+			try { ownership = qmd || config.qmd.enabled ? undefined : await (async () => { await prepareQmdStateDirectory(config.stateRoot); return acquireIndexOwnership(config.stateRoot); })(); }
 			catch (error) { await next.shutdown(); if (generation !== ownGeneration) return; unavailable = datastoreError(error, "STORE_UNAVAILABLE"); ctx.ui.setStatus("markdown-datastore", `datastore: disabled (${unavailable.code})`); return; }
 			service = next;
 			const coordinator = qmd?.coordinator ?? new MaintenanceCoordinator(join(config.stateRoot, "jobs.json"), () => new Set(config.stores.keys()));
