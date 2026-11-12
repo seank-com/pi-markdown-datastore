@@ -74,6 +74,35 @@ test("path updates keep written targets and match a rebuild", async () => {
 	assert.deepEqual(incremental, rebuilt);
 });
 
+test("resolution covers explicit paths, attachments, self-fragments, tags, and reconcile", async () => {
+	const { notes, state, store } = await fixture();
+	await mkdir(join(notes, "clients"));
+	await writeFile(join(notes, "clients", "Project Atlas.md"), "[[#Here]]\n");
+	await writeFile(join(notes, "planner.md"), "[[clients/Project Atlas]]\n[[clients/Project Atlas.md]]\n[[diagram]]\n[[diagram.png]]\n[[folder\\page]]\n");
+	await writeFile(join(notes, "diagram.png"), "png");
+	await writeFile(join(notes, "diagram.svg"), "svg");
+	await writeFile(join(notes, "__proto__.md"), "---\ntags: ['#Projects', 'active']\n---\nowned\n");
+	const index = new MetadataIndex(state);
+	await index.refresh(store);
+	const planner = await index.links("planner.md");
+	assert.deepEqual(planner.map((edge) => edge.targetKind), ["note", "note", "ambiguous", "attachment", "unresolved"]);
+	assert.equal((await index.backlinks("clients/Project Atlas.md")).some((edge) => edge.source === "clients/Project Atlas.md" && edge.fragment === "Here"), true);
+	assert.equal((await index.backlinks("planner.md")).some((edge) => edge.fragment === "Here"), false);
+	const catalog = await index.catalog();
+	assert.equal(catalog.find((tag) => tag.identity === "projects")?.spelling, "#Projects");
+	assert.equal(Object.hasOwn((await index.snapshot())!.files, "__proto__.md"), true);
+	await writeFile(join(notes, "broken.md"), "---\ntags: [\n");
+	await index.updatePaths(store, ["broken.md"]);
+	await writeFile(join(notes, "planner.md"), "[[clients/Project Atlas]]\n");
+	const after = await index.updatePaths(store, ["planner.md"]);
+	assert.equal(after.diagnostics.some((line) => line.startsWith("broken.md:")), true);
+	await writeFile(join(notes, "external.md"), "added outside\n");
+	const reconciled = await index.reconcile(store);
+	assert.equal(Object.hasOwn(reconciled.files, "external.md"), true);
+	const rebuilt = await new MetadataIndex(join(state, "oracle")).rebuild(store);
+	assert.deepEqual(semantic(reconciled), semantic(rebuilt));
+});
+
 test("a failed snapshot write keeps the previous memory and disk", async () => {
 	const { notes, state, store } = await fixture();
 	await writeFile(join(notes, "alpha.md"), "one\n");
