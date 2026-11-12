@@ -205,8 +205,11 @@ export function pageRendered<T>(items: T[], offset: number, budget: { maxBytes: 
 }
 
 function decodePageToken(token: string): { store?: string; revision?: string; query?: string; offset?: number; maxBytes?: number; maxLines?: number } {
-	try { return JSON.parse(Buffer.from(token, "base64url").toString("utf8")); }
+	let parsed: unknown;
+	try { parsed = JSON.parse(Buffer.from(token, "base64url").toString("utf8")); }
 	catch { throw new DatastoreError("STALE_CONTINUATION"); }
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new DatastoreError("STALE_CONTINUATION");
+	return parsed as { store?: string; revision?: string; query?: string; offset?: number; maxBytes?: number; maxLines?: number };
 }
 
 export function continuationOffset(token: string | undefined, store: string, revision: string, query: string): number {
