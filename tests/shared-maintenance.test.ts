@@ -33,8 +33,16 @@ test("private and shared hosts expose the same refresh coalescing and detach doe
 	await mkdir(socketDir, { mode: 0o700 });
 	await chmod(socketDir, 0o700);
 	const socketPath = join(socketDir, "s.sock");
-	t.after(() => rm(root, { recursive: true, force: true }));
-	t.after(() => rm(socketDir, { recursive: true, force: true }));
+	let child: ReturnType<typeof spawn> | undefined;
+	let privateAdapter: QmdAdapter | undefined;
+	const services: MarkdownDatastoreService[] = [];
+	t.after(async () => {
+		await Promise.all(services.map((service) => service.shutdown()));
+		await privateAdapter?.shutdown();
+		if (child && child.exitCode === null) { child.kill("SIGTERM"); await once(child, "exit"); }
+		await rm(socketDir, { recursive: true, force: true });
+		await rm(root, { recursive: true, force: true });
+	});
 	const notes = join(root, "notes");
 	const packageRoot = await createQmdFixture(root);
 	await owned(notes);
@@ -55,15 +63,13 @@ test("private and shared hosts expose the same refresh coalescing and detach doe
 	const privateConfigPath = join(privateProject, ".pi", "markdown-datastore", "config.json");
 	await writeFile(privateConfigPath, JSON.stringify({ schemaVersion: 1, defaults: { maxResultBytes: 8192, maxResultLines: 100, operationTimeoutMs: 3000 }, qmd: { enabled: true, installation: { packageRoot }, minimumVersion: "2.8.3" }, stores: { memory: { root: "notes", include: ["**/*.md"], exclude: [], maxFileBytes: 4096, search: { defaultMode: "lexical", qmdCollection: "memory" } } } }), { mode: 0o600 });
 	const privateConfig = await loadMarkdownDatastoreConfig(privateProject, privateConfigPath);
-	const privateAdapter = new QmdAdapter(privateConfig, await discoverQmdBinding(privateConfig));
-	t.after(() => privateAdapter.shutdown());
+	privateAdapter = new QmdAdapter(privateConfig, await discoverQmdBinding(privateConfig));
 	const first = await privateAdapter.startLexicalRefresh([privateConfig.stores.get("memory")!]);
 	const second = await privateAdapter.startLexicalRefresh([privateConfig.stores.get("memory")!]);
 	assert.equal(second.refreshId, first.refreshId);
 	assert.equal(second.coalesced, true);
 
-	const child = spawn(process.execPath, ["--experimental-strip-types", "src/shared-service-main.ts", "--catalog", catalogPath], { cwd: new URL("..", import.meta.url).pathname, stdio: ["ignore", "pipe", "pipe"] });
-	t.after(() => { child.kill("SIGTERM"); });
+	child = spawn(process.execPath, ["--experimental-strip-types", "src/shared-service-main.ts", "--catalog", catalogPath], { cwd: new URL("..", import.meta.url).pathname, stdio: ["ignore", "pipe", "pipe"] });
 	let err = "";
 	child.stderr.on("data", (chunk) => { err += chunk; });
 	const generation = await new Promise<string>((resolve, reject) => {
@@ -81,11 +87,12 @@ test("private and shared hosts expose the same refresh coalescing and detach doe
 		const config = await loadMarkdownDatastoreConfig(dir, configPath);
 		const client = new SharedIndexClient(config.stores.get(alias)!.shared!);
 		const service = new MarkdownDatastoreService(config, undefined, undefined, new Map([[alias, client]]));
+		services.push(service);
 		return { config, service, client, alias };
 	};
 	const left = await project("left", "notes-alias");
 	const right = await project("right", "archive-alias");
-	t.after(() => Promise.all([left.service.shutdown(), right.service.shutdown()]));
+
 	const leftReceipt = await left.service.refresh({ action: "start", store: left.alias, mode: "lexical" });
 	const rightReceipt = await right.service.refresh({ action: "start", store: right.alias, mode: "lexical" });
 	assert.equal(rightReceipt.data.qmd.refreshId, leftReceipt.data.qmd.refreshId);
@@ -102,7 +109,7 @@ test("private and shared hosts expose the same refresh coalescing and detach doe
 	child.kill("SIGTERM");
 	await new Promise((resolve) => child.once("exit", resolve));
 	const after = new MarkdownDatastoreService(right.config, undefined, undefined, new Map([[right.alias, new SharedIndexClient(right.config.stores.get(right.alias)!.shared!)]]));
-	t.after(() => after.shutdown());
+	services.push(after);
 	await assert.rejects(after.refresh({ action: "start", store: right.alias, mode: "lexical" }), { code: "STORE_UNAVAILABLE" });
 	const direct = await after.read({ store: right.alias, note: { store: right.alias, path: "alpha.md" } });
 	assert.match(direct.data.content, /Copper shared note/);
@@ -117,12 +124,19 @@ test("a live owner socket is not replaced and a public parent is refused", async
 	await mkdir(socketDir, { mode: 0o700 });
 	await chmod(socketDir, 0o700);
 	const socketPath = join(socketDir, "s.sock");
-	t.after(async () => { await rm(socketDir, { recursive: true, force: true }); await rm(root, { recursive: true, force: true }); });
-	const first = await listenOwnedSocket(socketPath, (socket) => socket.end("first"));
-	t.after(() => new Promise<void>((resolve) => first.close(() => resolve())));
+	let probe: ReturnType<typeof createConnection> | undefined;
+	let first: Server | undefined;
+	t.after(async () => {
+		probe?.destroy();
+		if (first) await new Promise<void>((resolve) => first!.close(() => resolve()));
+		await rm(socketDir, { recursive: true, force: true });
+		await rm(root, { recursive: true, force: true });
+	});
+	first = await listenOwnedSocket(socketPath, (socket) => socket.end("first"));
 	await assert.rejects(listenOwnedSocket(socketPath, () => undefined), { code: "STORE_UNAVAILABLE" });
 	assert.equal(first.listening, true);
-	const client = createConnection(socketPath);
+	probe = createConnection(socketPath);
+	const client = probe;
 	client.setEncoding("utf8");
 	const answer = new Promise<string>((resolve) => { let text = ""; client.on("data", (chunk) => { text += chunk; }); client.on("close", () => resolve(text)); });
 	await once(client, "connect");
