@@ -3,7 +3,7 @@ import { discoverQmdBinding, QmdAdapter } from "./qmd-adapter.ts";
 import type { MarkdownDatastoreConfig, StoreConfig } from "./config.ts";
 import { DatastoreError } from "./errors.ts";
 import { loadSharedCatalog, type SharedCatalog, type SharedStoreDefinition } from "./shared-catalog.ts";
-import { attachSharedParser, encodeSharedMessage, generationId, listenOwnedSocket, type SharedCall, type SharedHello, type SharedReply, type SharedRequest } from "./shared-ipc.ts";
+import { attachSharedParser, encodeSharedMessage, generationId, listenOwnedSocket, parseSharedRequest, type SharedCall, type SharedHello, type SharedReply } from "./shared-ipc.ts";
 
 export interface SharedHost {
 	generation: string;
@@ -29,12 +29,6 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 	const catalog = await loadSharedCatalog(catalogPath);
 	const generation = generationId();
 	const adapters = new Map<string, QmdAdapter>();
-	for (const definition of catalog.stores.values()) {
-		const config = storeConfig(catalog, definition);
-		const adapter = new QmdAdapter(config, await discoverQmdBinding(config));
-		adapters.set(definition.id, adapter);
-		void adapter.startupReconcile([config.stores.get(definition.id)!]).catch(() => undefined);
-	}
 	const sockets = new Set<Socket>();
 	const server = await listenOwnedSocket(catalog.socketPath, (socket) => {
 		sockets.add(socket);
@@ -45,9 +39,9 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 			send({ version: 1, requestId, generation, definitionRevision, ok: false, error: { code } });
 		};
 		attachSharedParser(socket, (message) => {
-			const request = message as SharedRequest;
-			if (!("operation" in request)) return;
-			if (request.operation === "drop") { if (request.requestId) waiters.get(request.requestId)?.abort(new DatastoreError("CANCELLED")); return; }
+			let request;
+			try { request = parseSharedRequest(message); } catch (error) { fail(undefined, "", error); socket.destroy(); return; }
+			if (request.operation === "drop") { waiters.get(request.requestId)?.abort(new DatastoreError("CANCELLED")); return; }
 			void handle(request).catch((error) => fail(request.requestId, request.definitionRevision, error));
 		}, () => socket.destroy());
 		const handle = async (message: SharedHello | SharedCall): Promise<void> => {
@@ -85,6 +79,19 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 			for (const controller of waiters.values()) controller.abort(new DatastoreError("CANCELLED"));
 		});
 	});
+	try {
+		for (const definition of catalog.stores.values()) {
+			const config = storeConfig(catalog, definition);
+			const adapter = new QmdAdapter(config, await discoverQmdBinding(config));
+			adapters.set(definition.id, adapter);
+			void adapter.startupReconcile([config.stores.get(definition.id)!]).catch(() => undefined);
+		}
+	} catch (error) {
+		server.close();
+		for (const socket of sockets) socket.destroy();
+		await Promise.all([...adapters.values()].map((adapter) => adapter.shutdown()));
+		throw error;
+	}
 	return {
 		generation, catalog, adapters,
 		close: async () => {

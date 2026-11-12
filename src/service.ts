@@ -90,45 +90,47 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		const started = Date.now(); throwIfAborted(signal); const store = this.store(input.store);
 		const shared = store.shared ? this.sharedClients?.get(store.name) : undefined;
 		if (store.shared && !shared) throw new DatastoreError("STORE_UNAVAILABLE");
-		if (!shared && !this.qmd) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
-		if (shared) return this.searchShared(store, shared, input, signal, started);
 		const qmd = this.qmd;
-		if (!qmd) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
+		if (!shared && !qmd) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
 		if (typeof input.query !== "string" || !input.query.trim() || Buffer.byteLength(input.query) > 4096) throw new DatastoreError("BACKEND_OUTPUT_INVALID");
 		const mode = input.mode ?? store.search.defaultMode; const limit = input.limit ?? 5;
 		if (input.minScore !== undefined && !Number.isFinite(input.minScore)) throw new DatastoreError("INVALID_NOTE_REF");
 		if (!Number.isInteger(limit) || limit < 1 || limit > 20 || !["lexical", "semantic", "hybrid"].includes(mode)) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
 		const freshness = input.freshness ?? "allow-stale";
-		if (mode === "semantic" && qmd.activity?.().embeddingActive) throw new DatastoreError("SEMANTIC_UNAVAILABLE", { retryable: true, requestedMode: mode });
-		if (freshness !== "allow-stale" && !qmd.isLexicallyCurrent(store.name)) throw new DatastoreError("STALE_INDEX");
+		const embeddingActive = shared ? (await shared.activity(signal)).embeddingActive : Boolean(qmd!.activity?.().embeddingActive);
+		const current = () => shared ? shared.isLexicallyCurrent(signal) : Promise.resolve(qmd!.isLexicallyCurrent(store.name));
+		if (mode === "semantic" && embeddingActive) throw new DatastoreError("SEMANTIC_UNAVAILABLE", { retryable: true, requestedMode: mode });
+		if (freshness !== "allow-stale" && !await current()) throw new DatastoreError("STALE_INDEX");
+		const manifestName = store.shared?.store ?? store.name;
+		const backendVersion = shared ? shared.version : qmd!.binding.version;
 		{
-			const backend = await qmd.search(store, input.query, mode, Math.min(500, Math.max(limit * 4, limit)), input.minScore, signal);
+			const backend = shared ? await shared.search(input.query, mode, Math.min(500, Math.max(limit * 4, limit)), input.minScore, signal) : await qmd!.search(store, input.query, mode, Math.min(500, Math.max(limit * 4, limit)), input.minScore, signal);
 			if ((backend.effectiveMode === "semantic" || backend.effectiveMode === "hybrid") && (!backend.manifest.semanticAt || backend.manifest.pendingEmbeddings !== 0 || !backend.manifest.hasVectorIndex)) throw new DatastoreError("STALE_INDEX");
 			if (backend.effectiveMode === "lexical" && freshness === "require-current-semantic") throw new DatastoreError("STALE_INDEX");
 			const hits: SearchHit[] = []; let dropped = backend.rejectedCandidates ?? 0; let stale = dropped > 0;
 			for (const candidate of backend.candidates) {
 				if (hits.length >= limit) break;
-				const indexed = backend.manifest.stores[store.name]?.[candidate.path];
+				const indexed = backend.manifest.stores[manifestName]?.[candidate.path];
 				if (!indexed) { stale = true; dropped += 1; continue; }
 				try {
 					const source = await safeOpenNote(store, candidate.path, signal);
 					if (source.fullRevision !== indexed.revision) { stale = true; dropped += 1; continue; }
 					const parsed = parseMarkdown(source);
 					const excerpt = input.includeContent ? this.excerpt(source.text, parsed, input.query, candidate) : undefined;
-					hits.push({ note: source.note, uri: source.uri, path: source.note.path, title: parsed.title, snippet: excerpt?.content, rank: hits.length + 1, backendRank: candidate.backendRank, backend: "qmd" as const, mode: backend.effectiveMode, score: candidate.score, sourceRevision: source.revision, indexedRevision: source.revision, sourceMtime: source.mtime, indexFreshness: qmd.isLexicallyCurrent(store.name) ? "current" as const : "stale" as const, truncated: excerpt?.truncated ?? false });
+					hits.push({ note: source.note, uri: source.uri, path: source.note.path, title: parsed.title, snippet: excerpt?.content, rank: hits.length + 1, backendRank: candidate.backendRank, backend: "qmd" as const, mode: backend.effectiveMode, score: candidate.score, sourceRevision: source.revision, indexedRevision: source.revision, sourceMtime: source.mtime, indexFreshness: await current() ? "current" as const : "stale" as const, truncated: excerpt?.truncated ?? false });
 				} catch (error) {
 					if (error instanceof DatastoreError && (error.code === "CANCELLED" || error.code === "TIMEOUT")) throw error;
 					stale = true; dropped += 1;
 				}
 			}
 			if (stale && freshness !== "allow-stale") throw new DatastoreError("STALE_INDEX");
-			const indexCurrent = qmd.isLexicallyCurrent(store.name);
+			const indexCurrent = await current();
 			if (!indexCurrent && freshness !== "allow-stale") throw new DatastoreError("STALE_INDEX");
 			const aggregateLines = (): number => Math.max(1, hits.reduce((count, hit) => count + (typeof hit.snippet === "string" ? lines(hit.snippet) : 1), 0)); let budgetTruncated = false; while (hits.length && (Buffer.byteLength(JSON.stringify(hits)) > this.config.defaults.maxResultBytes || aggregateLines() > this.config.defaults.maxResultLines)) { hits.pop(); budgetTruncated = true; }
 			const text = JSON.stringify(hits); const returnedLines = aggregateLines(); if (Buffer.byteLength(text) > this.config.defaults.maxResultBytes || returnedLines > this.config.defaults.maxResultLines) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
 			const staleMessage = "Serving indexed results while source reconciliation is pending; new notes may be absent.";
 			const warnings = [...(backend.requestedMode !== backend.effectiveMode ? [{ code: "SEMANTIC_UNAVAILABLE" as const, message: "Embedding underway; semantic retrieval is temporarily unavailable. Hybrid request served with lexical search." }] : []), ...(!indexCurrent ? [{ code: "STALE_INDEX" as const, message: staleMessage }] : []), ...(dropped ? [{ code: "STALE_CANDIDATE_DROPPED" as const, message: "One or more backend candidates failed current direct validation." }] : []), ...(budgetTruncated ? [{ code: "RESULT_LIMIT_EXCEEDED" as const, message: "Search hits were truncated at the configured aggregate result budget." }] : [])];
-			return this.envelope("search", store.name, { hits, examined: backend.candidates.length + (backend.rejectedCandidates ?? 0), dropped, returned: hits.length, requestedMode: backend.requestedMode, effectiveMode: backend.effectiveMode, queueMs: backend.queueMs, operationMs: backend.operationMs, workerId: backend.workerId }, started, text, budgetTruncated, undefined, [{ kind: "qmd", backendVersion: qmd.binding.version, observationId: backend.generation, observedAt: new Date().toISOString(), freshness: indexCurrent ? "current" : "stale" }, { kind: "filesystem", observedAt: new Date().toISOString(), freshness: "current" }], warnings, undefined, returnedLines) as SearchResult;
+			return this.envelope("search", store.name, { hits, examined: backend.candidates.length + (backend.rejectedCandidates ?? 0), dropped, returned: hits.length, requestedMode: backend.requestedMode, effectiveMode: backend.effectiveMode, queueMs: backend.queueMs, operationMs: backend.operationMs, workerId: backend.workerId }, started, text, budgetTruncated, undefined, [{ kind: "qmd", backendVersion, observationId: backend.generation, observedAt: new Date().toISOString(), freshness: indexCurrent ? "current" : "stale" }, { kind: "filesystem", observedAt: new Date().toISOString(), freshness: "current" }], warnings, undefined, returnedLines) as SearchResult;
 		}
 	}
 
@@ -225,40 +227,6 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		if (section) data.section = section;
 		if (parsed.frontmatter.error) data.diagnostics = [parsed.frontmatter.error];
 		return this.envelope("read", store.name, data, started, page.content, page.truncated, continuation, [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: "current" }], [], descriptor) as ReadResult;
-	}
-
-	private async searchShared(store: StoreConfig, shared: SharedIndexClient, input: SearchInput, signal: AbortSignal, started: number): Promise<SearchResult> {
-		const activity = await shared.activity(signal);
-		const mode = input.mode ?? store.search.defaultMode; const limit = input.limit ?? 5;
-		if (input.minScore !== undefined && !Number.isFinite(input.minScore)) throw new DatastoreError("INVALID_NOTE_REF");
-		if (!Number.isInteger(limit) || limit < 1 || limit > 20 || !["lexical", "semantic", "hybrid"].includes(mode)) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
-		const freshness = input.freshness ?? "allow-stale";
-		if (mode === "semantic" && activity.embeddingActive) throw new DatastoreError("SEMANTIC_UNAVAILABLE", { retryable: true, requestedMode: mode });
-		if (freshness !== "allow-stale" && !await shared.isLexicallyCurrent(signal)) throw new DatastoreError("STALE_INDEX");
-		const backend = await shared.search(input.query, mode, Math.min(500, Math.max(limit * 4, limit)), input.minScore, signal);
-		if ((backend.effectiveMode === "semantic" || backend.effectiveMode === "hybrid") && (!backend.manifest.semanticAt || backend.manifest.pendingEmbeddings !== 0 || !backend.manifest.hasVectorIndex)) throw new DatastoreError("STALE_INDEX");
-		if (backend.effectiveMode === "lexical" && freshness === "require-current-semantic") throw new DatastoreError("STALE_INDEX");
-		const hits: SearchHit[] = []; let dropped = backend.rejectedCandidates ?? 0; let stale = dropped > 0;
-		for (const candidate of backend.candidates) {
-			if (hits.length >= limit) break;
-			const indexed = backend.manifest.stores[store.shared!.store]?.[candidate.path] ?? backend.manifest.stores[store.name]?.[candidate.path];
-			if (!indexed) { stale = true; dropped += 1; continue; }
-			try {
-				const source = await safeOpenNote(store, candidate.path, signal);
-				if (source.fullRevision !== indexed.revision) { stale = true; dropped += 1; continue; }
-				const parsed = parseMarkdown(source);
-				const excerpt = input.includeContent ? this.excerpt(source.text, parsed, input.query, candidate) : undefined;
-				hits.push({ note: source.note, uri: source.uri, path: source.note.path, title: parsed.title, snippet: excerpt?.content, rank: hits.length + 1, backendRank: candidate.backendRank, backend: "qmd" as const, mode: backend.effectiveMode, score: candidate.score, sourceRevision: source.revision, indexedRevision: source.revision, sourceMtime: source.mtime, indexFreshness: await shared.isLexicallyCurrent(signal) ? "current" as const : "stale" as const, truncated: excerpt?.truncated ?? false });
-			} catch (error) {
-				if (error instanceof DatastoreError && (error.code === "CANCELLED" || error.code === "TIMEOUT")) throw error;
-				stale = true; dropped += 1;
-			}
-		}
-		if (stale && freshness !== "allow-stale") throw new DatastoreError("STALE_INDEX");
-		const indexCurrent = await shared.isLexicallyCurrent(signal);
-		if (!indexCurrent && freshness !== "allow-stale") throw new DatastoreError("STALE_INDEX");
-		const text = JSON.stringify(hits);
-		return this.envelope("search", store.name, { hits, examined: backend.candidates.length + (backend.rejectedCandidates ?? 0), dropped, returned: hits.length, requestedMode: backend.requestedMode, effectiveMode: backend.effectiveMode, queueMs: backend.queueMs, operationMs: backend.operationMs, workerId: backend.workerId }, started, text, false, undefined, [{ kind: "qmd", backendVersion: shared.version, observationId: backend.generation, observedAt: new Date().toISOString(), freshness: indexCurrent ? "current" : "stale" }, { kind: "filesystem", observedAt: new Date().toISOString(), freshness: "current" }]) as SearchResult;
 	}
 
 	private async statusInner(input: StatusInput, signal: AbortSignal): Promise<StatusResult> {

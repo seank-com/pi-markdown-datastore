@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { once } from "node:events";
+import { createConnection, type Server, type Socket } from "node:net";
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,6 +10,7 @@ import { loadMarkdownDatastoreConfig } from "../src/config.ts";
 import { discoverQmdBinding, QmdAdapter } from "../src/qmd-adapter.ts";
 import { MarkdownDatastoreService } from "../src/service.ts";
 import { SharedIndexClient } from "../src/shared-client.ts";
+import { attachSharedParser, encodeSharedMessage, listenOwnedSocket } from "../src/shared-ipc.ts";
 import { createQmdFixture } from "./fixtures/qmd-fixture.ts";
 
 async function owned(path: string): Promise<void> {
@@ -26,9 +29,12 @@ test("one maintenance implementation is hosted, not copied", async () => {
 
 test("private and shared hosts expose the same refresh coalescing and detach does not rebuild", async (t) => {
 	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-shared-")));
-	const socketPath = `/tmp/ds-${process.pid}-${Date.now()}.sock`;
+	const socketDir = `/tmp/ds${process.pid}`;
+	await mkdir(socketDir, { mode: 0o700 });
+	await chmod(socketDir, 0o700);
+	const socketPath = join(socketDir, "s.sock");
 	t.after(() => rm(root, { recursive: true, force: true }));
-	t.after(() => rm(socketPath, { force: true }));
+	t.after(() => rm(socketDir, { recursive: true, force: true }));
 	const notes = join(root, "notes");
 	const packageRoot = await createQmdFixture(root);
 	await owned(notes);
@@ -66,6 +72,7 @@ test("private and shared hosts expose the same refresh coalescing and detach doe
 		child.once("exit", (code) => reject(new Error(`service exited ${code}: ${err}`)));
 	});
 	assert.match(generation, /^gen-/);
+	assert.equal(((await lstat(socketPath)).mode & 0o077), 0);
 	const project = async (name: string, alias: string) => {
 		const dir = join(root, name);
 		await owned(join(dir, ".pi", "markdown-datastore"));
@@ -100,5 +107,91 @@ test("private and shared hosts expose the same refresh coalescing and detach doe
 	const direct = await after.read({ store: right.alias, note: { store: right.alias, path: "alpha.md" } });
 	assert.match(direct.data.content, /Copper shared note/);
 	const projectState = join(root, "right", ".pi", "markdown-datastore", "state");
-	await assert.rejects(readFile(projectState));
+	await assert.rejects(lstat(projectState), { code: "ENOENT" });
+});
+
+test("a live owner socket is not replaced and a public parent is refused", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-own-")));
+	await chmod(root, 0o700);
+	const socketDir = `/tmp/dsown${process.pid}`;
+	await mkdir(socketDir, { mode: 0o700 });
+	await chmod(socketDir, 0o700);
+	const socketPath = join(socketDir, "s.sock");
+	t.after(async () => { await rm(socketDir, { recursive: true, force: true }); await rm(root, { recursive: true, force: true }); });
+	const first = await listenOwnedSocket(socketPath, (socket) => socket.end("first"));
+	t.after(() => new Promise<void>((resolve) => first.close(() => resolve())));
+	await assert.rejects(listenOwnedSocket(socketPath, () => undefined), { code: "STORE_UNAVAILABLE" });
+	assert.equal(first.listening, true);
+	const client = createConnection(socketPath);
+	client.setEncoding("utf8");
+	const answer = new Promise<string>((resolve) => { let text = ""; client.on("data", (chunk) => { text += chunk; }); client.on("close", () => resolve(text)); });
+	await once(client, "connect");
+	assert.equal(await answer, "first");
+	const publicParent = join(root, "public");
+	await mkdir(publicParent, { mode: 0o777 });
+	await chmod(publicParent, 0o777);
+	await assert.rejects(listenOwnedSocket(join(publicParent, "index.sock"), () => undefined), { code: "CONFIG_INVALID" });
+});
+
+test("private and shared search validation emit the same warnings", async () => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-parity-")));
+	const store = { name: "notes", root, configuredRoot: root, rootWasSymlink: false, rootDev: 0, rootIno: 0, include: ["**/*.md"], exclude: [], maxFileBytes: 4096, search: { defaultMode: "hybrid" as const, qmdCollection: "notes" } };
+	const config: any = { schemaVersion: 1, projectRoot: root, configPath: join(root, "config.json"), stateRoot: join(root, "state"), defaults: { maxResultBytes: 8192, maxResultLines: 100, operationTimeoutMs: 3000 }, qmd: { enabled: true }, stores: new Map([["notes", store]]) };
+	const backend = { candidates: [], rejectedCandidates: 1, manifest: { stores: {}, pendingEmbeddings: 0, semanticAt: undefined, hasVectorIndex: false }, generation: "gen-" + "a".repeat(32), requestedMode: "hybrid", effectiveMode: "lexical", embeddingActive: true, queueMs: 0, operationMs: 0 };
+	const local: any = { binding: { version: "fixture" }, activity: () => ({ embeddingActive: true }), isLexicallyCurrent: () => false, search: async () => backend, shutdown: async () => undefined };
+	const remote: any = { version: "fixture", activity: async () => ({ embeddingActive: true }), isLexicallyCurrent: async () => false, search: async () => backend, shutdown: async () => undefined };
+	const sharedStore = { ...store, shared: { catalog: "fixture", store: "notes", socketPath: "/tmp/unused.sock", definitionRevision: "a".repeat(64) } };
+	const privateService = new MarkdownDatastoreService(config, undefined, local);
+	const sharedService = new MarkdownDatastoreService({ ...config, stores: new Map([["notes", sharedStore]]) }, undefined, undefined, new Map([["notes", remote]]));
+	const privateResult = await privateService.search({ store: "notes", query: "copper", mode: "hybrid" });
+	const sharedResult = await sharedService.search({ store: "notes", query: "copper", mode: "hybrid" });
+	assert.deepEqual(sharedResult.warnings.map((warning) => warning.code), privateResult.warnings.map((warning) => warning.code));
+	await assert.rejects(privateService.search({ store: "notes", query: " ", mode: "hybrid" }), { code: "BACKEND_OUTPUT_INVALID" });
+	await assert.rejects(sharedService.search({ store: "notes", query: " ", mode: "hybrid" }), { code: "BACKEND_OUTPUT_INVALID" });
+	await privateService.shutdown();
+	await sharedService.shutdown();
+	await rm(root, { recursive: true, force: true });
+});
+
+test("concurrent calls wait for one completed attachment", async (t) => {
+	const socketDir = `/tmp/dsh${process.pid}`;
+	await mkdir(socketDir, { mode: 0o700 });
+	await chmod(socketDir, 0o700);
+	const socketPath = join(socketDir, "s.sock");
+	const seen: string[] = [];
+	let release!: () => void;
+	const held = new Promise<void>((resolve) => { release = resolve; });
+	let helloSeen!: () => void;
+	const sawHello = new Promise<void>((resolve) => { helloSeen = resolve; });
+	const generation = `gen-${"b".repeat(32)}`;
+	let server: Server | undefined;
+	let client: SharedIndexClient | undefined;
+	const sockets = new Set<Socket>();
+	t.after(async () => {
+		release();
+		await client?.shutdown();
+		for (const socket of sockets) socket.destroy();
+		const currentServer = server;
+		if (currentServer) await new Promise<void>((resolve) => currentServer.close(() => resolve()));
+		await rm(socketDir, { recursive: true, force: true });
+	});
+	server = await listenOwnedSocket(socketPath, (socket) => {
+		sockets.add(socket);
+		socket.once("close", () => sockets.delete(socket));
+		attachSharedParser(socket, (message: any) => {
+			seen.push(message.operation);
+			if (message.operation === "hello") { helloSeen(); void held.then(() => socket.write(encodeSharedMessage({ version: 1, requestId: message.requestId, generation, definitionRevision: "c".repeat(64), ok: true, result: { generation, version: "fixture" } }))); }
+			if (message.operation === "activity") socket.write(encodeSharedMessage({ version: 1, requestId: message.requestId, generation, definitionRevision: "c".repeat(64), ok: true, result: { state: "idle", active: false, queued: false, embeddingActive: false, jobs: [] } }));
+		}, () => socket.destroy());
+	});
+	client = new SharedIndexClient({ socketPath, store: "notebook", definitionRevision: "c".repeat(64) });
+	const first = client.activity();
+	await sawHello;
+	const second = client.activity();
+	await Promise.resolve();
+	assert.deepEqual(seen, ["hello"]);
+	release();
+	assert.equal((await first).state, "idle");
+	assert.equal((await second).state, "idle");
+	assert.deepEqual(seen, ["hello", "activity", "activity"]);
 });
