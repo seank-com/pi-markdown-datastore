@@ -113,34 +113,35 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 					const maxLines = Math.min(Number(call.input?.maxLines ?? catalog.defaults.maxResultLines), catalog.defaults.maxResultLines);
 					if (!Number.isInteger(maxBytes) || maxBytes < 1 || !Number.isInteger(maxLines) || maxLines < 1) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
 					const budget = { maxBytes, maxLines };
+					const responseStore = typeof call.input?.responseStore === "string" ? call.input.responseStore : message.store;
 					if (call.operation === "tags") {
-						const offset = continuationOffset(typeof call.input?.continuation === "string" ? call.input.continuation : undefined, message.store, snapshot.revision, "catalog");
+						const offset = continuationOffset(typeof call.input?.continuation === "string" ? call.input.continuation : undefined, responseStore, snapshot.revision, "catalog");
 						const render = (items: typeof snapshot.tags) => ({ tags: items.map((tag) => ({ identity: tag.identity, spelling: tag.spelling, pageCount: tag.pages.length })), total: snapshot.tags.length, returned: items.length, revision: snapshot.revision });
 						const page = pageRendered(snapshot.tags, offset, budget, render);
 						const admitted = await index.admit(store, [], controller.signal);
-						result = { ...render(page.items), complete: admitted.current, diagnostics: admitted.diagnostics, continuation: page.next === undefined ? undefined : continuationToken(message.store, snapshot.revision, "catalog", page.next) };
+						result = { ...render(page.items), complete: admitted.current, diagnostics: admitted.diagnostics, continuation: page.next === undefined ? undefined : continuationToken(responseStore, snapshot.revision, "catalog", page.next, budget) };
 					} else if (call.operation === "tagPages") {
 						const tag = String(call.input?.tag);
 						const pages = snapshot.tags.find((item) => item.identity === tag)?.pages ?? [];
 						const limit = Number(call.input?.limit ?? 20);
 						if (!Number.isInteger(limit) || limit < 1 || limit > 20) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
-						const offset = continuationOffset(typeof call.input?.continuation === "string" ? call.input.continuation : undefined, message.store, snapshot.revision, tag);
+						const offset = continuationOffset(typeof call.input?.continuation === "string" ? call.input.continuation : undefined, responseStore, snapshot.revision, tag);
 						const window = pages.slice(0, offset + limit);
 						const render = (items: string[]) => ({ pages: items, total: pages.length, returned: items.length, complete: snapshot.complete, revision: snapshot.revision });
 						const page = pageRendered(window, offset, budget, render);
 						const next = offset + page.items.length < pages.length ? offset + page.items.length : undefined;
 						const admitted = await index.admit(store, page.items.map((path) => ({ path, kind: "note" as const })), controller.signal);
-						result = { ...render(page.items), complete: admitted.current, diagnostics: admitted.diagnostics, continuation: next === undefined ? undefined : continuationToken(message.store, snapshot.revision, tag, next) };
+						result = { ...render(page.items), complete: admitted.current, diagnostics: admitted.diagnostics, continuation: next === undefined ? undefined : continuationToken(responseStore, snapshot.revision, tag, next, budget) };
 					} else {
 						const path = String(call.input?.path);
 						const edges = call.operation === "links" ? snapshot.edges.filter((edge) => edge.source === path) : snapshot.edges.filter((edge) => edge.target === path && edge.targetKind !== "unresolved" && edge.targetKind !== "ambiguous");
 						const query = `${call.operation}:${path}`;
-						const offset = continuationOffset(typeof call.input?.continuation === "string" ? call.input.continuation : undefined, message.store, snapshot.revision, query);
+						const offset = continuationOffset(typeof call.input?.continuation === "string" ? call.input.continuation : undefined, responseStore, snapshot.revision, query);
 						const pageCount = new Set(edges.map((edge) => call.operation === "links" ? edge.target : edge.source)).size;
 						const render = (items: typeof edges) => ({ edges: items, pageCount, occurrenceCount: edges.length, returned: items.length, complete: snapshot.complete, revision: snapshot.revision });
 						const page = pageRendered(edges, offset, budget, render);
 						const admitted = await index.admit(store, [{ path, kind: "note" as const }, ...page.items.flatMap((edge) => edge.targetKind === "note" || edge.targetKind === "attachment" ? [{ path: edge.target, kind: edge.targetKind }] : [])], controller.signal);
-						result = { ...render(page.items), complete: admitted.current, diagnostics: admitted.diagnostics, continuation: page.next === undefined ? undefined : continuationToken(message.store, snapshot.revision, query, page.next) };
+						result = { ...render(page.items), complete: admitted.current, diagnostics: admitted.diagnostics, continuation: page.next === undefined ? undefined : continuationToken(responseStore, snapshot.revision, query, page.next, budget) };
 					}
 				}
 				else if (!adapter || !store) throw new DatastoreError("CAPABILITY_UNAVAILABLE");

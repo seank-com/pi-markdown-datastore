@@ -32,6 +32,7 @@ export interface MetadataSnapshot {
 	tags: MetadataTag[];
 	pages: string[];
 	files: string[];
+	observed?: { path: string; size: number; mtime: string }[];
 }
 
 async function atomicJson(path: string, value: unknown): Promise<void> {
@@ -76,7 +77,9 @@ export class MetadataIndex {
 		const notes: SafeNoteMetadata[] = [];
 		await walkSafeNoteMetadata(store, (note) => { notes.push(note); }, signal);
 		const files: string[] = [];
-		await walkSafeAttachmentPaths(store, async (path) => { await safeInspectContainedFile(store, path, signal); files.push(path); }, signal);
+		const observed = new Map<string, { size: number; mtime: string }>();
+		for (const note of notes) observed.set(note.note.path, { size: note.size, mtime: note.mtime });
+		await walkSafeAttachmentPaths(store, async (path) => { const inspected = await safeInspectContainedFile(store, path, signal); observed.set(path, { size: inspected.size, mtime: inspected.mtime }); files.push(path); }, signal);
 		const pages = notes.map((note) => note.note.path).sort();
 		const byBase = new Map<string, string[]>();
 		for (const path of [...pages, ...files]) {
@@ -106,7 +109,7 @@ export class MetadataIndex {
 			}
 		}
 		await assertRootIdentity(store);
-		const snapshot: MetadataSnapshot = { version: 1, revision: `meta-${randomBytes(16).toString("hex")}`, root: store.root, rootDev: store.rootDev, rootIno: store.rootIno, complete: diagnostics.length === 0, diagnostics, edges, tags: [...tags.values()].sort((a, b) => a.identity.localeCompare(b.identity)), pages, files: files.sort() };
+		const snapshot: MetadataSnapshot = { version: 1, revision: `meta-${randomBytes(16).toString("hex")}`, root: store.root, rootDev: store.rootDev, rootIno: store.rootIno, complete: diagnostics.length === 0, diagnostics, edges, tags: [...tags.values()].sort((a, b) => a.identity.localeCompare(b.identity)), pages, files: files.sort(), observed: [...observed.entries()].map(([path, item]) => ({ path, ...item })) };
 		await atomicJson(join(this.root, "index.json"), snapshot);
 		this.#snapshot = snapshot;
 		return snapshot;
@@ -123,8 +126,9 @@ export class MetadataIndex {
 			if (seen.has(key)) continue;
 			seen.add(key);
 			try {
-				if (item.kind === "note") await safeOpenNote(store, item.path, signal);
-				else await safeInspectContainedFile(store, item.path, signal);
+				const inspected = await safeInspectContainedFile(store, item.path, signal);
+				const prior = snapshot.observed?.find((entry) => entry.path === item.path);
+				if (!prior || prior.size !== inspected.size || prior.mtime !== inspected.mtime) diagnostics.push(`${snapshot.revision}: ${item.path}: changed`);
 			} catch (error) {
 				if (!(error instanceof DatastoreError) || error.code === "STORE_UNAVAILABLE") throw error;
 				diagnostics.push(`${snapshot.revision}: ${item.path}: ${error.code}`);
@@ -193,6 +197,12 @@ export function continuationOffset(token: string | undefined, store: string, rev
 	return parsed.offset ?? 0;
 }
 
-export function continuationToken(store: string, revision: string, query: string, offset: number): string {
-	return Buffer.from(JSON.stringify({ store, revision, query, offset })).toString("base64url");
+export function continuationToken(store: string, revision: string, query: string, offset: number, budget?: { maxBytes: number; maxLines: number }): string {
+	return Buffer.from(JSON.stringify({ store, revision, query, offset, maxBytes: budget?.maxBytes, maxLines: budget?.maxLines })).toString("base64url");
+}
+
+export function readPageToken(token: string): { store: string; revision: string; query: string; offset: number; maxBytes?: number; maxLines?: number } {
+	const parsed = JSON.parse(Buffer.from(token, "base64url").toString("utf8")) as { store?: string; revision?: string; query?: string; offset?: number; maxBytes?: number; maxLines?: number };
+	if (typeof parsed.store !== "string" || typeof parsed.revision !== "string" || typeof parsed.query !== "string" || !Number.isInteger(parsed.offset) || (parsed.offset ?? -1) < 0) throw new DatastoreError("STALE_CONTINUATION");
+	return { store: parsed.store, revision: parsed.revision, query: parsed.query, offset: parsed.offset ?? 0, maxBytes: parsed.maxBytes, maxLines: parsed.maxLines };
 }

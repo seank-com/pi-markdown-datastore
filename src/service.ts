@@ -13,7 +13,7 @@ import type { QmdAdapter, QmdCandidate } from "./qmd-adapter.ts";
 import { SharedIndexClient } from "./shared-client.ts";
 import type { MaintenanceCoordinator } from "./maintenance-coordinator.ts";
 import type { IndexOwnership } from "./index-ownership.ts";
-import { continuationOffset, continuationToken, pageRendered, type MetadataIndex } from "./metadata-index.ts";
+import { continuationOffset, continuationToken, pageRendered, readPageToken, type MetadataIndex } from "./metadata-index.ts";
 
 function elapsed(started: number): number { return Math.max(0, Date.now() - started); }
 function propagateControlError(error: unknown): void { if (error instanceof DatastoreError && (error.code === "CANCELLED" || error.code === "TIMEOUT")) throw error; }
@@ -165,7 +165,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
   const token = (input as { continuation?: string }).continuation;
   if (store.shared) {
    const client = this.sharedClients?.get(store.name); if (!client) throw new DatastoreError("STORE_UNAVAILABLE");
-   const page = await client.tagPages(query, { continuation: token, limit, ...budget }, signal);
+   const page = await client.tagPages(query, { continuation: token, limit, ...budget, responseStore: store.name }, signal);
    const data = { candidates: page.pages.map((path) => ({ note: { store: store.name, path }, uri: "", title: path, revision: page.revision })), examined: page.total, partial: page.continuation !== undefined };
    return this.envelope("find", store.name, data, started, JSON.stringify(data), page.continuation !== undefined, page.continuation) as FindResult;
   }
@@ -179,7 +179,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
   const next = offset + bounded.length < pages.length ? offset + bounded.length : undefined;
   const data = { candidates: bounded.map((path) => ({ note: { store: store.name, path }, uri: "", title: path, revision: snapshot.revision })), examined: pages.length, partial: next !== undefined };
   const warnings = admitted.diagnostics.map((message) => ({ code: "STALE_INDEX" as const, message }));
-  return this.envelope("find", store.name, data, started, JSON.stringify(data), next !== undefined, next === undefined ? undefined : continuationToken(store.name, snapshot.revision, query, next), [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: admitted.current ? "current" : "stale" }], warnings) as FindResult;
+  return this.envelope("find", store.name, data, started, JSON.stringify(data), next !== undefined, next === undefined ? undefined : continuationToken(store.name, snapshot.revision, query, next, budget), [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: admitted.current ? "current" : "stale" }], warnings) as FindResult;
  }
  const notes=input.selectors.map(s=>{if(s.kind!=="uri" && (s.kind!=="path" || !s.path.endsWith(".md")))throw new DatastoreError("CAPABILITY_UNAVAILABLE");const note=s.kind==="uri"?noteUriToRef(s.uri):{store:store.name,path:validateRelativeNotePath(s.path)};if(note.store!==store.name)throw new DatastoreError("INVALID_NOTE_REF");return note;});
  const paths=[...new Set(notes.map(n=>n.path))];const candidates=[];
@@ -190,6 +190,19 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
  }
 
 	private readDescriptor(input: ReadInput): { store: StoreConfig; descriptor: Omit<ContinuationDescriptor, "kind" | "revision" | "cursor" | "createdAt" | "expiresAt">; expectedRevision?: string; cursor: number } {
+		if (input.continuation && Object.keys(input).every((key) => key === "continuation")) {
+			try {
+				const existing = this.continuations.getRead(input.continuation);
+				return { store: this.store(existing.note.store), descriptor: existing, expectedRevision: existing.revision, cursor: existing.cursor };
+			} catch (error) {
+				if (!(error instanceof DatastoreError)) throw error;
+				const parsed = readPageToken(input.continuation);
+				const view = parsed.query.startsWith("links:") ? "links" : parsed.query.startsWith("backlinks:") ? "backlinks" : undefined;
+				if (!view) throw new DatastoreError("STALE_CONTINUATION");
+				let store; try { store = this.store(parsed.store); } catch (lookup) { if (lookup instanceof DatastoreError && lookup.code === "STORE_UNKNOWN") throw new DatastoreError("STALE_CONTINUATION"); throw lookup; }
+				return { store, descriptor: { note: { store: store.name, path: parsed.query.slice(view.length + 1) }, view, includeFrontmatter: false, excludeSections: [], includeSemanticRelated: false, maxBytes: parsed.maxBytes ?? this.config.defaults.maxResultBytes, maxLines: parsed.maxLines ?? this.config.defaults.maxResultLines }, cursor: 0 };
+			}
+		}
 		if (input.continuation && (input.view === "links" || input.view === "backlinks")) {
 			if (!input.note) throw new DatastoreError("INVALID_NOTE_REF");
 			return { store: this.store(input.note.store), descriptor: { note: input.note, view: input.view, includeFrontmatter: false, excludeSections: [], includeSemanticRelated: false, maxBytes: input.maxBytes ?? this.config.defaults.maxResultBytes, maxLines: input.maxLines ?? this.config.defaults.maxResultLines }, cursor: 0 };
@@ -363,7 +376,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		if (store.shared) {
 			const client = this.sharedClients?.get(store.name);
 			if (!client) throw new DatastoreError("STORE_UNAVAILABLE");
-			const page = view === "links" ? await client.links(path, { continuation: token, ...budget }, signal) : await client.backlinks(path, { continuation: token, ...budget }, signal);
+			const page = view === "links" ? await client.links(path, { continuation: token, ...budget, responseStore: store.name }, signal) : await client.backlinks(path, { continuation: token, ...budget, responseStore: store.name }, signal);
 			const data = { note: { store: store.name, path }, view, edges: page.edges, pageCount: page.pageCount, occurrenceCount: page.occurrenceCount, returned: page.returned, complete: page.complete, revision: page.revision };
 			const warnings = (page.diagnostics ?? []).map((message) => ({ code: "STALE_INDEX" as const, message }));
 			return this.envelope("read", store.name, data, started, JSON.stringify(data), page.continuation !== undefined, page.continuation, [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: page.complete ? "current" : "stale" }], warnings) as ReadResult;
@@ -380,7 +393,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		const admitted = await index.admit(store, [{ path, kind: "note" }, ...page.items.flatMap((edge) => edge.targetKind === "note" || edge.targetKind === "attachment" ? [{ path: edge.target, kind: edge.targetKind }] : [])], signal);
 		const data = { ...render(page.items), complete: admitted.current };
 		const warnings = admitted.diagnostics.map((message) => ({ code: "STALE_INDEX" as const, message }));
-		return this.envelope("read", store.name, data, started, JSON.stringify(data), page.next !== undefined, page.next === undefined ? undefined : continuationToken(store.name, snapshot.revision, query, page.next), [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: admitted.current ? "current" : "stale" }], warnings) as ReadResult;
+		return this.envelope("read", store.name, data, started, JSON.stringify(data), page.next !== undefined, page.next === undefined ? undefined : continuationToken(store.name, snapshot.revision, query, page.next, budget), [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: admitted.current ? "current" : "stale" }], warnings) as ReadResult;
 	}
 	async tags(input: { store: string; continuation?: string; maxBytes?: number; maxLines?: number }, signal?: AbortSignal): Promise<RefreshResult> {
 		return this.runOperation(signal, async (active) => {
@@ -392,7 +405,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 			const query = "catalog";
 			if (store.shared) {
 				const client = this.sharedClients?.get(store.name); if (!client) throw new DatastoreError("STORE_UNAVAILABLE");
-				const page = await client.tags({ continuation: input.continuation, ...budget }, signal);
+				const page = await client.tags({ continuation: input.continuation, ...budget, responseStore: store.name }, signal);
 				const data = { tags: page.tags, revision: page.revision, returned: page.returned, total: page.total };
 				return this.envelope("tags", store.name, data, started, JSON.stringify(data), page.continuation !== undefined, page.continuation) as RefreshResult;
 			}
@@ -404,7 +417,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 			const page = pageRendered(snapshot.tags, offset, budget, render);
 			const admitted = await index.admit(store, [], active);
 			const data = render(page.items);
-			const continuation = page.next === undefined ? undefined : continuationToken(store.name, snapshot.revision, query, page.next);
+			const continuation = page.next === undefined ? undefined : continuationToken(store.name, snapshot.revision, query, page.next, budget);
 			const warnings = admitted.diagnostics.map((message) => ({ code: "STALE_INDEX" as const, message }));
 			return this.envelope("tags", store.name, data, started, JSON.stringify(data), page.next !== undefined, continuation, [], warnings) as RefreshResult;
 		});

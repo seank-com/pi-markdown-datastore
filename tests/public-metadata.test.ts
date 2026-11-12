@@ -193,6 +193,15 @@ test("shared tools page catalog, tag find, and links through the owner", async (
 	assert.equal(first.data.occurrenceCount, 3);
 	assert.ok(first.bounds.continuation);
 	await assert.rejects(read.execute("7", { store: "notebook", note: { store: "notebook", path: "alpha.md" }, view: "links", maxBytes: 40 }, new AbortController().signal), { code: "RESULT_LIMIT_EXCEEDED" });
+	const continued = JSON.parse((await read.execute("8", { continuation: first.bounds.continuation }, new AbortController().signal)).content[0].text);
+	assert.equal(continued.store, "notebook");
+	assert.equal(continued.data.occurrenceCount, 3);
+	await assert.rejects(read.execute("9", { continuation: Buffer.from(JSON.stringify({ store: "notebook", revision: first.data.revision, query: "links:alpha.md", offset: -1 })).toString("base64url") }, new AbortController().signal), { code: "STALE_CONTINUATION" });
+	await assert.rejects(read.execute("10", { continuation: Buffer.from(JSON.stringify({ store: "other", revision: first.data.revision, query: "links:alpha.md", offset: 0 })).toString("base64url") }, new AbortController().signal), { code: "STALE_CONTINUATION" });
+	await writeFile(join(notes, "alpha.md"), "changed\n", { flag: "a" });
+	const changed = JSON.parse((await read.execute("11", { store: "notebook", note: { store: "notebook", path: "alpha.md" }, view: "links" }, new AbortController().signal)).content[0].text);
+	assert.equal(changed.provenance.sources[0].freshness, "stale");
+	assert.match(changed.warnings.map((warning) => warning.message).join("\n"), new RegExp(String(first.data.revision)));
 	const client = createMarkdownDatastoreClient(app.pi.events, { timeoutMs: 3000 });
 	const viaClient = await client.tags({ store: "notebook", maxBytes: 400 });
 	assert.equal(viaClient.data.total, 3);
