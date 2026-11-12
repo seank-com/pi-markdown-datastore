@@ -144,11 +144,12 @@ test("five tools remain visible across initial failures, recovery, and valid-to-
 	}
 	assert.equal(backendStarts, 2, "invalid configuration never constructs a backend");
 	await writeFile(current.configPath, original);
-	const untrusted = harness(current.project, false);
-	createMarkdownDatastoreExtension({ projectRoot: current.project, createQmd: async () => { throw new Error("trust bypassed"); } })(untrusted.pi);
+	const fresh = await fixture(t);
+	const untrusted = harness(fresh.project, false);
+	createMarkdownDatastoreExtension({ projectRoot: fresh.project, createQmd: async () => { throw new Error("trust bypassed"); } })(untrusted.pi);
 	await untrusted.fire("session_start"); assert.equal(untrusted.tools.length, 6);
 	for (const tool of untrusted.tools) await assert.rejects(tool.execute("id", inputs[tool.name]), (error: any) => error.code === "PROJECT_UNTRUSTED");
-	await assert.rejects((await import("node:fs/promises")).stat(join(current.project, ".pi/markdown-datastore/state")), { code: "ENOENT" });
+	await assert.rejects((await import("node:fs/promises")).stat(join(fresh.project, ".pi/markdown-datastore/state")), { code: "ENOENT" });
 	await app.fire("session_shutdown"); await untrusted.fire("session_shutdown");
 });
 

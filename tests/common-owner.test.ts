@@ -96,7 +96,8 @@ test("a second private owner is refused and a legacy application ledger is adopt
 
 test("extension status keeps the metadata receipt when qmd drops and returns", async (t) => {
 	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-owner-ext-")));
-	t.after(() => rm(root, { recursive: true, force: true }));
+	let shutdown = async () => undefined;
+	t.after(async () => { await shutdown(); await rm(root, { recursive: true, force: true }); });
 	const notes = join(root, "notes");
 	const dir = join(root, ".pi", "markdown-datastore");
 	await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -109,18 +110,11 @@ test("extension status keeps the metadata receipt when qmd drops and returns", a
 	const app = harness(root);
 	createMarkdownDatastoreExtension({ projectRoot: root, createQmd: async () => { if (!available) throw new Error("unavailable"); return { binding: { version: "2.8.3" }, startupReconcile: async () => undefined, shutdown: async () => undefined } as any; } })(app.pi);
 	await app.fire("session_start");
-	t.after(() => app.fire("session_shutdown"));
+	shutdown = () => app.fire("session_shutdown");
 	const refresh = app.tools.find((tool) => tool.name === "datastore_refresh");
 	const status = app.tools.find((tool) => tool.name === "datastore_status");
-	await refresh.execute("1", { store: "memory", mode: "metadata" }, new AbortController().signal);
-	let first: any;
-	for (let attempt = 0; attempt < 20; attempt += 1) {
-		first = JSON.parse((await status.execute("2", { store: "memory" }, new AbortController().signal)).content[0].text);
-		if (first.data.stores[0].capabilities.metadata.progress.job?.refreshId) break;
-		await new Promise((resolve) => setTimeout(resolve, 15));
-	}
-	const id = first.data.stores[0].capabilities.metadata.progress.job?.refreshId;
-	assert.ok(id, JSON.stringify(first.data.stores[0].capabilities.metadata));
+	const started = JSON.parse((await refresh.execute("1", { store: "memory", mode: "metadata" }, new AbortController().signal)).content[0].text);
+	const id = started.data.qmd.refreshId;
 	assert.match(id, /^[0-9a-f]{32}$/);
 	available = false;
 	await app.fire("session_start");

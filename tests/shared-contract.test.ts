@@ -6,7 +6,7 @@ import { setImmediate as nextTurn } from "node:timers/promises";
 import { watch } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { loadMarkdownDatastoreConfig } from "../src/config.ts";
 import { discoverQmdBinding, QmdAdapter, type QmdRefreshJob } from "../src/qmd-adapter.ts";
@@ -51,9 +51,9 @@ async function fixture(t: import("node:test").TestContext) {
 		const cancel = () => finish(new Error("Fixture observer cancelled at teardown"));
 		observers.add(cancel); watcher.on("error", finish); void check();
 	});
-	const job = (adapter: QmdAdapter, id: string) => observe(adapter.root, async () => {
-		if (!await present(join(adapter.root, "jobs.json"))) return undefined;
-		const persisted = JSON.parse(await readFile(join(adapter.root, "jobs.json"), "utf8")) as { jobs: QmdRefreshJob[] };
+	const job = (adapter: QmdAdapter, id: string) => observe(dirname(adapter.coordinator.jobsPath), async () => {
+		if (!await present(adapter.coordinator.jobsPath)) return undefined;
+		const persisted = JSON.parse(await readFile(adapter.coordinator.jobsPath, "utf8")) as { jobs: QmdRefreshJob[] };
 		const value = persisted.jobs.find(item => item.refreshId === id);
 		return value && ["succeeded", "failed", "cancelled"].includes(value.state) ? value : undefined;
 	});

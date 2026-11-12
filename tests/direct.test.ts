@@ -61,7 +61,7 @@ test("explicit traversal counts beyond the candidate ceiling while status remain
 	assert.equal(await countSafeNotes(config.stores.get("memory")!), 510);
 	const status = await new MarkdownDatastoreService(config).status({ store: "memory" });
 	const storeStatus = (status.data.stores as Array<any>)[0]; assert.equal(storeStatus.fileCount, undefined); assert.equal(storeStatus.fileCountSource, "unavailable");
-	assert.equal(storeStatus.capabilities.outline.state, "ready"); assert.equal(storeStatus.capabilities.graph, undefined); assert.equal(storeStatus.capabilities.metadata, undefined); assert.deepEqual(storeStatus.capabilities.mutations, { supported: false }); assert.deepEqual(storeStatus.permissionWarnings, []);
+	assert.equal(storeStatus.capabilities.outline.state, "ready"); assert.equal(storeStatus.capabilities.graph, undefined); assert.equal(storeStatus.capabilities.metadata.state, "unavailable"); assert.deepEqual(storeStatus.capabilities.mutations, { supported: false }); assert.deepEqual(storeStatus.permissionWarnings, []);
 	assert.ok(Buffer.byteLength(JSON.stringify(status)) < 32 * 1024);
 });
 
