@@ -109,7 +109,8 @@ export type MarkdownDatastoreRequest =
 	| { operation: "find"; input: FindInput }
 	| { operation: "read"; input: ReadInput }
 	| { operation: "status"; input: StatusInput }
-	| { operation: "refresh"; input: RefreshInput };
+	| { operation: "refresh"; input: RefreshInput }
+	| { operation: "tags"; input: { store: StoreName; continuation?: string } };
 export type MarkdownDatastoreResult = SearchResult | FindResult | ReadResult | StatusResult | RefreshResult | RootsResult | DestinationResult;
 
 export interface MarkdownDatastorePolicyV1 {
@@ -123,6 +124,7 @@ export interface MarkdownDatastoreServiceV1 {
 	read(input: ReadInput, signal?: AbortSignal): Promise<ReadResult>;
 	status(input: StatusInput, signal?: AbortSignal): Promise<StatusResult>;
 	refresh(input: RefreshInput, signal?: AbortSignal): Promise<RefreshResult>;
+	tags(input: { store: StoreName; continuation?: string }, signal?: AbortSignal): Promise<RefreshResult>;
 }
 
 export interface MarkdownDatastoreRpcEnvelope {

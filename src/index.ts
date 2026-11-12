@@ -44,7 +44,7 @@ const Schemas = {
 		type: "object",
 		properties: {
 			continuation: Type.String(), ...ReadIdentity,
-			view: StringEnum(["content", "section", "outline"] as const),
+			view: StringEnum(["content", "section", "outline", "links", "backlinks"] as const),
 			includeFrontmatter: Type.Boolean(), excludeSections: Type.Array(Type.String(), { maxItems: 20 }),
 			headingPath: Type.Array(Type.String(), { minItems: 1, maxItems: 12 }), occurrence: Type.Integer({ minimum: 0 }), sectionHandle: Type.String(),
 			...ReadBounds,
@@ -55,9 +55,11 @@ const Schemas = {
 			{ type: "object", properties: { view: { type: "string", enum: ["content"] } }, ...forbidden("continuation", "headingPath", "occurrence", "sectionHandle", "includeSemanticRelated") },
 			{ type: "object", required: ["view"], properties: { view: { type: "string", enum: ["section"] } }, ...forbidden("continuation", "includeFrontmatter", "excludeSections", "includeSemanticRelated") },
 			{ type: "object", required: ["view"], properties: { view: { type: "string", enum: ["outline"] } }, ...forbidden("continuation", "includeFrontmatter", "excludeSections", "headingPath", "occurrence", "sectionHandle", "includeSemanticRelated") },
+			{ type: "object", required: ["view"], properties: { view: { type: "string", enum: ["links", "backlinks"] } }, ...forbidden("includeFrontmatter", "excludeSections", "headingPath", "occurrence", "sectionHandle", "includeSemanticRelated") },
 		],
 	}),
 	status: Type.Object({ store: Type.Optional(Type.String()) }, { additionalProperties: false }),
+	tags: Type.Object({ store: Type.String(), continuation: Type.Optional(Type.String()) }, { additionalProperties: false }),
 	refresh: Type.Unsafe<RefreshInput>({
 		type: "object",
 		properties: {
@@ -150,6 +152,7 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 				case "read": return service.read(request.input, signal);
 				case "status": return service.status(request.input, signal);
 				case "refresh": return service.refresh(request.input, signal);
+				case "tags": return service.tags(request.input, signal);
 				default: throw new DatastoreError("CAPABILITY_UNAVAILABLE");
 			}
 		};
@@ -169,6 +172,7 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 			pi.registerTool({ name: "datastore_read", label: "Datastore read", description: "Read a bounded direct Markdown content, section, or outline view. Truncation uses opaque continuations.", parameters: Schemas.read, execute: (_id, input, signal) => execute({ operation: "read", input }, signal) });
 			pi.registerTool({ name: "datastore_status", label: "Datastore status", description: "Report configured Markdown store capabilities, protected backend readiness, freshness, counts, and permission warnings without note contents.", parameters: Schemas.status, execute: (_id, input, signal) => execute({ operation: "status", input }, signal) });
 			pi.registerTool({ name: "datastore_refresh", label: "Datastore refresh", description: "Start or cancel read-only derived datastore maintenance. Lexical, semantic, and all return prompt durable job receipts; direct performs only bounded root revalidation. Status reports progress. Never mutates source Markdown or runs source synchronization.", parameters: Schemas.refresh, executionMode: "sequential", execute: (_id, input, signal) => execute({ operation: "refresh", input }, signal) });
+			pi.registerTool({ name: "datastore_tags", label: "Datastore tags", description: "List frontmatter tag identities, display spellings, and distinct page counts for one configured store. Pages by the existing result envelope. Not a note and not a refresh.", parameters: Schemas.tags, execute: (_id, input, signal) => execute({ operation: "tags", input }, signal) });
 		};
 		registerTools();
 		const removeRpc = (): void => { rpcUnsubscribe?.(); rpcUnsubscribe = undefined; };

@@ -32,6 +32,7 @@ export interface MetadataSnapshot {
 }
 
 async function atomicJson(path: string, value: unknown): Promise<void> {
+	await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 	const temp = `${path}.tmp-${randomBytes(8).toString("hex")}`;
 	await writeFile(temp, JSON.stringify(value), { mode: 0o600 });
 	const handle = await open(temp, constants.O_RDONLY);
@@ -138,7 +139,8 @@ export function registerMetadata(coordinator: MaintenanceCoordinator, indexes: M
 			const index = indexes.get(name);
 			const store = stores.get(name);
 			if (!index || !store) throw new DatastoreError("STORE_UNKNOWN");
-			revision = (await index.refresh(store, signal)).revision;
+			try { revision = (await index.refresh(store, signal)).revision; }
+			catch (error) { await writeFile("/tmp/meta-run-error.txt", String(error)); throw error; }
 		}
 		return { generation: revision };
 	});
