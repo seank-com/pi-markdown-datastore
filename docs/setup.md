@@ -58,7 +58,7 @@ Build the candidate with `npm ci && npm run build` and start Pi with
 `-e /path/to/pi-markdown-datastore/dist/index.js`. Load it once. Status should
 report ready direct capabilities, unavailable optional backends, and unsupported
 mutations. Try an exact-path find and a bounded read of a synthetic note before
-using a real collection. All five tools remain registered with missing/invalid
+using a real collection. All six tools remain registered with missing/invalid
 configuration or an untrusted project. Calls report the specific configuration
 failure or `PROJECT_UNTRUSTED`; check the persistent UI status too. Correct the
 configuration or project trust and start a new session to load it. No backend or

@@ -47,8 +47,9 @@ may be absent until the next explicit/startup reconciliation.
 
 ## Operations and bounds
 
-`datastore_find` accepts exact `.md` paths and datastore URIs.
-`datastore_read` provides content, section and direct heading outlines. Raw frontmatter is available through content reads with `includeFrontmatter`.
+`datastore_find` accepts exact `.md` paths, datastore URIs, and a single frontmatter tag. A tag query uses the same one-leading-`#` identity as the index.
+`datastore_read` provides content, section, direct heading outlines, `links`, and `backlinks`. An attachment may be the subject of a backlink read; that read does not open the attachment as Markdown. Raw frontmatter is available through content reads with `includeFrontmatter`.
+`datastore_tags` lists tag identity, display spelling, and distinct page count. `datastore_refresh` mode `metadata` builds that index without qmd.
 
 `datastore_search` supports lexical, semantic and hybrid requests. Its data
 includes requested/effective mode, queue and public-operation elapsed time and
@@ -60,8 +61,9 @@ changed candidates. Semantic retrieval requires complete backend embeddings;
 
 Results retain provenance, bounds and warnings. Limits include 32 KiB/800 lines
 per envelope, 10 MiB per source file, 20 search hits, 500 backend candidates and
-100 outline entries. Continuations and section handles are revision-bound,
-expire after 15 minutes, and live in a bounded 256-entry registry. Snippets use
+100 outline entries. Body and section continuations, and section handles, are
+revision-bound, expire after 15 minutes, and live in a bounded 256-entry registry.
+Metadata continuations are stateless tokens bound to the store, index revision, and query. They are not registry entries and have no separate lifetime. Snippets use
 current body paragraphs, exclude frontmatter, and obey 1024-byte/30-line and
 aggregate limits. They do not interpret backend chunk offsets.
 
@@ -92,6 +94,7 @@ additional encountered restrictions rather than assuming this list is exhaustive
 | Publication scanner Git-output capture is 256 MiB. Location: `scripts/check-private-terms.ts`; fixed by scanner maintainers. | Can reject large captured Git output. Specific necessity/approval is not established by the registry or revision-selection rules. |
 | Shared catalog uses protected JSON, the inherited 64 KiB configuration bound and one include pattern per native collection; the socket parent is owner-only and the socket mode is `0600`. Locations: `src/shared-catalog.ts`, `src/shared-ipc.ts`; catalog values belong to the operator. | Canonical definitions and owner-account-only local IPC are approved in issue #4. The catalog reuses existing reader/file/operation ranges rather than selecting a new transport deadline or frame cap. Reuse does not approve legacy numeric bounds; the single-pattern mapping follows the qualified qmd collection interface. |
 | Metadata catalog and relationship pages use the existing result envelope. Location: `src/service.ts`. The inherited 20-job and 256 KiB ledger checks remain in the common coordinator. | Prevents an unbounded tag or edge response from being treated as a complete page. No new item cap or continuation TTL is added. Reuse of the envelope and ledger bounds does not approve them. |
+| Frontmatter depth 8, 1,000 nodes, 16 KiB strings, and 10 YAML aliases. Location: `src/markdown.ts`. Exceeding one fails the note as `FRONTMATTER_INVALID`. | Bounds YAML walked while parsing notes. Issue #2 surfaced these inherited values. This table records them. It does not approve them. |
 | One maintenance owner per derived index, independent of IPC path. Protected ownership directory `0700`, records `0600`; live or unverifiable owner/worker PIDs refuse admission. Locations: `src/index-ownership.ts`, `QmdAdapter`, native-worker registration. | Approved single-index ownership and operator restart without manual dead-owner cleanup, issue #4 and the owner's 2026-11-12 recovery decision. Atomic nonempty-directory admission prevents simultaneous reclaimers replacing one another. Only proven-dead process records are reclaimed; no lease timer, election, process killing or autostart. PID reuse is conservatively treated as live, not guessed dead. |
 
 ## Public qmd lifecycle
@@ -150,10 +153,9 @@ are separate. Preflight does not establish exact backend membership.
 
 ## Refresh and recovery
 
-State directories are specific to the release and configuration, so a new
-configuration does not migrate the previous index. Job receipts and reconciliation
+Qmd's derived directory is specific to the release and configuration. The common application ledger and metadata index are not. They live at the application state root and are created before qmd. A new qmd binding does not move that ledger. Startup loads it and relaunches queued metadata work. Queued qmd jobs stay pending when no qmd runner is registered. If the stable ledger is absent, startup inventories `qmd-public-VERSION-FINGERPRINT` children, recomputes that path from the recorded version and current store config, and adopts exactly one proven application `jobs.json` after the ledger schema check and an index-ownership lease. A live or uncertain owner, two ledgers, or a path that does not recompute is an explicit compatibility failure. An existing stable file is not replaced. This does not open or migrate qmd's native databases. Job receipts and reconciliation
 metadata are published atomically. They do not make native index writes atomic.
-Startup requeues interrupted jobs and schedules lexical reconciliation. Identical
+When qmd is available, startup also requeues interrupted qmd jobs and schedules lexical reconciliation. Identical
 active jobs coalesce; different requests serialize. Cancelling a request waiter
 does not cancel shared maintenance; explicit cancellation owns that decision.
 The latest 20 job records are retained, subject to the active-job bound.
@@ -184,13 +186,13 @@ Broader automatic lexical indexing cadence is not enabled.
 
 A project store is either private or an explicit reference to a shared catalog entry. The reference selects a canonical store id. It does not create an index, and the local alias is not a second definition. Same path is not identity. Direct find, read, outline and root policy stay in the project against the resolved source root.
 
-Indexed search, refresh, status and job cancellation for a shared store go to one foreground local service. That service hosts the same `QmdAdapter` used for a private store, one adapter and one derived index per canonical shared datastore. The project does not keep a second coordinator or a private replacement index for that store. If the service is unavailable, shared indexed operations fail and direct reads continue.
+Indexed search, refresh, status and job cancellation for a shared store go to one foreground local service. The maintenance owner is `MaintenanceCoordinator`. `MetadataIndex` and `wiki` own graph and tag state. `QmdAdapter` is the optional qmd backend and is injected with that coordinator; it does not own the common ledger. Graph-only and qmd-unavailable stores still have one coordinator and one metadata index per canonical store. The project does not keep a second coordinator or a private replacement index. If the service is unavailable, shared indexed operations fail and direct reads continue. Shutdown settles accepted work before releasing ownership.
 
 The service is started by an operator with `--catalog`. Projects connect to its configured owner-only socket. They do not launch it, install a LaunchAgent, or become its owner. Closing a project closes that client's waiters and any in-progress attachment. Attachment belongs to the client lifetime, so cancelling the first handshake waiter does not cancel other callers using that same attachment. It does not cancel an accepted shared job or rebuild the index. Replies must match the attached definition and live generation. Restarting the service creates a new generation. A request bound to the previous generation or a different definition revision fails instead of being retargeted. Definition revisions include captured source-root device/inode identity, so replacing a root at the same path invalidates old attachments.
 
 `src/index-ownership.ts` admits one owning maintenance unit for the actual derived index before the host changes its endpoint or starts reconciliation. A different catalog or socket does not bypass that guard. A complete, nonempty ownership generation is published atomically. Native workers register before SDK access; a surviving worker prevents a replacement owner even after its parent has exited. Graceful shutdown stops requests/workers, persists receipts and releases ownership. After an unclean exit, an operator-started replacement reclaims proven-dead records and uses the same interrupted-job reconciliation. Live or unverifiable process identity remains unavailable rather than being killed or silently replaced. No background restart is introduced.
 
-Private stores keep project-hosted maintenance through that same adapter and admission algorithm. Search validation, aggregate budgets/warnings and status readiness use common private/shared paths; receipts and reconciliation present the project's local store aliases while underlying refresh IDs and queue keys remain canonical.
+Private stores use the same coordinator, metadata index, and admission algorithm. Qmd, when present, is a backend on that coordinator, not a second owner of the metadata directory. Search validation, aggregate budgets/warnings and status readiness use common private/shared paths; receipts and reconciliation present the project's local store aliases while underlying refresh IDs and queue keys remain canonical.
 
 ## Integration lifecycle and packaging
 
@@ -212,13 +214,13 @@ supported policy API. No paths or write grant are returned by discovery. The
 query subscribes, emits, and unsubscribes synchronously. Missing services return
 immediately; malformed/incompatible or duplicate replies grant no capability.
 
-All five model-facing tools use object-root parameter schemas. Conditional
+All six model-facing tools use object-root parameter schemas. Conditional
 `anyOf`/`oneOf` object branches explicitly declare their object type, including
 presence constraints inside `not`, so provider validators do not infer a
 non-object union. The read-view/continuation and refresh-action exclusions remain
 part of the schema and runtime validation.
 
-All five model-facing tools and the event responder register independently of
+All six model-facing tools and the event responder register independently of
 configuration success. Configuration/backend construction occurs in
 `session_start` after project trust. Missing/invalid configuration disables
 operation, not visibility: calls retain the actual configuration error code.
