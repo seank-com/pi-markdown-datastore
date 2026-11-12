@@ -13,7 +13,7 @@ import type { QmdAdapter, QmdCandidate } from "./qmd-adapter.ts";
 import { SharedIndexClient } from "./shared-client.ts";
 import type { MaintenanceCoordinator } from "./maintenance-coordinator.ts";
 import type { IndexOwnership } from "./index-ownership.ts";
-import type { MetadataIndex } from "./metadata-index.ts";
+import { continuationOffset, continuationToken, pageRendered, type MetadataIndex } from "./metadata-index.ts";
 
 function elapsed(started: number): number { return Math.max(0, Date.now() - started); }
 function propagateControlError(error: unknown): void { if (error instanceof DatastoreError && (error.code === "CANCELLED" || error.code === "TIMEOUT")) throw error; }
@@ -160,19 +160,24 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
  const limit=input.limit??20;if(!Number.isInteger(limit)||limit<1||limit>20)throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
  const match=input.match??"all";if(!["all","any"].includes(match))throw new DatastoreError("INVALID_NOTE_REF");
  if (input.selectors.length === 1 && input.selectors[0].kind === "tag") {
-  const index = this.metadata?.get(store.name); if (!index) throw new DatastoreError("STALE_INDEX");
   const query = input.selectors[0].value.toLocaleLowerCase("en-US").replace(/^#/, "");
-  const snapshot = store.shared ? undefined : await index.requireSnapshot();
-  const pages = snapshot ? snapshot.tags.find((tag) => tag.identity === query)?.pages ?? [] : await this.sharedClients?.get(store.name)?.tagPages(query, signal) ?? [];
-  const revision = snapshot?.revision;
-  let offset = 0;
+  const budget = { maxBytes: this.config.defaults.maxResultBytes, maxLines: this.config.defaults.maxResultLines };
   const token = (input as { continuation?: string }).continuation;
-  if (token) { const parsed = JSON.parse(Buffer.from(token, "base64url").toString("utf8")) as { store?: string; revision?: string; query?: string; offset?: number }; if (parsed.store !== store.name || parsed.query !== query || (revision !== undefined && parsed.revision !== revision) || !Number.isInteger(parsed.offset)) throw new DatastoreError("STALE_CONTINUATION"); offset = parsed.offset ?? 0; }
-  const page = pages.slice(offset, offset + limit);
-  const next = offset + page.length < pages.length ? offset + page.length : undefined;
-  const continuation = next === undefined ? undefined : Buffer.from(JSON.stringify({ store: store.name, revision, query, offset: next })).toString("base64url");
-  const data = { candidates: page.map((path) => ({ note: { store: store.name, path }, uri: "", title: path, revision: "" })), examined: pages.length, partial: next !== undefined };
-  return this.envelope("find", store.name, data, started, JSON.stringify(data), next !== undefined, continuation) as FindResult;
+  if (store.shared) {
+   const client = this.sharedClients?.get(store.name); if (!client) throw new DatastoreError("STORE_UNAVAILABLE");
+   const page = await client.tagPages(query, { continuation: token, limit, ...budget }, signal);
+   const data = { candidates: page.pages.map((path) => ({ note: { store: store.name, path }, uri: "", title: path, revision: page.revision })), examined: page.total, partial: page.continuation !== undefined };
+   return this.envelope("find", store.name, data, started, JSON.stringify(data), page.continuation !== undefined, page.continuation) as FindResult;
+  }
+  const index = this.metadata?.get(store.name); if (!index) throw new DatastoreError("STALE_INDEX");
+  const snapshot = await index.requireSnapshot();
+  const pages = snapshot.tags.find((tag) => tag.identity === query)?.pages ?? [];
+  const offset = continuationOffset(token, store.name, snapshot.revision, query);
+  const selected = pageRendered(pages.slice(0, offset + limit), offset, budget, (page) => ({ candidates: page, examined: pages.length }));
+  const bounded = selected.items.slice(0, limit);
+  const next = offset + bounded.length < pages.length ? offset + bounded.length : undefined;
+  const data = { candidates: bounded.map((path) => ({ note: { store: store.name, path }, uri: "", title: path, revision: snapshot.revision })), examined: pages.length, partial: next !== undefined };
+  return this.envelope("find", store.name, data, started, JSON.stringify(data), next !== undefined, next === undefined ? undefined : continuationToken(store.name, snapshot.revision, query, next)) as FindResult;
  }
  const notes=input.selectors.map(s=>{if(s.kind!=="uri" && (s.kind!=="path" || !s.path.endsWith(".md")))throw new DatastoreError("CAPABILITY_UNAVAILABLE");const note=s.kind==="uri"?noteUriToRef(s.uri):{store:store.name,path:validateRelativeNotePath(s.path)};if(note.store!==store.name)throw new DatastoreError("INVALID_NOTE_REF");return note;});
  const paths=[...new Set(notes.map(n=>n.path))];const candidates=[];
@@ -215,7 +220,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 	private async readInner(input: ReadInput, signal: AbortSignal): Promise<ReadResult> {
 		const started = Date.now(); throwIfAborted(signal);
 		const { store, descriptor, expectedRevision, cursor } = this.readDescriptor(input);
-		if (descriptor.view === "links" || descriptor.view === "backlinks") return this.metadataRead(store, descriptor.view, descriptor.note.path, started, signal, input.continuation);
+		if (descriptor.view === "links" || descriptor.view === "backlinks") return this.metadataRead(store, descriptor.view, descriptor.note.path, started, signal, input.continuation, { maxBytes: descriptor.maxBytes, maxLines: descriptor.maxLines });
 		const source = await safeOpenNote(store, descriptor.note.path, signal);
 		if (expectedRevision && expectedRevision !== source.fullRevision) throw new DatastoreError("STALE_CONTINUATION", { note: source.note });
 		const parsed = parseMarkdown(source);
@@ -351,69 +356,50 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		throw new DatastoreError(this.qmd || this.sharedClients?.size || this.maintenance ? "INVALID_NOTE_REF" : "CAPABILITY_UNAVAILABLE");
 	}
 	bindMetadata(coordinator: MaintenanceCoordinator, indexes: Map<string, MetadataIndex>, ownership?: IndexOwnership): void { this.maintenance = coordinator; this.metadata = indexes; this.#ownership = ownership; }
-	private pageToken<T>(items: T[], token: string | undefined, store: string, revision: string, query: string): { items: T[]; next?: number; continuation?: string } {
-		let offset = 0;
-		if (token) {
-			const parsed = JSON.parse(Buffer.from(token, "base64url").toString("utf8")) as { store?: string; revision?: string; query?: string; offset?: number };
-			if (parsed.store !== store || parsed.revision !== revision || parsed.query !== query || !Number.isInteger(parsed.offset)) throw new DatastoreError("STALE_CONTINUATION");
-			offset = parsed.offset ?? 0;
-		}
-		const page: T[] = [];
-		let next = offset;
-		for (; next < items.length; next += 1) {
-			const text = JSON.stringify([...page, items[next]]);
-			if (page.length && (Buffer.byteLength(text) > this.config.defaults.maxResultBytes || text.split("\n").length > this.config.defaults.maxResultLines)) break;
-			page.push(items[next]);
-		}
-		const more = next < items.length ? next : undefined;
-		return { items: page, next: more, continuation: more === undefined ? undefined : Buffer.from(JSON.stringify({ store, revision, query, offset: more })).toString("base64url") };
-	}
-	private async metadataRead(store: StoreConfig, view: "links" | "backlinks", path: string, started: number, signal: AbortSignal, token?: string): Promise<ReadResult> {
+	private async metadataRead(store: StoreConfig, view: "links" | "backlinks", path: string, started: number, signal: AbortSignal, token?: string, budget = { maxBytes: this.config.defaults.maxResultBytes, maxLines: this.config.defaults.maxResultLines }): Promise<ReadResult> {
 		throwIfAborted(signal);
 		if (store.shared) {
 			const client = this.sharedClients?.get(store.name);
 			if (!client) throw new DatastoreError("STORE_UNAVAILABLE");
-			const edges = view === "links" ? await client.links(path, signal) : await client.backlinks(path, signal);
-			const data = { note: { store: store.name, path }, view, edges, occurrenceCount: edges.length };
-			return this.envelope("read", store.name, data, started, JSON.stringify(data), false, undefined, [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: "unknown" }]) as ReadResult;
+			const page = view === "links" ? await client.links(path, { continuation: token, ...budget }, signal) : await client.backlinks(path, { continuation: token, ...budget }, signal);
+			const data = { note: { store: store.name, path }, view, edges: page.edges, pageCount: page.pageCount, occurrenceCount: page.occurrenceCount, returned: page.returned, complete: page.complete, revision: page.revision };
+			return this.envelope("read", store.name, data, started, JSON.stringify(data), page.continuation !== undefined, page.continuation, [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: page.complete ? "current" : "stale" }]) as ReadResult;
 		}
 		const index = this.metadata?.get(store.name);
 		if (!index) throw new DatastoreError("STALE_INDEX");
 		const snapshot = await index.requireSnapshot();
 		const query = `${view}:${path}`;
 		const edges = (view === "links" ? snapshot.edges.filter((edge) => edge.source === path) : snapshot.edges.filter((edge) => edge.target === path && edge.targetKind !== "unresolved" && edge.targetKind !== "ambiguous"));
-		const page = this.pageToken(edges, token, store.name, snapshot.revision, query);
-		const data = { note: { store: store.name, path }, view, edges: page.items, pageCount: new Set(edges.map((edge) => view === "links" ? edge.target : edge.source)).size, occurrenceCount: edges.length, returned: page.items.length, complete: snapshot.complete };
-		return this.envelope("read", store.name, data, started, JSON.stringify(data), page.next !== undefined, page.continuation, [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: snapshot.complete ? "current" : "stale" }]) as ReadResult;
+		const offset = continuationOffset(token, store.name, snapshot.revision, query);
+		const pageCount = new Set(edges.map((edge) => view === "links" ? edge.target : edge.source)).size;
+		const render = (items: typeof edges) => ({ note: { store: store.name, path }, view, edges: items, pageCount, occurrenceCount: edges.length, returned: items.length, complete: snapshot.complete, revision: snapshot.revision });
+		const page = pageRendered(edges, offset, budget, render);
+		const data = render(page.items);
+		return this.envelope("read", store.name, data, started, JSON.stringify(data), page.next !== undefined, page.next === undefined ? undefined : continuationToken(store.name, snapshot.revision, query, page.next), [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: snapshot.complete ? "current" : "stale" }]) as ReadResult;
 	}
-	async tags(input: { store: string; continuation?: string }, signal?: AbortSignal): Promise<RefreshResult> {
+	async tags(input: { store: string; continuation?: string; maxBytes?: number; maxLines?: number }, signal?: AbortSignal): Promise<RefreshResult> {
 		return this.runOperation(signal, async (active) => {
 			throwIfAborted(active);
 			const started = Date.now();
 			const store = this.store(input.store);
+			const budget = { maxBytes: Math.min(input.maxBytes ?? this.config.defaults.maxResultBytes, this.config.defaults.maxResultBytes), maxLines: Math.min(input.maxLines ?? this.config.defaults.maxResultLines, this.config.defaults.maxResultLines) };
+			if (!Number.isInteger(budget.maxBytes) || budget.maxBytes < 1 || !Number.isInteger(budget.maxLines) || budget.maxLines < 1) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
+			const query = "catalog";
+			if (store.shared) {
+				const client = this.sharedClients?.get(store.name); if (!client) throw new DatastoreError("STORE_UNAVAILABLE");
+				const page = await client.tags({ continuation: input.continuation, ...budget }, signal);
+				const data = { tags: page.tags, revision: page.revision, returned: page.returned, total: page.total };
+				return this.envelope("tags", store.name, data, started, JSON.stringify(data), page.continuation !== undefined, page.continuation) as RefreshResult;
+			}
 			const index = this.metadata?.get(store.name);
 			if (!index) throw new DatastoreError("STALE_INDEX");
 			const snapshot = await index.requireSnapshot();
-			const query = "catalog";
-			let offset = 0;
-			if (input.continuation) {
-				const parsed = JSON.parse(Buffer.from(input.continuation, "base64url").toString("utf8")) as { store?: string; revision?: string; query?: string; offset?: number };
-				if (parsed.store !== store.name || parsed.revision !== snapshot.revision || parsed.query !== query || !Number.isInteger(parsed.offset)) throw new DatastoreError("STALE_CONTINUATION");
-				offset = parsed.offset ?? 0;
-			}
-			const page: typeof snapshot.tags = [];
-			let next = offset;
-			for (; next < snapshot.tags.length; next += 1) {
-				const candidate = [...page, snapshot.tags[next]];
-				const text = JSON.stringify(candidate);
-				if (page.length && (Buffer.byteLength(text) > this.config.defaults.maxResultBytes || text.split("\n").length > this.config.defaults.maxResultLines)) break;
-				page.push(snapshot.tags[next]);
-			}
-			if (next >= snapshot.tags.length) next = undefined as unknown as number;
-			const continuation = next === undefined ? undefined : Buffer.from(JSON.stringify({ store: store.name, revision: snapshot.revision, query, offset: next })).toString("base64url");
-			const catalog = page.map((tag) => ({ identity: tag.identity, spelling: tag.spelling, pageCount: tag.pages.length }));
-			const data = { tags: catalog, revision: snapshot.revision, returned: catalog.length, total: snapshot.tags.length };
-			return this.envelope("tags", store.name, data, started, JSON.stringify(data), next !== undefined, continuation) as RefreshResult;
+			const offset = continuationOffset(input.continuation, store.name, snapshot.revision, query);
+			const render = (items: typeof snapshot.tags) => ({ tags: items.map((tag) => ({ identity: tag.identity, spelling: tag.spelling, pageCount: tag.pages.length })), revision: snapshot.revision, returned: items.length, total: snapshot.tags.length });
+			const page = pageRendered(snapshot.tags, offset, budget, render);
+			const data = render(page.items);
+			const continuation = page.next === undefined ? undefined : continuationToken(store.name, snapshot.revision, query, page.next);
+			return this.envelope("tags", store.name, data, started, JSON.stringify(data), page.next !== undefined, continuation) as RefreshResult;
 		});
 	}
 	async shutdown(): Promise<void> {

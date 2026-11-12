@@ -2,7 +2,7 @@ import type { Server, Socket } from "node:net";
 import { discoverQmdBinding, prepareQmdStateDirectory, QmdAdapter } from "./qmd-adapter.ts";
 import { acquireIndexOwnership, type IndexOwnership } from "./index-ownership.ts";
 import { MaintenanceCoordinator } from "./maintenance-coordinator.ts";
-import { MetadataIndex, registerMetadata } from "./metadata-index.ts";
+import { MetadataIndex, registerMetadata, pageRendered, continuationOffset, continuationToken } from "./metadata-index.ts";
 import type { MarkdownDatastoreConfig, StoreConfig } from "./config.ts";
 import { DatastoreError } from "./errors.ts";
 import { loadSharedCatalog, type SharedCatalog, type SharedStoreDefinition } from "./shared-catalog.ts";
@@ -105,9 +105,39 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 				const store = adapter?.config.stores.get(message.store);
 				let result: unknown;
 				if (call.operation === "startMetadata") result = await coordinator.enqueue("metadata", [message.store], "explicit-maintenance");
-				else if (call.operation === "links") result = await index.links(String(call.input?.path));
-				else if (call.operation === "backlinks") result = await index.backlinks(String(call.input?.path));
-				else if (call.operation === "tagPages") result = await index.tagPages(String(call.input?.tag));
+				else if (call.operation === "links" || call.operation === "backlinks" || call.operation === "tagPages" || call.operation === "tags") {
+					const snapshot = await index.requireSnapshot();
+					const maxBytes = Math.min(Number(call.input?.maxBytes ?? catalog.defaults.maxResultBytes), catalog.defaults.maxResultBytes);
+					const maxLines = Math.min(Number(call.input?.maxLines ?? catalog.defaults.maxResultLines), catalog.defaults.maxResultLines);
+					if (!Number.isInteger(maxBytes) || maxBytes < 1 || !Number.isInteger(maxLines) || maxLines < 1) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
+					const budget = { maxBytes, maxLines };
+					if (call.operation === "tags") {
+						const offset = continuationOffset(typeof call.input?.continuation === "string" ? call.input.continuation : undefined, message.store, snapshot.revision, "catalog");
+						const render = (items: typeof snapshot.tags) => ({ tags: items.map((tag) => ({ identity: tag.identity, spelling: tag.spelling, pageCount: tag.pages.length })), total: snapshot.tags.length, returned: items.length, revision: snapshot.revision });
+						const page = pageRendered(snapshot.tags, offset, budget, render);
+						result = { ...render(page.items), continuation: page.next === undefined ? undefined : continuationToken(message.store, snapshot.revision, "catalog", page.next) };
+					} else if (call.operation === "tagPages") {
+						const tag = String(call.input?.tag);
+						const pages = snapshot.tags.find((item) => item.identity === tag)?.pages ?? [];
+						const limit = Number(call.input?.limit ?? 20);
+						if (!Number.isInteger(limit) || limit < 1 || limit > 20) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
+						const offset = continuationOffset(typeof call.input?.continuation === "string" ? call.input.continuation : undefined, message.store, snapshot.revision, tag);
+						const window = pages.slice(0, offset + limit);
+						const render = (items: string[]) => ({ pages: items, total: pages.length, returned: items.length, complete: snapshot.complete, revision: snapshot.revision });
+						const page = pageRendered(window, offset, budget, render);
+						const next = offset + page.items.length < pages.length ? offset + page.items.length : undefined;
+						result = { ...render(page.items), continuation: next === undefined ? undefined : continuationToken(message.store, snapshot.revision, tag, next) };
+					} else {
+						const path = String(call.input?.path);
+						const edges = call.operation === "links" ? snapshot.edges.filter((edge) => edge.source === path) : snapshot.edges.filter((edge) => edge.target === path && edge.targetKind !== "unresolved" && edge.targetKind !== "ambiguous");
+						const query = `${call.operation}:${path}`;
+						const offset = continuationOffset(typeof call.input?.continuation === "string" ? call.input.continuation : undefined, message.store, snapshot.revision, query);
+						const pageCount = new Set(edges.map((edge) => call.operation === "links" ? edge.target : edge.source)).size;
+						const render = (items: typeof edges) => ({ edges: items, pageCount, occurrenceCount: edges.length, returned: items.length, complete: snapshot.complete, revision: snapshot.revision });
+						const page = pageRendered(edges, offset, budget, render);
+						result = { ...render(page.items), continuation: page.next === undefined ? undefined : continuationToken(message.store, snapshot.revision, query, page.next) };
+					}
+				}
 				else if (!adapter || !store) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
 				else if (call.operation === "activity") result = adapter.activity();
 				else if (call.operation === "current") result = adapter.isLexicallyCurrent(message.store);

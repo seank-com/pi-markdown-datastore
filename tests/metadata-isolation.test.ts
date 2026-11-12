@@ -98,8 +98,9 @@ test("graph-only shared host refreshes metadata without qmd", async (t) => {
 	const receipt = await client.startMetadata();
 	assert.equal(receipt.coalesced, false);
 	await host.coordinators.get("notebook")?.settled();
-	const edges = await client.links("alpha.md") as { target?: string }[];
-	assert.equal(edges[0]?.target, "beta.md");
+	const edges = await client.links("alpha.md");
+	assert.equal((edges.edges[0] as { target?: string })?.target, "beta.md");
+	assert.equal(typeof edges.revision, "string");
 });
 
 test("a second graph-only endpoint cannot own the same index, and close waits for the job", async (t) => {

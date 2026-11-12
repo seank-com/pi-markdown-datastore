@@ -139,21 +139,35 @@ export function registerMetadata(coordinator: MaintenanceCoordinator, indexes: M
 			const index = indexes.get(name);
 			const store = stores.get(name);
 			if (!index || !store) throw new DatastoreError("STORE_UNKNOWN");
-			try { revision = (await index.refresh(store, signal)).revision; }
-			catch (error) { await writeFile("/tmp/meta-run-error.txt", String(error)); throw error; }
+			revision = (await index.refresh(store, signal)).revision;
 		}
 		return { generation: revision };
 	});
 }
 
-export function pageItems<T>(items: T[], offset: number, budget: { maxBytes: number; maxLines: number }): { items: T[]; next?: number } {
+export function pageRendered<T>(items: T[], offset: number, budget: { maxBytes: number; maxLines: number }, render: (page: T[]) => unknown): { items: T[]; next?: number } {
+	if (!Number.isInteger(offset) || offset < 0 || offset > items.length) throw new DatastoreError("STALE_CONTINUATION");
 	const selected: T[] = [];
 	let index = offset;
 	for (; index < items.length; index += 1) {
 		const candidate = [...selected, items[index]];
-		const text = JSON.stringify(candidate);
-		if (selected.length > 0 && (Buffer.byteLength(text) > budget.maxBytes || candidate.length + 1 > budget.maxLines)) break;
+		const text = JSON.stringify(render(candidate));
+		if (Buffer.byteLength(text) > budget.maxBytes || text.split("\n").length > budget.maxLines) {
+			if (selected.length === 0) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
+			break;
+		}
 		selected.push(items[index]);
 	}
 	return { items: selected, next: index < items.length ? index : undefined };
+}
+
+export function continuationOffset(token: string | undefined, store: string, revision: string, query: string): number {
+	if (!token) return 0;
+	const parsed = JSON.parse(Buffer.from(token, "base64url").toString("utf8")) as { store?: string; revision?: string; query?: string; offset?: number };
+	if (parsed.store !== store || parsed.revision !== revision || parsed.query !== query || !Number.isInteger(parsed.offset) || (parsed.offset ?? -1) < 0) throw new DatastoreError("STALE_CONTINUATION");
+	return parsed.offset ?? 0;
+}
+
+export function continuationToken(store: string, revision: string, query: string, offset: number): string {
+	return Buffer.from(JSON.stringify({ store, revision, query, offset })).toString("base64url");
 }

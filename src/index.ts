@@ -61,7 +61,7 @@ const Schemas = {
 		],
 	}),
 	status: Type.Object({ store: Type.Optional(Type.String()) }, { additionalProperties: false }),
-	tags: Type.Object({ store: Type.String(), continuation: Type.Optional(Type.String()) }, { additionalProperties: false }),
+	tags: Type.Object({ store: Type.String(), continuation: Type.Optional(Type.String()), maxBytes: Type.Optional(Type.Integer({ minimum: 1 })), maxLines: Type.Optional(Type.Integer({ minimum: 1 })) }, { additionalProperties: false }),
 	refresh: Type.Unsafe<RefreshInput>({
 		type: "object",
 		properties: {
