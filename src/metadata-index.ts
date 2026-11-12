@@ -204,9 +204,14 @@ export function pageRendered<T>(items: T[], offset: number, budget: { maxBytes: 
 	return { items: selected, next: index < items.length ? index : undefined };
 }
 
+function decodePageToken(token: string): { store?: string; revision?: string; query?: string; offset?: number; maxBytes?: number; maxLines?: number } {
+	try { return JSON.parse(Buffer.from(token, "base64url").toString("utf8")); }
+	catch { throw new DatastoreError("STALE_CONTINUATION"); }
+}
+
 export function continuationOffset(token: string | undefined, store: string, revision: string, query: string): number {
 	if (!token) return 0;
-	const parsed = JSON.parse(Buffer.from(token, "base64url").toString("utf8")) as { store?: string; revision?: string; query?: string; offset?: number };
+	const parsed = decodePageToken(token);
 	if (parsed.store !== store || parsed.revision !== revision || parsed.query !== query || !Number.isInteger(parsed.offset) || (parsed.offset ?? -1) < 0) throw new DatastoreError("STALE_CONTINUATION");
 	return parsed.offset ?? 0;
 }
@@ -216,7 +221,7 @@ export function continuationToken(store: string, revision: string, query: string
 }
 
 export function readPageToken(token: string): { store: string; revision: string; query: string; offset: number; maxBytes?: number; maxLines?: number } {
-	const parsed = JSON.parse(Buffer.from(token, "base64url").toString("utf8")) as { store?: string; revision?: string; query?: string; offset?: number; maxBytes?: number; maxLines?: number };
+	const parsed = decodePageToken(token);
 	if (typeof parsed.store !== "string" || typeof parsed.revision !== "string" || typeof parsed.query !== "string" || !Number.isInteger(parsed.offset) || (parsed.offset ?? -1) < 0) throw new DatastoreError("STALE_CONTINUATION");
 	return { store: parsed.store, revision: parsed.revision, query: parsed.query, offset: parsed.offset ?? 0, maxBytes: parsed.maxBytes, maxLines: parsed.maxLines };
 }

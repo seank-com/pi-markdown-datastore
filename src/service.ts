@@ -199,7 +199,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 				return { store: this.store(existing.note.store), descriptor: existing, expectedRevision: existing.revision, cursor: existing.cursor };
 			} catch (error) {
 				if (!(error instanceof DatastoreError)) throw error;
-				const parsed = readPageToken(input.continuation);
+				let parsed; try { parsed = readPageToken(input.continuation); } catch (decode) { if (/^[0-9a-f]{32}$/.test(input.continuation)) throw error; throw decode instanceof DatastoreError ? decode : new DatastoreError("STALE_CONTINUATION"); }
 				const view = parsed.query.startsWith("links:") ? "links" : parsed.query.startsWith("backlinks:") ? "backlinks" : undefined;
 				if (!view) throw new DatastoreError("STALE_CONTINUATION");
 				let store; try { store = this.store(parsed.store); } catch (lookup) { if (lookup instanceof DatastoreError && lookup.code === "STORE_UNKNOWN") throw new DatastoreError("STALE_CONTINUATION"); throw lookup; }

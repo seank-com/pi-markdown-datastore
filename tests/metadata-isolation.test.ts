@@ -343,6 +343,8 @@ test("attachment backlinks stay current and an edited referrer does not", async 
 	assert.match(stale.warnings.map((warning) => warning.message).join("\n"), new RegExp(String(image.data.revision)));
 	const token = Buffer.from(JSON.stringify({ store: "notes", revision: image.data.revision, query: "backlinks:map.png", offset: 0, maxBytes: "bad" })).toString("base64url");
 	await assert.rejects(service.read({ continuation: token }), { code: "RESULT_LIMIT_EXCEEDED" });
+	await assert.rejects(service.read({ continuation: "not-a-page-token" }), { code: "STALE_CONTINUATION" });
+	await assert.rejects(service.read({ continuation: "ab".repeat(16) }), { code: "EXPIRED_CONTINUATION" });
 	const huge = Buffer.from(JSON.stringify({ store: "notes", revision: image.data.revision, query: "backlinks:map.png", offset: 0, maxBytes: 10_000_000, maxLines: 1 })).toString("base64url");
 	const clamped = await service.read({ continuation: huge });
 	assert.equal(clamped.bounds.maxBytes <= 32 * 1024, true);
