@@ -150,9 +150,10 @@ function resolveTarget(store: StoreConfig, source: string, ref: WikiReference, p
 	const raw = ref.target;
 	if (!raw && ref.fragment) return { target: source, targetKind: "note" };
 	const withMd = raw.endsWith(".md") ? raw : `${raw}.md`;
-	const rooted = raw.includes("/") || raw.includes("\\");
+	if (raw.includes("\\")) return { target: raw, targetKind: "unresolved" };
+	const rooted = raw.includes("/");
 	if (rooted) {
-		const candidate = raw.replaceAll("\\", "/");
+		const candidate = raw;
 		if (candidate.split("/").includes("..")) return { target: raw, targetKind: "unresolved" };
 		if (pages.includes(candidate) || pages.includes(withMd)) return { target: pages.includes(candidate) ? candidate : withMd, targetKind: "note" };
 		if (files.includes(candidate)) return { target: candidate, targetKind: "attachment" };

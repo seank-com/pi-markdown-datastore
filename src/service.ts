@@ -14,6 +14,7 @@ import { SharedIndexClient } from "./shared-client.ts";
 import type { MaintenanceCoordinator } from "./maintenance-coordinator.ts";
 import type { IndexOwnership } from "./index-ownership.ts";
 import { continuationOffset, continuationToken, pageRendered, readPageToken, tagCandidate, type MetadataIndex } from "./metadata-index.ts";
+import { tagIdentity } from "./wiki.ts";
 
 function elapsed(started: number): number { return Math.max(0, Date.now() - started); }
 function propagateControlError(error: unknown): void { if (error instanceof DatastoreError && (error.code === "CANCELLED" || error.code === "TIMEOUT")) throw error; }
@@ -160,7 +161,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
  const limit=input.limit??20;if(!Number.isInteger(limit)||limit<1||limit>20)throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
  const match=input.match??"all";if(!["all","any"].includes(match))throw new DatastoreError("INVALID_NOTE_REF");
  if (input.selectors.length === 1 && input.selectors[0].kind === "tag") {
-  const query = input.selectors[0].value.toLocaleLowerCase("en-US").replace(/^#/, "");
+  const query = tagIdentity(input.selectors[0].value);
   const budget = { maxBytes: this.config.defaults.maxResultBytes, maxLines: this.config.defaults.maxResultLines };
   const token = (input as { continuation?: string }).continuation;
   if (store.shared) {

@@ -39,7 +39,7 @@ function yamlBounds(value: unknown, depth = 0, state = { nodes: 0 }): void {
 }
 function normalizedList(value: unknown, tag = false): string[] {
 	const values = typeof value === "string" ? [value] : Array.isArray(value) && value.every((item) => typeof item === "string") ? value : [];
-	return values.map((item) => tag && item.startsWith("#") ? item.slice(1) : item);
+	return values;
 }
 
 function parseFrontmatter(lines: string[]): FrontmatterResult {

@@ -295,3 +295,25 @@ test("shared metadata status works when enabled qmd is unavailable", async (t) =
 	const activity = await client.activity();
 	assert.equal(activity.embeddingActive, false);
 });
+
+test("a backslash wikilink is unresolved and a second hash stays in the tag", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-syntax-")));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const notes = join(root, "notes");
+	await mkdir(join(notes, "folder"), { recursive: true });
+	await writeFile(join(notes, "folder", "page.md"), "Page.\n");
+	await writeFile(join(notes, "alpha.md"), "---\ntags: ['##Travel']\n---\nSee [[folder\\page]].\n");
+	const config = await projectConfig(root, { notes });
+	const index = new MetadataIndex(join(config.stateRoot, "metadata-notes"));
+	const coordinator = new MaintenanceCoordinator(join(config.stateRoot, "jobs.json"), () => new Set(["notes"]));
+	registerMetadata(coordinator, new Map([["notes", index]]), config.stores);
+	const service = new MarkdownDatastoreService(config);
+	service.bindMetadata(coordinator, new Map([["notes", index]]));
+	await service.refresh({ store: "notes", mode: "metadata" });
+	await coordinator.settled();
+	const links = await service.read({ store: "notes", note: { store: "notes", path: "alpha.md" }, view: "links" });
+	assert.equal(links.data.edges[0].target, "folder\\page");
+	assert.equal(links.data.edges[0].targetKind, "unresolved");
+	const found = await service.find({ store: "notes", selectors: [{ kind: "tag", value: "##travel" }] });
+	assert.equal(found.data.candidates[0].note.path, "alpha.md");
+});

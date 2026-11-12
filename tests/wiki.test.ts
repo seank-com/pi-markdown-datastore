@@ -2,6 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { extractWikilinks, tagIdentity } from "../src/wiki.ts";
 
+test("a tag keeps one leading hash and no more", () => {
+	assert.equal(tagIdentity("#Travel"), "travel");
+	assert.equal(tagIdentity("##Travel"), "#travel");
+	assert.equal(tagIdentity("##travel"), "#travel");
+});
+
 test("raw wikilinks ignore escapes, code and ordinary markdown", () => {
 	const text = [
 		"---",
