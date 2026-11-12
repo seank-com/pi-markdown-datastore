@@ -65,6 +65,10 @@ expire after 15 minutes, and live in a bounded 256-entry registry. Snippets use
 current body paragraphs, exclude frontmatter, and obey 1024-byte/30-line and
 aggregate limits. They do not interpret backend chunk offsets.
 
+## Metadata index
+
+Wikilink edges and frontmatter tags are a source-derived index beside qmd. They use the same maintenance coordinator as qmd when qmd is present, and that coordinator alone when qmd is disabled. Ordinary Markdown links are not edges. Code identified by the Markdown parser is not an edge. A tag catalog entry is an identity, the retained display spelling, and the distinct page count. Relationship and catalog pages use the existing result envelope. A continuation is bound to the store, the index revision, and the query. It is not a registry entry and has no separate lifetime. An incomplete scan is stale, not current. Direct reads stay available when this index is rebuilding. A shared graph-only store acquires the same per-index ownership as a qmd index and releases it only after accepted work has settled.
+
 ## Restrictions register
 
 Review in every PR against implementation, tests and dependency behavior. The
@@ -87,6 +91,7 @@ additional encountered restrictions rather than assuming this list is exhaustive
 | Existing-branch publication scans exclude `origin/main` ancestry; new branches exclude known remote history. Location: `.githooks/pre-push`. | Approved correction in PR #13 prevents published main history from blocking clean updates; feature checks remain. |
 | Publication scanner Git-output capture is 256 MiB. Location: `scripts/check-private-terms.ts`; fixed by scanner maintainers. | Can reject large captured Git output. Specific necessity/approval is not established by the registry or revision-selection rules. |
 | Shared catalog uses protected JSON, the inherited 64 KiB configuration bound and one include pattern per native collection; the socket parent is owner-only and the socket mode is `0600`. Locations: `src/shared-catalog.ts`, `src/shared-ipc.ts`; catalog values belong to the operator. | Canonical definitions and owner-account-only local IPC are approved in issue #4. The catalog reuses existing reader/file/operation ranges rather than selecting a new transport deadline or frame cap. Reuse does not approve legacy numeric bounds; the single-pattern mapping follows the qualified qmd collection interface. |
+| Metadata catalog and relationship pages use the existing result envelope. Location: `src/service.ts`. The inherited 20-job and 256 KiB ledger checks remain in the common coordinator. | Prevents an unbounded tag or edge response from being treated as a complete page. No new item cap or continuation TTL is added. Reuse of the envelope and ledger bounds does not approve them. |
 | One maintenance owner per derived index, independent of IPC path. Protected ownership directory `0700`, records `0600`; live or unverifiable owner/worker PIDs refuse admission. Locations: `src/index-ownership.ts`, `QmdAdapter`, native-worker registration. | Approved single-index ownership and operator restart without manual dead-owner cleanup, issue #4 and the owner's 2026-11-12 recovery decision. Atomic nonempty-directory admission prevents simultaneous reclaimers replacing one another. Only proven-dead process records are reclaimed; no lease timer, election, process killing or autostart. PID reuse is conservatively treated as live, not guessed dead. |
 
 ## Public qmd lifecycle

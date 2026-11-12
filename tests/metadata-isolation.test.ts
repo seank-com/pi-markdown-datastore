@@ -68,6 +68,11 @@ test("incomplete metadata is not reported current and tag find continues past tw
 	assert.equal(first.bounds.truncated, true);
 	const second = await service.find({ store: "notes", selectors: [{ kind: "tag", value: "travel" }], limit: 20, continuation: first.bounds.continuation } as never);
 	assert.equal(second.data.candidates.length, 1);
+	const revision = (await indexes.get("notes")!.requireSnapshot()).revision;
+	const token = (fields: Record<string, string>) => Buffer.from(JSON.stringify({ store: "notes", revision, query: "travel", offset: 0, ...fields })).toString("base64url");
+	await assert.rejects(service.find({ store: "notes", selectors: [{ kind: "tag", value: "travel" }], continuation: token({ query: "other" }) } as never), { code: "STALE_CONTINUATION" });
+	await assert.rejects(service.find({ store: "notes", selectors: [{ kind: "tag", value: "travel" }], continuation: token({ revision: "meta-" + "0".repeat(32) }) } as never), { code: "STALE_CONTINUATION" });
+	await assert.rejects(service.find({ store: "notes", selectors: [{ kind: "tag", value: "travel" }], continuation: token({ store: "archive" }) } as never), { code: "STALE_CONTINUATION" });
 });
 
 test("graph-only shared host refreshes metadata without qmd", async (t) => {

@@ -162,13 +162,15 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
  if (input.selectors.length === 1 && input.selectors[0].kind === "tag") {
   const index = this.metadata?.get(store.name); if (!index) throw new DatastoreError("STALE_INDEX");
   const query = input.selectors[0].value.toLocaleLowerCase("en-US").replace(/^#/, "");
-  const pages = store.shared ? await this.sharedClients?.get(store.name)?.tagPages(query, signal) ?? [] : await index.tagPages(query);
+  const snapshot = store.shared ? undefined : await index.requireSnapshot();
+  const pages = snapshot ? snapshot.tags.find((tag) => tag.identity === query)?.pages ?? [] : await this.sharedClients?.get(store.name)?.tagPages(query, signal) ?? [];
+  const revision = snapshot?.revision;
   let offset = 0;
   const token = (input as { continuation?: string }).continuation;
-  if (token) { const parsed = JSON.parse(Buffer.from(token, "base64url").toString("utf8")) as { store?: string; query?: string; offset?: number }; if (parsed.store !== store.name || parsed.query !== query || !Number.isInteger(parsed.offset)) throw new DatastoreError("STALE_CONTINUATION"); offset = parsed.offset ?? 0; }
+  if (token) { const parsed = JSON.parse(Buffer.from(token, "base64url").toString("utf8")) as { store?: string; revision?: string; query?: string; offset?: number }; if (parsed.store !== store.name || parsed.query !== query || (revision !== undefined && parsed.revision !== revision) || !Number.isInteger(parsed.offset)) throw new DatastoreError("STALE_CONTINUATION"); offset = parsed.offset ?? 0; }
   const page = pages.slice(offset, offset + limit);
   const next = offset + page.length < pages.length ? offset + page.length : undefined;
-  const continuation = next === undefined ? undefined : Buffer.from(JSON.stringify({ store: store.name, query, offset: next })).toString("base64url");
+  const continuation = next === undefined ? undefined : Buffer.from(JSON.stringify({ store: store.name, revision, query, offset: next })).toString("base64url");
   const data = { candidates: page.map((path) => ({ note: { store: store.name, path }, uri: "", title: path, revision: "" })), examined: pages.length, partial: next !== undefined };
   return this.envelope("find", store.name, data, started, JSON.stringify(data), next !== undefined, continuation) as FindResult;
  }

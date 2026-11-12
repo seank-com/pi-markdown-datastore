@@ -73,7 +73,7 @@ test("client RPC and direct search permit slow reranking and propagate deadline 
 
 test("trusted valid configuration registers exactly five strict tools", async (t) => {
 	const current = await fixture(t); const app = harness(current.project); createMarkdownDatastoreExtension({ projectRoot: current.project, configPath: current.configPath })(app.pi); await app.fire("session_start", { reason: "startup" });
-	assert.deepEqual(app.tools.map((tool) => tool.name), ["datastore_search", "datastore_find", "datastore_read", "datastore_status", "datastore_refresh"]);
+	assert.deepEqual(app.tools.map((tool) => tool.name), ["datastore_search", "datastore_find", "datastore_read", "datastore_status", "datastore_refresh", "datastore_tags"]);
 	for (const tool of app.tools) {
 		if (tool.parameters.type === "object") assert.equal(tool.parameters.additionalProperties, false);
 		else for (const schema of tool.parameters.anyOf) assert.equal(schema.additionalProperties, false);
@@ -128,7 +128,7 @@ test("five tools remain visible across initial failures, recovery, and valid-to-
 	const app = harness(current.project); let backendStarts = 0;
 	createMarkdownDatastoreExtension({ projectRoot: current.project, createQmd: async () => { backendStarts++; throw new Error("not installed"); } })(app.pi);
 	assert.equal(app.tools.length, 5, "registration does not wait for session_start");
-	const inputs: Record<string, unknown> = { datastore_search: { store: "memory", query: "body" }, datastore_find: { store: "memory", selectors: [{ kind: "path", path: "one.md" }] }, datastore_read: { note: { store: "memory", path: "one.md" } }, datastore_status: {}, datastore_refresh: {} };
+	const inputs: Record<string, unknown> = { datastore_search: { store: "memory", query: "body" }, datastore_find: { store: "memory", selectors: [{ kind: "path", path: "one.md" }] }, datastore_read: { note: { store: "memory", path: "one.md" } }, datastore_status: {}, datastore_refresh: {}, datastore_tags: { store: "memory" } };
 	const fails = async (code: string) => {
 		assert.equal(app.tools.length, 5);
 		for (const tool of app.tools) await assert.rejects(tool.execute("id", inputs[tool.name]), (error: any) => error.code === code);
