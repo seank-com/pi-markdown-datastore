@@ -33,7 +33,7 @@ test("hooks refuse private terms in staged files, messages and pushes", () => {
 		const secretsFile = join(root, "secrets");
 		writeFileSync(termsFile, "Example Person\n");
 		writeFileSync(secretsFile, "API_TOKEN=s3cret-value-123\nAPP_PASSWORD=q7!\n");
-		const env = { ...process.env, PRIVATE_TERMS_FILE: termsFile, PRIVATE_SECRETS_FILE: secretsFile, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+		const env = { ...process.env, PATH: `/opt/homebrew/bin:${process.env.PATH ?? ""}`, PRIVATE_TERMS_FILE: termsFile, PRIVATE_SECRETS_FILE: secretsFile, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
 		const run = (...args: string[]) => spawnSync("git", args, { cwd: repo, env, encoding: "utf8" });
 		const ok = (...args: string[]) => { const result = run(...args); assert.equal(result.status, 0, result.stderr); };
 		spawnSync("git", ["init", "-q", "--bare", remote], { env });
