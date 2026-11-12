@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -18,7 +18,8 @@ test("ledger keeps progress, capacity, validation, and explicit cancel", async (
 	let reported!: () => void;
 	const sawReport = new Promise<void>((resolve) => { reported = resolve; });
 	progress.register("metadata", async (_job, _signal, report) => {
-		report("embedding", { phase: "embedding", chunks: { completed: 2, total: 4 }, errors: 1 });
+		report("updating", { documentsCompleted: 3, sourceBytesCompleted: 9, documentsTotal: 8, sourceBytesTotal: 40 });
+		report("embedding", { phase: "embedding", documents: { completed: 1, total: 5 }, chunks: { completed: 2, total: 4 }, errors: 1 });
 		reported();
 		await gate;
 		return { generation: "meta-1" };
@@ -26,6 +27,8 @@ test("ledger keeps progress, capacity, validation, and explicit cancel", async (
 	const job = await progress.enqueue("metadata", ["memory"], "explicit-maintenance");
 	await sawReport;
 	assert.equal(progress.get(String(job.refreshId))?.progress.chunksCompleted, 2);
+	assert.equal(progress.get(String(job.refreshId))?.progress.documentsTotal, 5);
+	assert.equal(progress.get(String(job.refreshId))?.progress.sourceBytesTotal, 40);
 	release();
 	await progress.settled();
 	const names = Array.from({ length: 21 }, (_item, index) => `s${index}`);
@@ -44,12 +47,29 @@ test("ledger keeps progress, capacity, validation, and explicit cancel", async (
 	const cancel = coordinator(join(dir, "cancel"));
 	let finish!: () => void;
 	const running = new Promise<void>((resolve) => { finish = resolve; });
-	cancel.register("metadata", async (_job, signal) => { await Promise.race([running, new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason)))]); return { generation: "x" }; });
+	let started!: () => void;
+	const holding = new Promise<void>((resolve) => { started = resolve; });
+	cancel.register("metadata", async (_job, signal) => { started(); await Promise.race([running, new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason)))]); return { generation: "meta-" + "ab".repeat(16) }; });
 	const runningJob = await cancel.enqueue("metadata", ["memory"], "explicit-maintenance");
-	await new Promise((resolve) => setImmediate(resolve));
+	await holding;
+	assert.equal(cancel.get(String(runningJob.refreshId))?.state, "running");
 	await cancel.cancel(String(runningJob.refreshId));
 	cancel.shutdown();
 	finish();
 	await cancel.settled();
 	assert.equal(cancel.get(String(runningJob.refreshId))?.state, "cancelled");
+	const failing = coordinator(join(dir, "fail"));
+	let entered!: () => void;
+	const enteredGate = new Promise<void>((resolve) => { entered = resolve; });
+	let finishFail!: () => void;
+	const finishGate = new Promise<void>((resolve) => { finishFail = resolve; });
+	failing.register("metadata", async () => { entered(); await finishGate; return { generation: "meta-" + "cd".repeat(16) }; });
+	const failingJob = await failing.enqueue("metadata", ["memory"], "explicit-maintenance");
+	await enteredGate;
+	await chmod(join(dir, "fail"), 0o500);
+	finishFail();
+	await failing.settled();
+	await chmod(join(dir, "fail"), 0o700);
+	assert.equal(failing.get(String(failingJob.refreshId))?.state, "failed");
+	assert.equal(failing.get(String(failingJob.refreshId))?.errorCode, "INDEX_CORRUPT");
 });

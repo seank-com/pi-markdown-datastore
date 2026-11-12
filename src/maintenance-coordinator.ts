@@ -64,6 +64,10 @@ export class MaintenanceCoordinator {
 			const stores = [...jobRaw.stores as string[]].sort();
 			const mode = String(jobRaw.mode) as Mode;
 			if (jobRaw.key !== `${mode}:${stores.join(",")}`) throw new DatastoreError("INDEX_CORRUPT");
+			if (jobRaw.completedAt !== undefined && typeof jobRaw.completedAt !== "string") throw new DatastoreError("INDEX_CORRUPT");
+			if (jobRaw.errorCode !== undefined && (typeof jobRaw.errorCode !== "string" || !/^[A-Z_]{3,64}$/.test(jobRaw.errorCode))) throw new DatastoreError("INDEX_CORRUPT");
+			const generationPattern = mode === "metadata" ? /^(?:gen|meta)-[0-9a-f]{32}$/ : /^gen-[0-9a-f]{32}$/;
+			if (jobRaw.generation !== undefined && (typeof jobRaw.generation !== "string" || !generationPattern.test(jobRaw.generation))) throw new DatastoreError("INDEX_CORRUPT");
 			const progressRaw = jobRaw.progress as Record<string, unknown>;
 			const progressAllowed = ["documentsCompleted", "documentsTotal", "sourceBytesCompleted", "sourceBytesTotal", "chunksCompleted", "chunksTotal", "embeddingBytesCompleted", "embeddingBytesTotal", "errors"];
 			if (!progressRaw || typeof progressRaw !== "object" || Array.isArray(progressRaw) || Object.keys(progressRaw).some((field) => !progressAllowed.includes(field))) throw new DatastoreError("INDEX_CORRUPT");
@@ -115,8 +119,8 @@ export class MaintenanceCoordinator {
 			const report: MaintenanceReport = (phase, update) => {
 				if (["succeeded", "failed", "cancelled"].includes(job.phase)) return;
 				job.phase = phase; job.state = phase === "queued" ? "queued" : "running"; job.updatedAt = new Date().toISOString();
-				if (update && "documentsCompleted" in update) { job.progress.documentsCompleted = update.documentsCompleted; job.progress.sourceBytesCompleted = update.sourceBytesCompleted; }
-				else if (update) { if (update.documents) job.progress.documentsCompleted = update.documents.completed; if (update.chunks) { job.progress.chunksCompleted = update.chunks.completed; job.progress.chunksTotal = update.chunks.total; } if (update.bytes) { job.progress.embeddingBytesCompleted = update.bytes.completed; job.progress.embeddingBytesTotal = update.bytes.total; } if (update.errors !== undefined) job.progress.errors = update.errors; }
+				if (update && "documentsCompleted" in update) { job.progress.documentsCompleted = update.documentsCompleted; job.progress.sourceBytesCompleted = update.sourceBytesCompleted; if (update.documentsTotal !== undefined) job.progress.documentsTotal = update.documentsTotal; if (update.sourceBytesTotal !== undefined) job.progress.sourceBytesTotal = update.sourceBytesTotal; }
+				else if (update) { if (update.documents) { job.progress.documentsCompleted = update.documents.completed; job.progress.documentsTotal = update.documents.total; } if (update.chunks) { job.progress.chunksCompleted = update.chunks.completed; job.progress.chunksTotal = update.chunks.total; } if (update.bytes) { job.progress.embeddingBytesCompleted = update.bytes.completed; job.progress.embeddingBytesTotal = update.bytes.total; } if (update.errors !== undefined) job.progress.errors = update.errors; }
 			};
 			const result = await runner(job, controller.signal, report);
 			job.state = "succeeded"; job.phase = "succeeded"; if (result && "generation" in result && result.generation) job.generation = result.generation;
