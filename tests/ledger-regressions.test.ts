@@ -74,6 +74,24 @@ test("ledger keeps progress, capacity, validation, and explicit cancel", async (
 	assert.equal(failing.get(String(failingJob.refreshId))?.errorCode, "INDEX_CORRUPT");
 });
 
+test("a lone capacity rejection does not emit an unhandled rejection", async () => {
+	const dir = await realpath(await mkdtemp(join(tmpdir(), "datastore-lone-reject-")));
+	const names = Array.from({ length: 21 }, (_item, index) => `s${index}`);
+	const owner = new MaintenanceCoordinator(join(dir, "jobs.json"), () => new Set(names));
+	let release!: () => void;
+	const held = new Promise<void>((resolve) => { release = resolve; });
+	owner.register("metadata", async () => { await held; return { generation: "meta-" + "ab".repeat(16) }; });
+	const unhandled: unknown[] = [];
+	const onUnhandled = (error: unknown) => { unhandled.push(error); };
+	process.on("unhandledRejection", onUnhandled);
+	try {
+		for (let index = 0; index < 20; index += 1) await owner.enqueue("metadata", [names[index]], "explicit-maintenance");
+		await assert.rejects(owner.enqueue("metadata", [names[20]], "explicit-maintenance"), { code: "RESULT_LIMIT_EXCEEDED" });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.deepEqual(unhandled, []);
+	} finally { process.off("unhandledRejection", onUnhandled); release(); owner.shutdown(); await owner.settled(); await rm(dir, { recursive: true, force: true }); }
+});
+
 test("a failed first admission rejects every coalesced caller and starts no runner", async () => {
 	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-admit-fail-")));
 	const owner = new MaintenanceCoordinator(join(root, "jobs.json"), () => new Set(["a"]));

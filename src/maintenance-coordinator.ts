@@ -149,6 +149,7 @@ export class MaintenanceCoordinator {
 		let admit!: () => void;
 		let refuse!: (error: unknown) => void;
 		const admission = new Promise<void>((resolve, reject) => { admit = resolve; refuse = reject; });
+		admission.catch(() => undefined);
 		this.#admissions.set(key, admission);
 		try {
 			const terminal = this.jobs().filter((item) => !["queued", "running"].includes(item.state));
