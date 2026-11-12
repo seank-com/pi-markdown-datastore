@@ -4,10 +4,12 @@ import { chmod, lstat, mkdir, open, readFile, rename, writeFile } from "node:fs/
 import { dirname } from "node:path";
 import { DatastoreError, throwIfAborted } from "./errors.ts";
 import type { QmdRefreshJob, QmdRefreshPhase } from "./qmd-adapter.ts";
+import type { QmdWorkerProgress } from "./qmd-worker-client.ts";
 
 const TERMINAL_JOB_LIMIT = 20;
 type Mode = "lexical" | "semantic" | "metadata";
-export type MaintenanceRunner = (job: QmdRefreshJob, signal: AbortSignal, report: (phase: QmdRefreshPhase) => void) => Promise<{ generation?: string } | void>;
+export type MaintenanceReport = (phase: QmdRefreshPhase, update?: QmdWorkerProgress | { documentsCompleted: number; sourceBytesCompleted: number; documentsTotal?: number; sourceBytesTotal?: number }) => void;
+export type MaintenanceRunner = (job: QmdRefreshJob, signal: AbortSignal, report: MaintenanceReport) => Promise<{ generation?: string } | void>;
 
 async function atomicJson(path: string, value: unknown): Promise<void> {
 	await mkdir(dirname(path), { recursive: true, mode: 0o700 });
@@ -31,6 +33,7 @@ export class MaintenanceCoordinator {
 	#persistTail: Promise<void> = Promise.resolve();
 	#closed = false;
 	#hostClosing = false;
+	#explicitCancel = new Set<string>();
 	readonly jobsPath: string;
 	readonly knownStores: () => ReadonlySet<string>;
 	constructor(jobsPath: string, knownStores: () => ReadonlySet<string>) { this.jobsPath = jobsPath; this.knownStores = knownStores; }
@@ -55,8 +58,17 @@ export class MaintenanceCoordinator {
 		}
 		if (raw?.version !== 1 || !Array.isArray(raw.jobs) || raw.jobs.length > TERMINAL_JOB_LIMIT) throw new DatastoreError("INDEX_CORRUPT");
 		for (const value of raw.jobs) {
-			const job = value as QmdRefreshJob;
-			if (!job || job.version !== 1 || !/^[0-9a-f]{32}$/.test(job.refreshId) || !["lexical", "semantic", "metadata"].includes(job.mode) || !Array.isArray(job.stores) || job.stores.some((name) => !this.knownStores().has(name))) throw new DatastoreError("INDEX_CORRUPT");
+			const jobRaw = value as Record<string, unknown>;
+			const allowed = ["version", "refreshId", "key", "mode", "stores", "ownership", "state", "phase", "createdAt", "updatedAt", "completedAt", "generation", "errorCode", "progress"];
+			if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(jobRaw).some((key) => !allowed.includes(key)) || jobRaw.version !== 1 || typeof jobRaw.refreshId !== "string" || !/^[0-9a-f]{32}$/.test(jobRaw.refreshId) || !["lexical", "semantic", "metadata"].includes(String(jobRaw.mode)) || !Array.isArray(jobRaw.stores) || jobRaw.stores.some((name) => typeof name !== "string" || !this.knownStores().has(name)) || new Set(jobRaw.stores as string[]).size !== jobRaw.stores.length || !["startup-reconciliation", "explicit-maintenance"].includes(String(jobRaw.ownership)) || !["queued", "running", "succeeded", "failed", "cancelled"].includes(String(jobRaw.state)) || !["queued", "scanning", "updating", "embedding", "validating", "promoting", "succeeded", "failed", "cancelled"].includes(String(jobRaw.phase)) || typeof jobRaw.createdAt !== "string" || typeof jobRaw.updatedAt !== "string") throw new DatastoreError("INDEX_CORRUPT");
+			const stores = [...jobRaw.stores as string[]].sort();
+			const mode = String(jobRaw.mode) as Mode;
+			if (jobRaw.key !== `${mode}:${stores.join(",")}`) throw new DatastoreError("INDEX_CORRUPT");
+			const progressRaw = jobRaw.progress as Record<string, unknown>;
+			const progressAllowed = ["documentsCompleted", "documentsTotal", "sourceBytesCompleted", "sourceBytesTotal", "chunksCompleted", "chunksTotal", "embeddingBytesCompleted", "embeddingBytesTotal", "errors"];
+			if (!progressRaw || typeof progressRaw !== "object" || Array.isArray(progressRaw) || Object.keys(progressRaw).some((field) => !progressAllowed.includes(field))) throw new DatastoreError("INDEX_CORRUPT");
+			for (const field of progressAllowed) if (progressRaw[field] !== undefined && (!Number.isSafeInteger(progressRaw[field]) || (progressRaw[field] as number) < 0)) throw new DatastoreError("INDEX_CORRUPT");
+			const job: QmdRefreshJob = { version: 1, refreshId: jobRaw.refreshId, key: jobRaw.key, mode, stores, ownership: jobRaw.ownership as QmdRefreshJob["ownership"], state: jobRaw.state as QmdRefreshJob["state"], phase: jobRaw.phase as QmdRefreshPhase, createdAt: jobRaw.createdAt, updatedAt: jobRaw.updatedAt, completedAt: typeof jobRaw.completedAt === "string" ? jobRaw.completedAt : undefined, generation: typeof jobRaw.generation === "string" ? jobRaw.generation : undefined, errorCode: typeof jobRaw.errorCode === "string" ? jobRaw.errorCode : undefined, progress: { documentsCompleted: Number(progressRaw.documentsCompleted ?? 0), documentsTotal: progressRaw.documentsTotal as number | undefined, sourceBytesCompleted: Number(progressRaw.sourceBytesCompleted ?? 0), sourceBytesTotal: progressRaw.sourceBytesTotal as number | undefined, chunksCompleted: Number(progressRaw.chunksCompleted ?? 0), chunksTotal: progressRaw.chunksTotal as number | undefined, embeddingBytesCompleted: Number(progressRaw.embeddingBytesCompleted ?? 0), embeddingBytesTotal: progressRaw.embeddingBytesTotal as number | undefined, errors: Number(progressRaw.errors ?? 0) } };
 			if (job.state === "queued" || job.state === "running") { job.state = "queued"; job.phase = "queued"; delete job.errorCode; delete job.completedAt; job.updatedAt = new Date().toISOString(); }
 			this.#jobs.set(job.refreshId, job);
 		}
@@ -77,6 +89,9 @@ export class MaintenanceCoordinator {
 		const key = `${mode}:${ordered.join(",")}`;
 		const existing = [...this.#jobs.values()].find((job) => job.key === key && (job.state === "queued" || job.state === "running"));
 		if (existing) { this.launch(existing); return { ...structuredClone(existing), coalesced: true }; }
+		const terminal = this.jobs().filter((item) => !["queued", "running"].includes(item.state));
+		while (this.#jobs.size + 1 > TERMINAL_JOB_LIMIT && terminal.length) this.#jobs.delete(terminal.shift()!.refreshId);
+		if (this.#jobs.size + 1 > TERMINAL_JOB_LIMIT) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
 		const now = new Date().toISOString();
 		const job: QmdRefreshJob = { version: 1, refreshId: randomBytes(16).toString("hex"), key, mode, stores: ordered, ownership, state: "queued", phase: "queued", createdAt: now, updatedAt: now, progress: { documentsCompleted: 0, sourceBytesCompleted: 0, chunksCompleted: 0, embeddingBytesCompleted: 0, errors: 0 } };
 		this.#jobs.set(job.refreshId, job);
@@ -97,18 +112,24 @@ export class MaintenanceCoordinator {
 			await previous.catch(() => undefined);
 			throwIfAborted(controller.signal);
 			job.state = "running"; job.phase = "scanning"; job.updatedAt = new Date().toISOString();
-			const result = await runner(job, controller.signal, (phase) => { job.phase = phase; job.state = "running"; job.updatedAt = new Date().toISOString(); });
+			const report: MaintenanceReport = (phase, update) => {
+				if (["succeeded", "failed", "cancelled"].includes(job.phase)) return;
+				job.phase = phase; job.state = phase === "queued" ? "queued" : "running"; job.updatedAt = new Date().toISOString();
+				if (update && "documentsCompleted" in update) { job.progress.documentsCompleted = update.documentsCompleted; job.progress.sourceBytesCompleted = update.sourceBytesCompleted; }
+				else if (update) { if (update.documents) job.progress.documentsCompleted = update.documents.completed; if (update.chunks) { job.progress.chunksCompleted = update.chunks.completed; job.progress.chunksTotal = update.chunks.total; } if (update.bytes) { job.progress.embeddingBytesCompleted = update.bytes.completed; job.progress.embeddingBytesTotal = update.bytes.total; } if (update.errors !== undefined) job.progress.errors = update.errors; }
+			};
+			const result = await runner(job, controller.signal, report);
 			job.state = "succeeded"; job.phase = "succeeded"; if (result && "generation" in result && result.generation) job.generation = result.generation;
 		})().catch((error: unknown) => {
-			if (this.#hostClosing) { job.state = "queued"; job.phase = "queued"; delete job.errorCode; delete job.completedAt; return; }
+			if (this.#hostClosing && !this.#explicitCancel.has(job.refreshId)) { job.state = "queued"; job.phase = "queued"; delete job.errorCode; delete job.completedAt; return; }
 			const safe = error instanceof DatastoreError ? error : new DatastoreError("BACKEND_FAILED");
 			job.state = safe.code === "CANCELLED" ? "cancelled" : "failed";
 			job.phase = job.state; job.errorCode = safe.code;
-		}).finally(() => {
+		}).finally(async () => {
 			job.updatedAt = new Date().toISOString();
 			if (["succeeded", "failed", "cancelled"].includes(job.state)) job.completedAt ??= job.updatedAt;
 			this.#controllers.delete(job.refreshId);
-			void this.persist();
+			try { await this.persist(); } catch { job.state = "failed"; job.phase = "failed"; job.errorCode = "INDEX_CORRUPT"; job.completedAt = job.updatedAt; }
 		});
 		this.#tail = operation.then(() => undefined, () => undefined);
 	}
@@ -117,6 +138,7 @@ export class MaintenanceCoordinator {
 		const job = this.#jobs.get(refreshId);
 		if (!job) throw new DatastoreError("INVALID_NOTE_REF");
 		const controller = this.#controllers.get(refreshId);
+		this.#explicitCancel.add(refreshId);
 		controller?.abort(new DatastoreError("CANCELLED"));
 		if (job.state === "queued") { job.state = "cancelled"; job.phase = "cancelled"; job.errorCode = "CANCELLED"; job.updatedAt = new Date().toISOString(); job.completedAt = job.updatedAt; await this.persist(); }
 		return { ...structuredClone(job), cancellationRequested: controller !== undefined || job.state === "cancelled" };
