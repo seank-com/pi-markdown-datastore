@@ -12,6 +12,13 @@ export const HARD_MAX_SEARCH_RESULTS = 20;
 export const HARD_MAX_CANDIDATES = 500;
 export const HARD_MAX_OUTLINE = 100;
 
+export function clampReadBudget(requested: { maxBytes?: unknown; maxLines?: unknown } | undefined, defaults: { maxBytes: number; maxLines: number }): { maxBytes: number; maxLines: number } {
+	const maxBytes = requested?.maxBytes === undefined ? defaults.maxBytes : requested.maxBytes;
+	const maxLines = requested?.maxLines === undefined ? defaults.maxLines : requested.maxLines;
+	if (typeof maxBytes !== "number" || !Number.isInteger(maxBytes) || maxBytes < 4 || typeof maxLines !== "number" || !Number.isInteger(maxLines) || maxLines < 1) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
+	return { maxBytes: Math.min(maxBytes, HARD_MAX_RESULT_BYTES), maxLines: Math.min(maxLines, HARD_MAX_RESULT_LINES) };
+}
+
 export interface DatastoreDefaults { maxResultBytes: number; maxResultLines: number; operationTimeoutMs: number }
 export interface QmdConfig { enabled: boolean; installation: { executable?: string; packageRoot?: string }; minimumVersion: string }
 

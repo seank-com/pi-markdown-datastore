@@ -4,7 +4,7 @@ import { discoverQmdBinding, prepareQmdStateDirectory, qmdApplicationDirectory, 
 import { acquireIndexOwnership, type IndexOwnership } from "./index-ownership.ts";
 import { adoptLegacyApplicationJobs, MaintenanceCoordinator } from "./maintenance-coordinator.ts";
 import { MetadataIndex, registerMetadata, pageRendered, continuationOffset, continuationToken, tagCandidate } from "./metadata-index.ts";
-import type { MarkdownDatastoreConfig, StoreConfig } from "./config.ts";
+import { clampReadBudget, type MarkdownDatastoreConfig, type StoreConfig } from "./config.ts";
 import { DatastoreError } from "./errors.ts";
 import { loadSharedCatalog, type SharedCatalog, type SharedStoreDefinition } from "./shared-catalog.ts";
 import { attachSharedParser, encodeSharedMessage, generationId, listenOwnedSocket, parseSharedRequest, type SharedCall, type SharedHello, type SharedReply } from "./shared-ipc.ts";
@@ -112,10 +112,7 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 					const store = storeConfig(catalog, definition).stores.get(message.store);
 					if (!store) throw new DatastoreError("STORE_UNAVAILABLE");
 					const snapshot = await index.requireSnapshot();
-					const maxBytes = Math.min(Number(call.input?.maxBytes ?? catalog.defaults.maxResultBytes), catalog.defaults.maxResultBytes);
-					const maxLines = Math.min(Number(call.input?.maxLines ?? catalog.defaults.maxResultLines), catalog.defaults.maxResultLines);
-					if (!Number.isInteger(maxBytes) || maxBytes < 1 || !Number.isInteger(maxLines) || maxLines < 1) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
-					const budget = { maxBytes, maxLines };
+					const budget = clampReadBudget({ maxBytes: call.input?.maxBytes, maxLines: call.input?.maxLines }, { maxBytes: catalog.defaults.maxResultBytes, maxLines: catalog.defaults.maxResultLines });
 					const responseStore = typeof call.input?.responseStore === "string" ? call.input.responseStore : message.store;
 					if (call.operation === "tags") {
 						const offset = continuationOffset(typeof call.input?.continuation === "string" ? call.input.continuation : undefined, responseStore, snapshot.revision, "catalog");
@@ -145,7 +142,8 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 						const pageCount = new Set(edges.map((edge) => call.operation === "links" ? edge.target : edge.source)).size;
 						const render = (items: typeof edges) => ({ edges: items, pageCount, occurrenceCount: edges.length, returned: items.length, complete: snapshot.complete, revision: snapshot.revision });
 						const page = pageRendered(edges, offset, budget, render);
-						const admitted = await index.admit(store, [{ path, kind: "note" as const }, ...page.items.flatMap((edge) => edge.targetKind === "note" || edge.targetKind === "attachment" ? [{ path: edge.target, kind: edge.targetKind }] : [])], controller.signal);
+						const subject = { path, kind: call.operation === "backlinks" && !path.endsWith(".md") ? "attachment" as const : "note" as const };
+						const admitted = await index.admit(store, [subject, ...page.items.flatMap((edge) => [{ path: edge.source, kind: "note" as const }, ...(edge.targetKind === "note" || edge.targetKind === "attachment" ? [{ path: edge.target, kind: edge.targetKind }] : [])])], controller.signal);
 						result = { ...render(page.items), complete: admitted.current, diagnostics: admitted.diagnostics, continuation: page.next === undefined ? undefined : continuationToken(responseStore, snapshot.revision, query, page.next, budget) };
 					}
 				}

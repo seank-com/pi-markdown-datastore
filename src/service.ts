@@ -4,7 +4,7 @@ import type {
 	RootsInput, RootsResult, DestinationInput, DestinationResult, MarkdownDatastorePolicyV1,
 } from "./contract.ts";
 import type { MarkdownDatastoreConfig, StoreConfig } from "./config.ts";
-import { HARD_MAX_RESULT_BYTES, HARD_MAX_RESULT_LINES } from "./config.ts";
+import { clampReadBudget, HARD_MAX_RESULT_BYTES, HARD_MAX_RESULT_LINES } from "./config.ts";
 import { assertRootIdentity, inspectDestination, ownsDestination, noteUriToRef, redactedRoot, safeOpenNote, validateRelativeNotePath } from "./containment.ts";
 import { ContinuationRegistry, type ContinuationDescriptor } from "./continuations.ts";
 import { DatastoreError, throwIfAborted } from "./errors.ts";
@@ -203,7 +203,8 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 				const view = parsed.query.startsWith("links:") ? "links" : parsed.query.startsWith("backlinks:") ? "backlinks" : undefined;
 				if (!view) throw new DatastoreError("STALE_CONTINUATION");
 				let store; try { store = this.store(parsed.store); } catch (lookup) { if (lookup instanceof DatastoreError && lookup.code === "STORE_UNKNOWN") throw new DatastoreError("STALE_CONTINUATION"); throw lookup; }
-				return { store, descriptor: { note: { store: store.name, path: parsed.query.slice(view.length + 1) }, view, includeFrontmatter: false, excludeSections: [], includeSemanticRelated: false, maxBytes: parsed.maxBytes ?? this.config.defaults.maxResultBytes, maxLines: parsed.maxLines ?? this.config.defaults.maxResultLines }, cursor: 0 };
+				const budget = clampReadBudget(parsed, { maxBytes: this.config.defaults.maxResultBytes, maxLines: this.config.defaults.maxResultLines });
+				return { store, descriptor: { note: { store: store.name, path: parsed.query.slice(view.length + 1) }, view, includeFrontmatter: false, excludeSections: [], includeSemanticRelated: false, ...budget }, cursor: 0 };
 			}
 		}
 		if (input.continuation && (input.view === "links" || input.view === "backlinks")) {
@@ -219,9 +220,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		const note = input.note ?? noteUriToRef(input.uri!);
 		if (input.store && input.store !== note.store) throw new DatastoreError("INVALID_NOTE_REF");
 		const store = this.store(note.store);
-		const maxBytes = Math.min(input.maxBytes ?? this.config.defaults.maxResultBytes, HARD_MAX_RESULT_BYTES);
-		const maxLines = Math.min(input.maxLines ?? this.config.defaults.maxResultLines, HARD_MAX_RESULT_LINES);
-		if (!Number.isInteger(maxBytes) || maxBytes < 4 || !Number.isInteger(maxLines) || maxLines < 1) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
+		const { maxBytes, maxLines } = clampReadBudget(input, { maxBytes: this.config.defaults.maxResultBytes, maxLines: this.config.defaults.maxResultLines });
 		const view = input.view ?? "content"; const hasHeading = input.headingPath !== undefined; const hasOccurrence = input.occurrence !== undefined; const hasSectionHandle = input.sectionHandle !== undefined; const hasExclusions = input.excludeSections !== undefined;
 		const invalidOption = (option: "includeFrontmatter" | "headingPath" | "occurrence" | "sectionHandle" | "excludeSections" | "includeSemanticRelated"): never => { throw new DatastoreError("INVALID_NOTE_REF", { reason: "OPTION_NOT_ALLOWED", view, option }); };
 		if (view === "section") {
@@ -400,7 +399,8 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		const pageCount = new Set(edges.map((edge) => view === "links" ? edge.target : edge.source)).size;
 		const render = (items: typeof edges) => ({ note: { store: store.name, path }, view, edges: items, pageCount, occurrenceCount: edges.length, returned: items.length, complete: snapshot.complete, revision: snapshot.revision });
 		const page = pageRendered(edges, offset, budget, render);
-		const admitted = await index.admit(store, [{ path, kind: "note" }, ...page.items.flatMap((edge) => edge.targetKind === "note" || edge.targetKind === "attachment" ? [{ path: edge.target, kind: edge.targetKind }] : [])], signal);
+		const subject = { path, kind: view === "backlinks" && !path.endsWith(".md") ? "attachment" as const : "note" as const };
+		const admitted = await index.admit(store, [subject, ...page.items.flatMap((edge) => [{ path: edge.source, kind: "note" as const }, ...(edge.targetKind === "note" || edge.targetKind === "attachment" ? [{ path: edge.target, kind: edge.targetKind }] : [])])], signal);
 		const data = { ...render(page.items), complete: admitted.current };
 		const warnings = admitted.diagnostics.map((message) => ({ code: "STALE_INDEX" as const, message }));
 		return this.envelope("read", store.name, data, started, JSON.stringify(data), page.next !== undefined, page.next === undefined ? undefined : continuationToken(store.name, snapshot.revision, query, page.next, budget), [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: admitted.current ? "current" : "stale" }], warnings) as ReadResult;
