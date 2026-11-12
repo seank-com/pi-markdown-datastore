@@ -119,9 +119,9 @@ export async function listenOwnedSocket(socketPath: string, onConnection: (socke
 	return server;
 }
 
-export function connectSharedSocket(socketPath: string): Promise<Socket> {
+export function connectSharedSocket(socketPath: string, signal?: AbortSignal): Promise<Socket> {
 	return new Promise((resolve, reject) => {
-		const socket = createConnection(socketPath);
+		const socket = createConnection({ path: socketPath, signal });
 		const fail = (error: unknown) => { socket.destroy(); reject(error); };
 		socket.once("error", fail);
 		socket.once("connect", () => { socket.off("error", fail); containSocket(socket); resolve(socket); });
