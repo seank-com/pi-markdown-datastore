@@ -162,8 +162,8 @@ When qmd is available, startup also requeues interrupted qmd jobs and schedules 
 active jobs coalesce; different requests serialize. Cancelling a request waiter
 does not cancel shared maintenance; explicit cancellation owns that decision.
 The latest 20 job records are retained, subject to the active-job bound.
-A backend refresh failure marks the index for rebuild on the next explicit
-refresh: close both public stores, quarantine the entire opaque backend directory,
+A backend refresh failure marks the index for rebuild on the next lexical
+reconciliation: close both public stores, quarantine the entire opaque backend directory,
 and build a fresh index from all configured collections. Successful recovery
 publishes freshness for every collection actually reconciled, not only the
 requested subset; a collection with another outstanding maintenance job remains
@@ -183,7 +183,7 @@ enters the serialized maintenance queue without the automatic batching delay.
 Automatic semantic batching waits five minutes after lexical refresh without postponing the window for later requests. Empty
 or fully embedded ticks do not update. Failed embedding jobs remain failed until
 an explicit retry; there is no automatic infinite retry of a bad document.
-Broader automatic lexical indexing cadence is not enabled.
+The common coordinator checks source inventory every five minutes, reconciles changed metadata first, and then schedules due lexical work. A current graph does not clear failed or pending qmd reconciliation.
 
 ## Shared datastores
 

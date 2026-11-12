@@ -4,7 +4,10 @@ A simple extension for Pi that enables semantic and lexical searching across a f
 Direct content, section and outline reads, exact-path/URI lookup, and status
 work on their own. Wikilink and frontmatter-tag indexing also works without qmd.
 Optional qmd 2.8.3 adds lexical, semantic and hybrid search.
-Telegram and observability are not required. See [setup](docs/setup.md).
+Telegram and observability are not required. The graph/tag JSON index accepts
+incremental changed-path notifications and reconciles filesystem observations
+every five minutes, independently of qmd. Explicit rebuild rereads source;
+ordinary reads do not scan or rebuild the store. See [setup](docs/setup.md).
 
 ## Local quick start
 
