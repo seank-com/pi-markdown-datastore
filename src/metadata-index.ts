@@ -80,25 +80,40 @@ export class MetadataIndex {
 	fileRevision(path: string, snapshot: MetadataSnapshot): string | undefined { return snapshot.files[path]?.revision; }
 	async updatePaths(store: StoreConfig, paths: string[], signal?: AbortSignal): Promise<MetadataSnapshot> {
 		const loaded = await this.load();
-		const files = own(loaded?.files);
-		const diagnostics = [...(loaded?.diagnostics ?? [])].filter((line) => !paths.some((path) => line.startsWith(`${path}:`)));
+		const sameRoot = loaded?.root === store.root && loaded.rootDev === store.rootDev && loaded.rootIno === store.rootIno;
+		if (!loaded || !sameRoot) return this.refresh(store, signal);
+		const files = own<FileRecord>(loaded.files);
+		const targets = copyLists(loaded.targets);
+		const tags = copyLists(loaded.tags);
+		const references = copyLists(loaded.references);
+		const diagnostics = [...loaded.diagnostics];
 		for (const path of paths) {
 			throwIfAborted(signal);
+			const prior = Object.hasOwn(files, path) ? files[path] : undefined;
+			let next: FileRecord | undefined;
+			let replaceDiagnostics = false;
+			let nextDiagnostics: string[] = [];
 			if (!path.endsWith(".md")) {
-				try { const inspected = await safeInspectContainedFile(store, path, signal); files[path] = { kind: "attachment", mtime: inspected.mtime, size: inspected.size }; }
-				catch (error) { if (error instanceof DatastoreError && error.code === "NOTE_NOT_FOUND") delete files[path]; else throw error; }
-				continue;
+				try { const inspected = await safeInspectContainedFile(store, path, signal); next = { kind: "attachment", mtime: inspected.mtime, size: inspected.size }; }
+				catch (error) { if (!(error instanceof DatastoreError) || error.code !== "NOTE_NOT_FOUND") throw error; }
+			} else {
+				try {
+					const opened = await safeOpenNote(store, path, signal);
+					if (prior?.kind === "note" && prior.revision === opened.revision) next = { ...prior, mtime: opened.mtime, size: opened.size };
+					else { const recorded = recordNote(opened); next = recorded.file; replaceDiagnostics = true; nextDiagnostics = recorded.diagnostics; }
+				} catch (error) { if (!(error instanceof DatastoreError) || error.code !== "NOTE_NOT_FOUND") throw error; replaceDiagnostics = true; }
 			}
-			try {
-				const opened = await safeOpenNote(store, path, signal);
-				const prior = files[path];
-				if (prior?.kind === "note" && prior.revision === opened.revision) { files[path] = { ...prior, mtime: opened.mtime, size: opened.size }; continue; }
-				const recorded = recordNote(opened);
-				diagnostics.push(...recorded.diagnostics);
-				files[path] = recorded.file;
-			} catch (error) { if (error instanceof DatastoreError && error.code === "NOTE_NOT_FOUND") delete files[path]; else throw error; }
+			if (replaceDiagnostics) {
+				for (let index = diagnostics.length - 1; index >= 0; index -= 1) if (diagnostics[index].startsWith(`${path}:`)) diagnostics.splice(index, 1);
+				diagnostics.push(...nextDiagnostics);
+			}
+			if (prior?.kind !== next?.kind || prior?.links !== next?.links || prior?.tags !== next?.tags) applyContribution({ targets, tags, references }, path, prior, next);
+			if (next) files[path] = next; else delete files[path];
 		}
-		return this.#publish(store, files, diagnostics);
+		const next = { version: 2 as const, revision: `meta-${randomBytes(16).toString("hex")}`, root: store.root, rootDev: store.rootDev, rootIno: store.rootIno, complete: diagnostics.length === 0, diagnostics, files, targets, tags, references };
+		try { await atomicJson(join(this.root, "index.json"), next); } catch (error) { throw error; }
+		this.#snapshot = next;
+		return next;
 	}
 	async reconcile(store: StoreConfig, signal?: AbortSignal): Promise<MetadataSnapshot> {
 		const snapshot = await this.load();
@@ -181,7 +196,7 @@ function edgesFrom(snapshot: MetadataSnapshot, view: "links" | "backlinks", path
 			if (resolved.target === path && resolved.targetKind !== "unresolved" && resolved.targetKind !== "ambiguous") sources.add(source);
 		}
 	}
-	return [...sources].flatMap((source) => (snapshot.files[source]?.links ?? []).filter((link) => resolveWritten(snapshot, link.target, source).target === path).map((link) => present(source, link)));
+	return [...sources].flatMap((source) => (snapshot.files[source]?.links ?? []).filter((link) => { const resolved = resolveWritten(snapshot, link.target, source); return resolved.target === path && resolved.targetKind !== "unresolved" && resolved.targetKind !== "ambiguous"; }).map((link) => present(source, link)));
 }
 function resolveWritten(snapshot: MetadataSnapshot, written: string, source?: string): Pick<MetadataEdge, "target" | "targetKind"> {
 	if (!written && source) return { target: source, targetKind: "note" };
@@ -192,9 +207,10 @@ function resolveWritten(snapshot: MetadataSnapshot, written: string, source?: st
 		if (snapshot.files[withMd]?.kind === "note") return { target: withMd, targetKind: "note" };
 		return { target: written, targetKind: "unresolved" };
 	}
-	const stem = basename(written, extname(written));
-	let candidates = snapshot.targets[stem] ?? [];
-	if (extname(written)) candidates = candidates.filter((path) => basename(path) === written);
+	const byStem = Object.hasOwn(snapshot.targets, written) ? snapshot.targets[written] : [];
+	const exactStem = extname(written) ? basename(written, extname(written)) : undefined;
+	const byName = exactStem && Object.hasOwn(snapshot.targets, exactStem) ? snapshot.targets[exactStem].filter((path) => basename(path) === written) : [];
+	const candidates = [...new Set([...byStem, ...byName])];
 	if (candidates.length === 1) return { target: candidates[0], targetKind: snapshot.files[candidates[0]]?.kind === "attachment" ? "attachment" : "note" };
 	if (candidates.length > 1) return { target: written, targetKind: "ambiguous" };
 	return { target: written, targetKind: "unresolved" };
@@ -214,6 +230,51 @@ function recordNote(opened: SafeNote): { file: FileRecord; diagnostics: string[]
 	const links = extractWikilinks(opened.text, parsed.frontmatter.endLine ?? 0).map((ref) => ({ target: ref.target, kind: ref.kind, fragment: ref.fragment, suffix: ref.suffix, raw: ref.raw, line: ref.line }));
 	return { file: { kind: "note", mtime: opened.mtime, size: opened.size, revision: opened.revision, links, tags: spellings }, diagnostics };
 }
+function copyLists(source: Record<string, string[]>): Record<string, string[]> {
+	const out = own<string[]>(source);
+	for (const key of Object.keys(out)) out[key] = [...out[key]];
+	return out;
+}
+function drop(map: Record<string, string[]>, key: string, value: string): void {
+	if (!Object.hasOwn(map, key)) return;
+	map[key] = map[key].filter((item) => item !== value);
+	if (!map[key].length) delete map[key];
+}
+function add(map: Record<string, string[]>, key: string, value: string): void {
+	const list = Object.hasOwn(map, key) ? map[key] : [];
+	if (!list.includes(value)) list.push(value);
+	list.sort();
+	map[key] = list;
+}
+function applyContribution(lookups: { targets: Record<string, string[]>; tags: Record<string, string[]>; references: Record<string, string[]> }, path: string, previous: FileRecord | undefined, next: FileRecord | undefined): void {
+	if (previous) {
+		drop(lookups.targets, basename(path, extname(path)), path);
+		if (previous.kind === "note") {
+			for (const spelling of previous.tags ?? []) { const identity = tagIdentity(spelling); if (identity) drop(lookups.tags, identity, path); }
+			for (const link of previous.links ?? []) drop(lookups.references, link.target, path);
+		}
+	}
+	if (next) {
+		add(lookups.targets, basename(path, extname(path)), path);
+		if (next.kind === "note") {
+			for (const spelling of next.tags ?? []) { const identity = tagIdentity(spelling); if (identity) add(lookups.tags, identity, path); }
+			for (const link of next.links ?? []) {
+				add(lookups.references, link.target, path);
+				if (link.target && !link.target.includes("/") && !link.target.includes("\\")) {
+					if (!Object.hasOwn(lookups.targets, link.target)) lookups.targets[link.target] = [];
+					if (extname(link.target) && !Object.hasOwn(lookups.targets, basename(link.target, extname(link.target)))) lookups.targets[basename(link.target, extname(link.target))] = [];
+				}
+			}
+		}
+	}
+	const referenced = new Set<string>();
+	for (const written of Object.keys(lookups.references)) {
+		if (!written || written.includes("/") || written.includes("\\")) continue;
+		referenced.add(written);
+		if (extname(written)) referenced.add(basename(written, extname(written)));
+	}
+	for (const key of Object.keys(lookups.targets)) if (!lookups.targets[key].length && !referenced.has(key)) delete lookups.targets[key];
+}
 function reindex(store: StoreConfig, current: MetadataSnapshot): MetadataSnapshot {
 	const targets = own<string[]>();
 	const tags = own<string[]>();
@@ -225,7 +286,7 @@ function reindex(store: StoreConfig, current: MetadataSnapshot): MetadataSnapsho
 		for (const spelling of file.tags ?? []) { const identity = tagIdentity(spelling); if (identity) add(tags, identity, path); }
 		for (const link of file.links ?? []) {
 			add(references, link.target, path);
-			if (link.target && !link.target.includes("/") && !link.target.includes("\\") && !Object.hasOwn(targets, basename(link.target, extname(link.target)))) targets[basename(link.target, extname(link.target))] = [];
+			if (link.target && !link.target.includes("/") && !link.target.includes("\\")) { if (!Object.hasOwn(targets, link.target)) targets[link.target] = []; if (extname(link.target) && !Object.hasOwn(targets, basename(link.target, extname(link.target)))) targets[basename(link.target, extname(link.target))] = []; }
 		}
 	}
 	for (const list of [targets, tags, references]) for (const key of Object.keys(list)) list[key].sort(); return { ...current, version: 2, revision: `meta-${randomBytes(16).toString("hex")}`, root: store.root, rootDev: store.rootDev, rootIno: store.rootIno, complete: current.diagnostics.length === 0, targets, tags, references };
