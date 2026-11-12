@@ -26,7 +26,7 @@ export function extractWikilinks(text: string, frontmatterEndLine = 0): WikiRefe
 	for (let index = 0; index < frontmatterEndLine; index += 1) skip.add(index);
 	const refs: WikiReference[] = [];
 	for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
-		if (skip.has(lineIndex)) continue;
+		if (skip.has(lineIndex) || /^(?: {4,}|\t)/.test(lines[lineIndex])) continue;
 		const line = lines[lineIndex];
 		let index = 0;
 		let inline = false;

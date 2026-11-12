@@ -13,6 +13,7 @@ test("raw wikilinks ignore escapes, code and ordinary markdown", () => {
 		"[[inside-fence]]",
 		"```",
 		"[page](notes/page.md)",
+		"    [[indented-code]]",
 		"[[page#Heading]]",
 	].join("\n");
 	const refs = extractWikilinks(text, 3);
