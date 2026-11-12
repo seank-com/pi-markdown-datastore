@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, copyFile, lstat, mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -24,7 +24,11 @@ async function atomicJson(path: string, value: unknown): Promise<void> {
 }
 
 /** Existing queue, receipt file, coalescing and cancellation. Backends register runners; they do not keep another queue. */
-export async function adoptLegacyApplicationJobs(stateRoot: string, stablePath: string, knownStores: ReadonlySet<string>, expectedDirectory: (version: string) => string): Promise<void> {
+export function sourceDefinition(stores: { name: string; root: string; rootDev: number; rootIno: number; include: readonly string[]; exclude: readonly string[]; maxFileBytes: number }[]): string {
+	return createHash("sha256").update(JSON.stringify([...stores].sort((left, right) => left.name.localeCompare(right.name)).map((store) => ({ name: store.name, root: store.root, rootDev: store.rootDev, rootIno: store.rootIno, include: [...store.include], exclude: [...store.exclude], maxFileBytes: store.maxFileBytes })))).digest("hex");
+}
+
+export async function adoptLegacyApplicationJobs(stateRoot: string, stablePath: string, knownStores: ReadonlySet<string>, expectedDirectory: (version: string) => string, definition?: string): Promise<void> {
 	try { await lstat(stablePath); return; } catch (error: any) { if (error?.code !== "ENOENT") throw error; }
 	const names = await readdir(stateRoot).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return []; throw error; });
 	const matches: { directory: string; path: string }[] = [];
@@ -49,7 +53,7 @@ export async function adoptLegacyApplicationJobs(stateRoot: string, stablePath: 
 		const temp = `${stablePath}.adopting-${randomBytes(8).toString("hex")}`;
 		await copyFile(matches[0].path, temp);
 		const probe = new MaintenanceCoordinator(temp, () => knownStores);
-		try { await probe.ensureLoaded(); probe.shutdown(); await rename(temp, stablePath); }
+		try { await probe.ensureLoaded(); if (definition) await probe.stampMissingDefinition(definition); probe.shutdown(); await rename(temp, stablePath); }
 		catch (error) { probe.shutdown(); await rm(temp, { force: true }).catch(() => undefined); throw error; }
 	} finally { await lease.release(); }
 }
@@ -67,7 +71,8 @@ export class MaintenanceCoordinator {
 	#explicitCancel = new Set<string>();
 	readonly jobsPath: string;
 	readonly knownStores: () => ReadonlySet<string>;
-	constructor(jobsPath: string, knownStores: () => ReadonlySet<string>) { this.jobsPath = jobsPath; this.knownStores = knownStores; }
+	readonly definitionFor?: (stores: string[]) => string;
+	constructor(jobsPath: string, knownStores: () => ReadonlySet<string>, definitionFor?: (stores: string[]) => string) { this.jobsPath = jobsPath; this.knownStores = knownStores; this.definitionFor = definitionFor; }
 	register(mode: Mode, runner: MaintenanceRunner): void { this.#runners.set(mode, runner); }
 	jobs(): QmdRefreshJob[] { return [...this.#jobs.values()].sort((left, right) => right.createdAt.localeCompare(left.createdAt)).map((job) => structuredClone(job)); }
 	get(refreshId: string): QmdRefreshJob | undefined { return this.#jobs.get(refreshId); }
@@ -90,7 +95,7 @@ export class MaintenanceCoordinator {
 		if (raw?.version !== 1 || !Array.isArray(raw.jobs) || raw.jobs.length > TERMINAL_JOB_LIMIT) throw new DatastoreError("INDEX_CORRUPT");
 		for (const value of raw.jobs) {
 			const jobRaw = value as Record<string, unknown>;
-			const allowed = ["version", "refreshId", "key", "mode", "stores", "ownership", "state", "phase", "createdAt", "updatedAt", "completedAt", "generation", "errorCode", "progress"];
+			const allowed = ["version", "refreshId", "key", "mode", "stores", "ownership", "state", "phase", "createdAt", "updatedAt", "completedAt", "generation", "errorCode", "definition", "progress"];
 			if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(jobRaw).some((key) => !allowed.includes(key)) || jobRaw.version !== 1 || typeof jobRaw.refreshId !== "string" || !/^[0-9a-f]{32}$/.test(jobRaw.refreshId) || !["lexical", "semantic", "metadata"].includes(String(jobRaw.mode)) || !Array.isArray(jobRaw.stores) || jobRaw.stores.some((name) => typeof name !== "string" || !this.knownStores().has(name)) || new Set(jobRaw.stores as string[]).size !== jobRaw.stores.length || !["startup-reconciliation", "explicit-maintenance"].includes(String(jobRaw.ownership)) || !["queued", "running", "succeeded", "failed", "cancelled"].includes(String(jobRaw.state)) || !["queued", "scanning", "updating", "embedding", "validating", "promoting", "succeeded", "failed", "cancelled"].includes(String(jobRaw.phase)) || typeof jobRaw.createdAt !== "string" || typeof jobRaw.updatedAt !== "string") throw new DatastoreError("INDEX_CORRUPT");
 			const stores = [...jobRaw.stores as string[]].sort();
 			const mode = String(jobRaw.mode) as Mode;
@@ -99,11 +104,12 @@ export class MaintenanceCoordinator {
 			if (jobRaw.errorCode !== undefined && (typeof jobRaw.errorCode !== "string" || !/^[A-Z_]{3,64}$/.test(jobRaw.errorCode))) throw new DatastoreError("INDEX_CORRUPT");
 			const generationPattern = mode === "metadata" ? /^(?:gen|meta)-[0-9a-f]{32}$/ : /^gen-[0-9a-f]{32}$/;
 			if (jobRaw.generation !== undefined && (typeof jobRaw.generation !== "string" || !generationPattern.test(jobRaw.generation))) throw new DatastoreError("INDEX_CORRUPT");
+			if (jobRaw.definition !== undefined && (typeof jobRaw.definition !== "string" || !/^[0-9a-f]{64}$/.test(jobRaw.definition))) throw new DatastoreError("INDEX_CORRUPT");
 			const progressRaw = jobRaw.progress as Record<string, unknown>;
 			const progressAllowed = ["documentsCompleted", "documentsTotal", "sourceBytesCompleted", "sourceBytesTotal", "chunksCompleted", "chunksTotal", "embeddingBytesCompleted", "embeddingBytesTotal", "errors"];
 			if (!progressRaw || typeof progressRaw !== "object" || Array.isArray(progressRaw) || Object.keys(progressRaw).some((field) => !progressAllowed.includes(field))) throw new DatastoreError("INDEX_CORRUPT");
 			for (const field of progressAllowed) if (progressRaw[field] !== undefined && (!Number.isSafeInteger(progressRaw[field]) || (progressRaw[field] as number) < 0)) throw new DatastoreError("INDEX_CORRUPT");
-			const job: QmdRefreshJob = { version: 1, refreshId: jobRaw.refreshId, key: jobRaw.key, mode, stores, ownership: jobRaw.ownership as QmdRefreshJob["ownership"], state: jobRaw.state as QmdRefreshJob["state"], phase: jobRaw.phase as QmdRefreshPhase, createdAt: jobRaw.createdAt, updatedAt: jobRaw.updatedAt, completedAt: typeof jobRaw.completedAt === "string" ? jobRaw.completedAt : undefined, generation: typeof jobRaw.generation === "string" ? jobRaw.generation : undefined, errorCode: typeof jobRaw.errorCode === "string" ? jobRaw.errorCode : undefined, progress: { documentsCompleted: Number(progressRaw.documentsCompleted ?? 0), documentsTotal: progressRaw.documentsTotal as number | undefined, sourceBytesCompleted: Number(progressRaw.sourceBytesCompleted ?? 0), sourceBytesTotal: progressRaw.sourceBytesTotal as number | undefined, chunksCompleted: Number(progressRaw.chunksCompleted ?? 0), chunksTotal: progressRaw.chunksTotal as number | undefined, embeddingBytesCompleted: Number(progressRaw.embeddingBytesCompleted ?? 0), embeddingBytesTotal: progressRaw.embeddingBytesTotal as number | undefined, errors: Number(progressRaw.errors ?? 0) } };
+			const job: QmdRefreshJob = { version: 1, refreshId: jobRaw.refreshId, key: jobRaw.key, mode, stores, ownership: jobRaw.ownership as QmdRefreshJob["ownership"], state: jobRaw.state as QmdRefreshJob["state"], phase: jobRaw.phase as QmdRefreshPhase, createdAt: jobRaw.createdAt, updatedAt: jobRaw.updatedAt, completedAt: typeof jobRaw.completedAt === "string" ? jobRaw.completedAt : undefined, generation: typeof jobRaw.generation === "string" ? jobRaw.generation : undefined, errorCode: typeof jobRaw.errorCode === "string" ? jobRaw.errorCode : undefined, definition: typeof jobRaw.definition === "string" ? jobRaw.definition : undefined, progress: { documentsCompleted: Number(progressRaw.documentsCompleted ?? 0), documentsTotal: progressRaw.documentsTotal as number | undefined, sourceBytesCompleted: Number(progressRaw.sourceBytesCompleted ?? 0), sourceBytesTotal: progressRaw.sourceBytesTotal as number | undefined, chunksCompleted: Number(progressRaw.chunksCompleted ?? 0), chunksTotal: progressRaw.chunksTotal as number | undefined, embeddingBytesCompleted: Number(progressRaw.embeddingBytesCompleted ?? 0), embeddingBytesTotal: progressRaw.embeddingBytesTotal as number | undefined, errors: Number(progressRaw.errors ?? 0) } };
 			if (job.state === "queued" || job.state === "running") { job.state = "queued"; job.phase = "queued"; delete job.errorCode; delete job.completedAt; job.updatedAt = new Date().toISOString(); }
 			this.#jobs.set(job.refreshId, job);
 		}
@@ -117,18 +123,18 @@ export class MaintenanceCoordinator {
 		this.#persistTail = write;
 		return write;
 	}
-	async enqueue(mode: Mode, stores: string[], ownership: QmdRefreshJob["ownership"]): Promise<Record<string, unknown>> {
+	async enqueue(mode: Mode, stores: string[], ownership: QmdRefreshJob["ownership"], definition?: string): Promise<Record<string, unknown>> {
 		if (this.#closed) throw new DatastoreError("CANCELLED");
 		await this.ensureLoaded();
 		const ordered = [...stores].sort();
 		const key = `${mode}:${ordered.join(",")}`;
-		const existing = [...this.#jobs.values()].find((job) => job.key === key && (job.state === "queued" || job.state === "running"));
+		const existing = [...this.#jobs.values()].find((job) => job.key === key && (job.state === "queued" || job.state === "running") && job.definition === definition);
 		if (existing) { this.launch(existing); return { ...structuredClone(existing), coalesced: true }; }
 		const terminal = this.jobs().filter((item) => !["queued", "running"].includes(item.state));
 		while (this.#jobs.size + 1 > TERMINAL_JOB_LIMIT && terminal.length) this.#jobs.delete(terminal.shift()!.refreshId);
 		if (this.#jobs.size + 1 > TERMINAL_JOB_LIMIT) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
 		const now = new Date().toISOString();
-		const job: QmdRefreshJob = { version: 1, refreshId: randomBytes(16).toString("hex"), key, mode, stores: ordered, ownership, state: "queued", phase: "queued", createdAt: now, updatedAt: now, progress: { documentsCompleted: 0, sourceBytesCompleted: 0, chunksCompleted: 0, embeddingBytesCompleted: 0, errors: 0 } };
+		const job: QmdRefreshJob = { version: 1, refreshId: randomBytes(16).toString("hex"), key, mode, stores: ordered, ownership, definition, state: "queued", phase: "queued", createdAt: now, updatedAt: now, progress: { documentsCompleted: 0, sourceBytesCompleted: 0, chunksCompleted: 0, embeddingBytesCompleted: 0, errors: 0 } };
 		this.#jobs.set(job.refreshId, job);
 		try { await this.persist(); } catch (error) { this.#jobs.delete(job.refreshId); throw error; }
 		this.launch(job);
@@ -137,6 +143,7 @@ export class MaintenanceCoordinator {
 	relaunchQueued(): void { for (const job of this.#jobs.values()) if (job.state === "queued") this.launch(job); }
 	private launch(job: QmdRefreshJob): void {
 		if (this.#closed || this.#controllers.has(job.refreshId) || job.state !== "queued") return;
+		if (this.definitionFor && job.definition !== this.definitionFor(job.stores)) return;
 		const mode = job.mode;
 		const runner = this.#runners.get(mode);
 		if (!runner) return;
@@ -177,6 +184,13 @@ export class MaintenanceCoordinator {
 		controller?.abort(new DatastoreError("CANCELLED"));
 		if (job.state === "queued") { job.state = "cancelled"; job.phase = "cancelled"; job.errorCode = "CANCELLED"; job.updatedAt = new Date().toISOString(); job.completedAt = job.updatedAt; await this.persist(); }
 		return { ...structuredClone(job), cancellationRequested: controller !== undefined || job.state === "cancelled" };
+	}
+	async stampMissingDefinition(identity: string): Promise<void> {
+		for (const job of this.#jobs.values()) {
+			if (job.definition && job.definition !== identity) throw new DatastoreError("INDEX_CORRUPT");
+			job.definition = identity;
+		}
+		await this.persist();
 	}
 	async settled(): Promise<void> { await this.#tail.catch(() => undefined); await this.#persistTail.catch(() => undefined); }
 	shutdown(): void { this.#hostClosing = true; this.#closed = true; for (const controller of this.#controllers.values()) controller.abort(new DatastoreError("CANCELLED")); }

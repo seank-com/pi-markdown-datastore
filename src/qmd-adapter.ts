@@ -10,7 +10,7 @@ import { HARD_MAX_CANDIDATES } from "./config.ts";
 import { validateRelativeNotePath, walkSafeNoteMetadata } from "./containment.ts";
 import { abortError, DatastoreError, throwIfAborted } from "./errors.ts";
 import { QmdWorkerClient, type QmdWorkerProgress, type QmdWorkerRequest } from "./qmd-worker-client.ts";
-import { MaintenanceCoordinator } from "./maintenance-coordinator.ts";
+import { MaintenanceCoordinator, sourceDefinition } from "./maintenance-coordinator.ts";
 import { acquireIndexOwnership, type IndexOwnership } from "./index-ownership.ts";
 
 const TESTED_QMD_VERSIONS = new Set(["2.8.3"]);
@@ -27,7 +27,7 @@ export type QmdRefreshPhase = "queued" | "scanning" | "updating" | "embedding" |
 export interface QmdRefreshJob {
 	version: 1; refreshId: string; key: string; mode: "lexical" | "semantic" | "metadata"; stores: string[]; ownership: "startup-reconciliation" | "explicit-maintenance";
 	state: "queued" | "running" | "succeeded" | "failed" | "cancelled"; phase: QmdRefreshPhase;
-	createdAt: string; updatedAt: string; completedAt?: string; generation?: string; errorCode?: string;
+	createdAt: string; updatedAt: string; completedAt?: string; generation?: string; errorCode?: string; definition?: string;
 	progress: { documentsCompleted: number; documentsTotal?: number; sourceBytesCompleted: number; sourceBytesTotal?: number; chunksCompleted: number; chunksTotal?: number; embeddingBytesCompleted: number; embeddingBytesTotal?: number; errors: number };
 }
 
@@ -214,7 +214,7 @@ export class QmdAdapter {
 	private async startRefreshJob(stores: StoreConfig[], mode: "lexical" | "semantic", ownership: QmdRefreshJob["ownership"]): Promise<Record<string, unknown>> {
 		if (this.#closed) throw new DatastoreError("CANCELLED"); await this.validateBinding(); if (this.#closed) throw new DatastoreError("CANCELLED"); await this.ensureJobs(); if (this.#closed) throw new DatastoreError("CANCELLED");
 		for (const store of stores) this.#runtimeLexicalCurrent.delete(store.name);
-		return this.#coordinator.enqueue(mode, stores.map((store) => store.name), ownership);
+		return this.#coordinator.enqueue(mode, stores.map((store) => store.name), ownership, sourceDefinition(stores));
 	}
 	async cancelRefresh(refreshId: string): Promise<Record<string, unknown>> {
 		await this.ensureJobs(); return this.#coordinator.cancel(refreshId);

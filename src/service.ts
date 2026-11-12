@@ -13,6 +13,7 @@ import type { QmdAdapter, QmdCandidate } from "./qmd-adapter.ts";
 import { SharedIndexClient } from "./shared-client.ts";
 import type { MaintenanceCoordinator } from "./maintenance-coordinator.ts";
 import type { IndexOwnership } from "./index-ownership.ts";
+import { sourceDefinition } from "./maintenance-coordinator.ts";
 import { continuationOffset, continuationToken, pageRendered, readPageToken, tagCandidate, type MetadataIndex } from "./metadata-index.ts";
 import { tagIdentity } from "./wiki.ts";
 
@@ -331,7 +332,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 			const local = stores.filter((store) => !store.shared).map((store) => store.name);
 			const shared = stores.filter((store) => store.shared);
 			if (!local.length && !shared.length) throw new DatastoreError("STORE_UNKNOWN");
-			const receipt = local.length ? await this.maintenance?.enqueue("metadata", local, "explicit-maintenance") : undefined;
+			const receipt = local.length ? await this.maintenance?.enqueue("metadata", local, "explicit-maintenance", sourceDefinition(local.map((name) => this.store(name)))) : undefined;
 			if (local.length && !receipt) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
 			const sharedReceipts = [];
 			for (const store of shared) {

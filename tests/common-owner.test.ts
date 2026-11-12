@@ -7,7 +7,7 @@ import test from "node:test";
 import { acquireIndexOwnership } from "../src/index-ownership.ts";
 import { queryMarkdownDatastoreCapability } from "../src/client.ts";
 import { createMarkdownDatastoreExtension } from "../src/index.ts";
-import { adoptLegacyApplicationJobs, MaintenanceCoordinator } from "../src/maintenance-coordinator.ts";
+import { adoptLegacyApplicationJobs, MaintenanceCoordinator, sourceDefinition } from "../src/maintenance-coordinator.ts";
 import { prepareQmdStateDirectory, qmdApplicationDirectory } from "../src/qmd-adapter.ts";
 
 function harness(project: string) {
@@ -218,4 +218,30 @@ test("a superseded initializer does not relaunch accepted work", async (t) => {
 	await app.fire("session_start");
 	assert.equal(queryMarkdownDatastoreCapability(app.pi.events)?.ready, true);
 	await app.fire("session_shutdown");
+});
+
+test("a changed source definition does not rerun or coalesce an accepted job", async () => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-retarget-")));
+	const jobs = join(root, "jobs.json");
+	const store = (path: string) => ({ name: "memory", root: path, rootDev: 1, rootIno: path.endsWith("a") ? 1 : 2, include: ["**/*.md"], exclude: [], maxFileBytes: 4096 });
+	const first = new MaintenanceCoordinator(jobs, () => new Set(["memory"]), () => sourceDefinition([store(join(root, "a"))]));
+	let started = 0;
+	let holding!: () => void;
+	const held = new Promise<void>((resolve) => { holding = resolve; });
+	first.register("metadata", async (_job, signal) => { started += 1; holding(); await new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })); return { generation: "meta-" + "ab".repeat(16) }; });
+	const receipt = await first.enqueue("metadata", ["memory"], "explicit-maintenance", sourceDefinition([store(join(root, "a"))]));
+	await held;
+	first.shutdown();
+	await first.settled();
+	const second = new MaintenanceCoordinator(jobs, () => new Set(["memory"]), () => sourceDefinition([store(join(root, "b"))]));
+	second.register("metadata", async () => { started += 1; return { generation: "meta-" + "cd".repeat(16) }; });
+	await second.ensureLoaded();
+	second.relaunchQueued();
+	await second.settled();
+	assert.equal(second.get(String(receipt.refreshId))?.state, "queued");
+	const again = await second.enqueue("metadata", ["memory"], "explicit-maintenance", sourceDefinition([store(join(root, "b"))]));
+	assert.notEqual(again.refreshId, receipt.refreshId);
+	assert.equal(started, 1);
+	second.shutdown();
+	await rm(root, { recursive: true, force: true });
 });

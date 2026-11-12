@@ -51,12 +51,16 @@ async function fixture(t: import("node:test").TestContext) {
 		const cancel = () => finish(new Error("Fixture observer cancelled at teardown"));
 		observers.add(cancel); watcher.on("error", finish); void check();
 	});
-	const job = (adapter: QmdAdapter, id: string) => observe(dirname(adapter.coordinator.jobsPath), async () => {
-		if (!await present(adapter.coordinator.jobsPath)) return undefined;
-		const persisted = JSON.parse(await readFile(adapter.coordinator.jobsPath, "utf8")) as { jobs: QmdRefreshJob[] };
-		const value = persisted.jobs.find(item => item.refreshId === id);
-		return value && ["succeeded", "failed", "cancelled"].includes(value.state) ? value : undefined;
-	});
+	const job = (adapter: QmdAdapter, id: string) => {
+		const read = async () => {
+			const live = adapter.coordinator.get(id);
+			if (live && ["succeeded", "failed", "cancelled"].includes(live.state)) return live;
+			if (!await present(adapter.coordinator.jobsPath)) return undefined;
+			const persisted = JSON.parse(await readFile(adapter.coordinator.jobsPath, "utf8")) as { jobs: QmdRefreshJob[] };
+			return persisted.jobs.find(item => item.refreshId === id && ["succeeded", "failed", "cancelled"].includes(item.state));
+		};
+		return Promise.race([observe(dirname(adapter.coordinator.jobsPath), read), observe(adapter.root, read)]);
+	};
 	const entered = (adapter: QmdAdapter, name: string, id?: string) => observe(adapter.root, async () => {
 		if (await present(join(adapter.root, name + ".entered"))) return true;
 		const state = id && adapter.activity().jobs.find(item => item.refreshId === id);

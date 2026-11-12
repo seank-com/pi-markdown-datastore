@@ -2,7 +2,7 @@ import type { Server, Socket } from "node:net";
 import { join } from "node:path";
 import { discoverQmdBinding, prepareQmdStateDirectory, qmdApplicationDirectory, QmdAdapter } from "./qmd-adapter.ts";
 import { acquireIndexOwnership, type IndexOwnership } from "./index-ownership.ts";
-import { adoptLegacyApplicationJobs, MaintenanceCoordinator } from "./maintenance-coordinator.ts";
+import { adoptLegacyApplicationJobs, MaintenanceCoordinator, sourceDefinition } from "./maintenance-coordinator.ts";
 import { MetadataIndex, registerMetadata, pageRendered, continuationOffset, continuationToken, tagCandidate } from "./metadata-index.ts";
 import { clampReadBudget, type MarkdownDatastoreConfig, type StoreConfig } from "./config.ts";
 import { DatastoreError } from "./errors.ts";
@@ -58,8 +58,8 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 			const stateDirectory = `${catalog.stateRoot}/${definition.id}`;
 			await prepareQmdStateDirectory(stateDirectory);
 			ownerships.set(definition.id, await acquireIndexOwnership(stateDirectory));
-			await adoptLegacyApplicationJobs(stateDirectory, `${stateDirectory}/jobs.json`, new Set([definition.id]), (version) => qmdApplicationDirectory(config, version));
-			coordinator = new MaintenanceCoordinator(`${stateDirectory}/jobs.json`, () => new Set([definition.id]));
+			await adoptLegacyApplicationJobs(stateDirectory, `${stateDirectory}/jobs.json`, new Set([definition.id]), (version) => qmdApplicationDirectory(config, version), sourceDefinition([...config.stores.values()]));
+			coordinator = new MaintenanceCoordinator(`${stateDirectory}/jobs.json`, () => new Set([definition.id]), (names) => sourceDefinition(names.map((name) => config.stores.get(name)!)));
 			if (config.qmd.enabled) {
 				try {
 					const adapter = new QmdAdapter(config, await discoverQmdBinding(config), coordinator);
@@ -107,7 +107,7 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 			try {
 				const store = adapter?.config.stores.get(message.store);
 				let result: unknown;
-				if (call.operation === "startMetadata") result = await coordinator.enqueue("metadata", [message.store], "explicit-maintenance");
+				if (call.operation === "startMetadata") result = await coordinator.enqueue("metadata", [message.store], "explicit-maintenance", sourceDefinition([storeConfig(catalog, definition).stores.get(message.store)!]));
 				else if (call.operation === "links" || call.operation === "backlinks" || call.operation === "tagPages" || call.operation === "tags") {
 					const store = storeConfig(catalog, definition).stores.get(message.store);
 					if (!store) throw new DatastoreError("STORE_UNAVAILABLE");
