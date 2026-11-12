@@ -110,11 +110,11 @@ export async function startSharedHost(catalogPath: string, options: { schedule?:
 				const store = adapter?.config.stores.get(message.store);
 				let result: unknown;
 				if (call.operation === "startMetadata") {
-					if (call.input?.paths !== undefined && (!Array.isArray(call.input.paths) || call.input.paths.some((path) => typeof path !== "string"))) throw new DatastoreError("INVALID_NOTE_REF");
+					if (call.input?.paths !== undefined && (!Array.isArray(call.input.paths) || call.input.paths.length === 0 || call.input.paths.some((path) => typeof path !== "string"))) throw new DatastoreError("INVALID_NOTE_REF");
 					const paths = Array.isArray(call.input?.paths) ? call.input.paths.map((path) => validateRelativeContainedPath(path as string)) : [];
 					if (call.input?.rebuild === true && paths.length) throw new DatastoreError("INVALID_NOTE_REF");
 					if (paths.length) coordinator.notePaths(message.store, paths);
-					result = await coordinator.enqueue("metadata", [message.store], "explicit-maintenance", sourceDefinition([storeConfig(catalog, definition).stores.get(message.store)!]), call.input?.rebuild === true ? "rebuild" : undefined);
+					result = await coordinator.enqueue("metadata", [message.store], "explicit-maintenance", sourceDefinition([storeConfig(catalog, definition).stores.get(message.store)!]), call.input?.rebuild === true || call.input?.paths === undefined ? "rebuild" : undefined);
 				}
 				else if (call.operation === "links" || call.operation === "backlinks" || call.operation === "tagPages" || call.operation === "tags") {
 					const store = storeConfig(catalog, definition).stores.get(message.store);

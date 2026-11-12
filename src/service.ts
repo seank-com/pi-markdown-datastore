@@ -323,6 +323,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 	}
 
 	private async refreshInner(input: RefreshInput, signal: AbortSignal): Promise<RefreshResult> {
+		if ("paths" in input && (input.action === "cancel" || input.mode !== "metadata")) throw new DatastoreError("INVALID_NOTE_REF");
 		const started = Date.now(); throwIfAborted(signal);
 		if (input.action === "cancel") {
 			const qmd = await this.cancelRefresh(input.refreshId, signal); const data = { action: "cancel", qmd, durationMs: elapsed(started) }; return this.envelope("refresh", "*", data, started, JSON.stringify(data), false, undefined, [], [], undefined, 1) as RefreshResult;
@@ -335,13 +336,13 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 			if (mode === "metadata" && input.paths?.length) for (const name of local) this.maintenance?.notePaths(name, input.paths);
 			const shared = stores.filter((store) => store.shared);
 			if (!local.length && !shared.length) throw new DatastoreError("STORE_UNKNOWN");
-			const receipt = local.length ? await this.maintenance?.enqueue("metadata", local, "explicit-maintenance", sourceDefinition(local.map((name) => this.store(name))), mode === "rebuild" ? "rebuild" : undefined) : undefined;
+			const receipt = local.length ? await this.maintenance?.enqueue("metadata", local, "explicit-maintenance", sourceDefinition(local.map((name) => this.store(name))), mode === "rebuild" || input.paths === undefined ? "rebuild" : undefined) : undefined;
 			if (local.length && !receipt) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
 			const sharedReceipts = [];
 			for (const store of shared) {
 				const client = this.sharedClients?.get(store.name);
 				if (!client) throw new DatastoreError("STORE_UNAVAILABLE");
-				sharedReceipts.push(await client.startMetadata(signal, mode === "metadata" ? input.paths : undefined, mode === "rebuild"));
+				sharedReceipts.push(await client.startMetadata(signal, mode === "metadata" ? input.paths : undefined, mode === "rebuild" || input.paths === undefined));
 			}
 			const data = { action: "start", mode, qmd: receipt ?? sharedReceipts[0], shared: sharedReceipts, backgroundOwnership: "explicit-maintenance", durationMs: elapsed(started) };
 			return this.envelope("refresh", input.store ?? "*", data, started, JSON.stringify(data), false, undefined, [], [], undefined, 1) as RefreshResult;

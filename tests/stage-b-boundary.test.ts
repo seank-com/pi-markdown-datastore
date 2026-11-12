@@ -7,8 +7,10 @@ import { loadMarkdownDatastoreConfig } from "../src/config.ts";
 import { MaintenanceCoordinator } from "../src/maintenance-coordinator.ts";
 import { MetadataIndex, reconcileChanged, registerMetadata } from "../src/metadata-index.ts";
 import { MarkdownDatastoreService } from "../src/service.ts";
+import type { RefreshInput } from "../src/contract.ts";
 import { startSharedHost } from "../src/shared-host.ts";
 import { loadSharedCatalog } from "../src/shared-catalog.ts";
+import { SharedIndexClient } from "../src/shared-client.ts";
 
 async function store() {
 	const root = await realpath(await mkdtemp(join(tmpdir(), "stage-b-")));
@@ -143,7 +145,8 @@ test("a shared owner runs the injected clock and graph work before qmd", async (
 	await writeFile(catalogPath, JSON.stringify({ schemaVersion: 1, socketPath: join(socketDir, "s.sock"), stateRoot: state, defaults: { maxResultBytes: 8192, maxResultLines: 100, operationTimeoutMs: 3000 }, qmd: { enabled: false, installation: { executable: "qmd" }, minimumVersion: "2.8.3" }, stores: { notebook: { root: notes, include: ["**/*.md"], exclude: [], maxFileBytes: 4096, search: { defaultMode: "lexical", qmdCollection: "notebook" } } } }), { mode: 0o600 });
 	let callback: (() => void) | undefined;
 	const host = await startSharedHost(catalogPath, { schedule: ((stored: () => void) => { callback = stored; return { unref() {}, ref() {} } as ReturnType<typeof setTimeout>; }) as typeof setTimeout });
-	t.after(async () => { await host.close(); await rm(root, { recursive: true, force: true }); });
+	let client: SharedIndexClient | undefined;
+	t.after(async () => { client?.close(); await host.close(); await rm(root, { recursive: true, force: true }); });
 	const coordinator = host.coordinators.get("notebook")!;
 	let sawMetadata = false;
 	coordinator.register("lexical", async () => { sawMetadata = coordinator.jobs().some((job) => job.mode === "metadata" && job.state === "succeeded"); });
@@ -153,6 +156,8 @@ test("a shared owner runs the injected clock and graph work before qmd", async (
 	assert.equal(sawMetadata, true);
 	const catalog = await loadSharedCatalog(catalogPath);
 	assert.equal(catalog.stores.has("notebook"), true);
+	client = new SharedIndexClient({ socketPath: catalog.socketPath, store: "notebook", definitionRevision: catalog.stores.get("notebook")!.definitionRevision });
+	await assert.rejects(client.startMetadata(undefined, []), { code: "INVALID_NOTE_REF" });
 });
 
 test("bad paths are rejected and a late path gets the follow-up receipt", async (t) => {
@@ -176,4 +181,33 @@ test("bad paths are rejected and a late path gets the follow-up receipt", async 
 	assert.notEqual(followed.data.qmd.refreshId, first.data.qmd.refreshId);
 	await coordinator.persisted(String(followed.data.qmd.refreshId));
 	assert.equal(coordinator.get(String(followed.data.qmd.refreshId))?.state, "succeeded");
+});
+
+test("public paths are metadata-start-only and a pathless metadata request retains full intent", async (t) => {
+	const fixture = await store();
+	const coordinator = new MaintenanceCoordinator(join(fixture.state, "jobs.json"), () => new Set(["notes"]));
+	const service = new MarkdownDatastoreService(fixture.config);
+	service.bindMetadata(coordinator, new Map([["notes", new MetadataIndex(fixture.state)]]));
+	let release!: () => void;
+	let entered!: () => void;
+	const held = new Promise<void>((resolve) => { release = resolve; });
+	const started = new Promise<void>((resolve) => { entered = resolve; });
+	t.after(async () => { release(); await service.shutdown(); await rm(fixture.root, { recursive: true, force: true }); });
+	for (const input of [
+		{ mode: "lexical", paths: ["a.md"] },
+		{ action: "cancel", refreshId: "a".repeat(32), paths: ["a.md"] },
+		{ mode: "rebuild", paths: ["a.md"] },
+		{ mode: "metadata", paths: [] },
+	]) await assert.rejects(service.refresh(input as RefreshInput), { code: "INVALID_NOTE_REF" });
+	coordinator.register("metadata", async (job) => {
+		if (!job.intent) { entered(); await held; }
+		return { generation: `meta-${"a".repeat(32)}` };
+	});
+	const partial = await service.refresh({ store: "notes", mode: "metadata", paths: ["a.md"] });
+	await started;
+	const full = await service.refresh({ store: "notes", mode: "metadata" });
+	assert.notEqual(full.data.qmd.refreshId, partial.data.qmd.refreshId);
+	assert.equal(coordinator.get(String(full.data.qmd.refreshId))?.intent, "rebuild");
+	release();
+	await coordinator.settled();
 });

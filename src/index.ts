@@ -68,13 +68,13 @@ const Schemas = {
 			action: { type: "string", enum: ["start", "cancel"], description: "Start derived-state maintenance, or cancel one lexical or semantic job." },
 			store: { type: "string", description: "Configured store to refresh. Valid only for start; omit to refresh all stores." },
 			mode: { type: "string", enum: ["direct", "lexical", "semantic", "all", "metadata", "rebuild"], description: "Derived state to refresh. metadata accepts paths. rebuild rereads the store and ignores stored timestamps. Valid only for start." },
-			paths: { type: "array", items: { type: "string", minLength: 1 }, description: "Relative paths changed by a publication. Valid only for metadata start. Invalid paths are rejected and do not become a rebuild." },
+			paths: { type: "array", minItems: 1, items: { type: "string", minLength: 1 }, description: "Relative paths changed by a publication. Valid only for metadata start. Invalid paths are rejected and do not become a rebuild." },
 			refreshId: { type: "string", pattern: "^[0-9a-f]{32}$", description: "Lexical or semantic job ID returned by a prior start. Required only for cancel." },
 		},
 		additionalProperties: false,
 		anyOf: [
-			{ type: "object", properties: { action: { type: "string", enum: ["start"] } }, not: { type: "object", required: ["refreshId"] } },
-			{ type: "object", required: ["action", "refreshId"], properties: { action: { type: "string", enum: ["cancel"] } }, not: { type: "object", anyOf: [{ type: "object", required: ["store"] }, { type: "object", required: ["mode"] }] } },
+			{ type: "object", properties: { action: { type: "string", enum: ["start"] } }, not: { type: "object", required: ["refreshId"] }, anyOf: [{ type: "object", not: { type: "object", required: ["paths"] } }, { type: "object", required: ["mode"], properties: { mode: { type: "string", enum: ["metadata"] } } }] },
+			{ type: "object", required: ["action", "refreshId"], properties: { action: { type: "string", enum: ["cancel"] } }, not: { type: "object", anyOf: [{ type: "object", required: ["store"] }, { type: "object", required: ["mode"] }, { type: "object", required: ["paths"] }] } },
 		],
 	}),
 };
