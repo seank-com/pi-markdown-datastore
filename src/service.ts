@@ -13,7 +13,7 @@ import type { QmdAdapter, QmdCandidate } from "./qmd-adapter.ts";
 import { SharedIndexClient } from "./shared-client.ts";
 import type { MaintenanceCoordinator } from "./maintenance-coordinator.ts";
 import type { IndexOwnership } from "./index-ownership.ts";
-import { continuationOffset, continuationToken, pageRendered, readPageToken, type MetadataIndex } from "./metadata-index.ts";
+import { continuationOffset, continuationToken, pageRendered, readPageToken, tagCandidate, type MetadataIndex } from "./metadata-index.ts";
 
 function elapsed(started: number): number { return Math.max(0, Date.now() - started); }
 function propagateControlError(error: unknown): void { if (error instanceof DatastoreError && (error.code === "CANCELLED" || error.code === "TIMEOUT")) throw error; }
@@ -166,20 +166,22 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
   if (store.shared) {
    const client = this.sharedClients?.get(store.name); if (!client) throw new DatastoreError("STORE_UNAVAILABLE");
    const page = await client.tagPages(query, { continuation: token, limit, ...budget, responseStore: store.name }, signal);
-   const data = { candidates: page.pages.map((path) => ({ note: { store: store.name, path }, uri: "", title: path, revision: page.revision })), examined: page.total, partial: page.continuation !== undefined };
-   return this.envelope("find", store.name, data, started, JSON.stringify(data), page.continuation !== undefined, page.continuation) as FindResult;
+   const data = { candidates: page.candidates, examined: page.examined, partial: page.continuation !== undefined };
+   return this.envelope("find", store.name, data, started, JSON.stringify(data), page.continuation !== undefined, page.continuation, [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: page.complete ? "current" : "stale", indexRevision: page.revision }]) as FindResult;
   }
   const index = this.metadata?.get(store.name); if (!index) throw new DatastoreError("STALE_INDEX");
   const snapshot = await index.requireSnapshot();
   const pages = snapshot.tags.find((tag) => tag.identity === query)?.pages ?? [];
   const offset = continuationOffset(token, store.name, snapshot.revision, query);
-  const selected = pageRendered(pages.slice(0, offset + limit), offset, budget, (page) => ({ candidates: page, examined: pages.length }));
+  const revisionOf = (path: string) => snapshot.observed?.find((entry) => entry.path === path)?.sourceRevision;
+  if (pages.some((path) => !revisionOf(path))) throw new DatastoreError("STALE_INDEX");
+  const selected = pageRendered(pages.slice(0, offset + limit), offset, budget, (page) => ({ candidates: page.map((path) => tagCandidate(store.name, path, revisionOf(path)!)), examined: pages.length, partial: offset + page.length < pages.length }));
   const bounded = selected.items.slice(0, limit);
   const admitted = await index.admit(store, bounded.map((path) => ({ path, kind: "note" as const })), signal);
   const next = offset + bounded.length < pages.length ? offset + bounded.length : undefined;
-  const data = { candidates: bounded.map((path) => ({ note: { store: store.name, path }, uri: "", title: path, revision: snapshot.revision })), examined: pages.length, partial: next !== undefined };
+  const data = { candidates: bounded.map((path) => tagCandidate(store.name, path, revisionOf(path)!)), examined: pages.length, partial: next !== undefined };
   const warnings = admitted.diagnostics.map((message) => ({ code: "STALE_INDEX" as const, message }));
-  return this.envelope("find", store.name, data, started, JSON.stringify(data), next !== undefined, next === undefined ? undefined : continuationToken(store.name, snapshot.revision, query, next, budget), [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: admitted.current ? "current" : "stale" }], warnings) as FindResult;
+  return this.envelope("find", store.name, data, started, JSON.stringify(data), next !== undefined, next === undefined ? undefined : continuationToken(store.name, snapshot.revision, query, next, budget), [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: admitted.current ? "current" : "stale", indexRevision: snapshot.revision }], warnings) as FindResult;
  }
  const notes=input.selectors.map(s=>{if(s.kind!=="uri" && (s.kind!=="path" || !s.path.endsWith(".md")))throw new DatastoreError("CAPABILITY_UNAVAILABLE");const note=s.kind==="uri"?noteUriToRef(s.uri):{store:store.name,path:validateRelativeNotePath(s.path)};if(note.store!==store.name)throw new DatastoreError("INVALID_NOTE_REF");return note;});
  const paths=[...new Set(notes.map(n=>n.path))];const candidates=[];

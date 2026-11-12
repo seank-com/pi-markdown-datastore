@@ -184,3 +184,31 @@ test("a replaced source root or unsafe target is not a current graph result", as
 	await writeFile(join(notes, "alpha.md"), "Replacement.\n");
 	await assert.rejects(service.read({ store: "notes", note: { store: "notes", path: "alpha.md" }, view: "links" }), { code: "STORE_UNAVAILABLE" });
 });
+
+test("tag find pages the rendered candidate, not the path string", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-tag-budget-")));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const notes = join(root, "notes");
+	await mkdir(notes);
+	const long = "n".repeat(80);
+	await writeFile(join(notes, `${long}-a.md`), "---\ntags: [Travel]\n---\nOne.\n");
+	await writeFile(join(notes, `${long}-b.md`), "---\ntags: [Travel]\n---\nTwo.\n");
+	const dir = join(root, ".pi", "markdown-datastore");
+	await mkdir(dir, { recursive: true, mode: 0o700 });
+	await chmod(dir, 0o700);
+	await writeFile(join(dir, "config.json"), JSON.stringify({ schemaVersion: 1, defaults: { maxResultBytes: 700, maxResultLines: 20, operationTimeoutMs: 3000 }, qmd: { enabled: false, installation: { executable: "qmd" }, minimumVersion: "2.8.3" }, stores: { notes: { root: "notes", include: ["**/*.md"], exclude: [], maxFileBytes: 20000, search: { defaultMode: "lexical", qmdCollection: "notes" } } } }), { mode: 0o600 });
+	const config = await loadMarkdownDatastoreConfig(root);
+	const index = new MetadataIndex(join(root, "state", "metadata-notes"));
+	const coordinator = new MaintenanceCoordinator(join(root, "state", "jobs.json"), () => new Set(["notes"]));
+	registerMetadata(coordinator, new Map([["notes", index]]), config.stores);
+	const service = new MarkdownDatastoreService(config);
+	service.bindMetadata(coordinator, new Map([["notes", index]]));
+	await service.refresh({ store: "notes", mode: "metadata" });
+	await coordinator.settled();
+	const found = await service.find({ store: "notes", selectors: [{ kind: "tag", value: "travel" }], limit: 20 });
+	assert.equal(Buffer.byteLength(JSON.stringify(found.data)) <= 700, true);
+	assert.equal(found.data.candidates.length, 1);
+	assert.equal(found.bounds.truncated, true);
+	assert.equal(found.data.candidates[0].uri.startsWith("datastore://notes/"), true);
+	assert.notEqual(found.data.candidates[0].revision, found.provenance.sources[0].indexRevision);
+});

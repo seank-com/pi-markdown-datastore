@@ -188,6 +188,9 @@ test("shared tools page catalog, tag find, and links through the owner", async (
 	await assert.rejects(tags.execute("4", { store: "notebook", continuation: Buffer.from(JSON.stringify({ store: "archive", revision: catalog.data.revision, query: "catalog", offset: 0 })).toString("base64url") }, new AbortController().signal), { code: "STALE_CONTINUATION" });
 	const found = JSON.parse((await find.execute("5", { store: "notebook", selectors: [{ kind: "tag", value: "travel" }], limit: 20 }, new AbortController().signal)).content[0].text);
 	assert.equal(found.data.candidates[0].note.path, "alpha.md");
+	assert.equal(found.data.candidates[0].uri, "datastore://notebook/alpha.md");
+	assert.notEqual(found.data.candidates[0].revision, found.provenance.sources[0].indexRevision);
+	assert.match(String(found.provenance.sources[0].indexRevision), /^meta-/);
 	const first = JSON.parse((await read.execute("6", { store: "notebook", note: { store: "notebook", path: "alpha.md" }, view: "links", maxBytes: 800 }, new AbortController().signal)).content[0].text);
 	assert.equal(first.data.returned >= 1, true);
 	assert.equal(first.data.occurrenceCount, 3);

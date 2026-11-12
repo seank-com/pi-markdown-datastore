@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { lstat, mkdir, open, readFile, rename, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join } from "node:path";
 import type { StoreConfig } from "./config.ts";
-import { assertRootIdentity, safeInspectContainedFile, safeOpenNote, walkSafeAttachmentPaths, walkSafeNoteMetadata, type SafeNoteMetadata } from "./containment.ts";
+import { assertRootIdentity, noteRefToUri, safeInspectContainedFile, safeOpenNote, walkSafeAttachmentPaths, walkSafeNoteMetadata, type SafeNoteMetadata } from "./containment.ts";
 import { DatastoreError, throwIfAborted } from "./errors.ts";
 import type { MaintenanceCoordinator } from "./maintenance-coordinator.ts";
 import { parseMarkdown } from "./markdown.ts";
@@ -32,7 +32,7 @@ export interface MetadataSnapshot {
 	tags: MetadataTag[];
 	pages: string[];
 	files: string[];
-	observed?: { path: string; size: number; mtime: string }[];
+	observed?: { path: string; size: number; mtime: string; sourceRevision?: string }[];
 }
 
 async function atomicJson(path: string, value: unknown): Promise<void> {
@@ -77,7 +77,7 @@ export class MetadataIndex {
 		const notes: SafeNoteMetadata[] = [];
 		await walkSafeNoteMetadata(store, (note) => { notes.push(note); }, signal);
 		const files: string[] = [];
-		const observed = new Map<string, { size: number; mtime: string }>();
+		const observed = new Map<string, { size: number; mtime: string; sourceRevision?: string }>();
 		for (const note of notes) observed.set(note.note.path, { size: note.size, mtime: note.mtime });
 		await walkSafeAttachmentPaths(store, async (path) => { const inspected = await safeInspectContainedFile(store, path, signal); observed.set(path, { size: inspected.size, mtime: inspected.mtime }); files.push(path); }, signal);
 		const pages = notes.map((note) => note.note.path).sort();
@@ -93,6 +93,8 @@ export class MetadataIndex {
 		for (const note of notes) {
 			throwIfAborted(signal);
 			const opened = await safeOpenNote(store, note.note.path, signal);
+			const seen = observed.get(note.note.path);
+			if (seen) observed.set(note.note.path, { ...seen, sourceRevision: opened.revision });
 			const parsed = parseMarkdown(opened);
 			if (parsed.frontmatter.error) diagnostics.push(`${note.note.path}: ${parsed.frontmatter.error}`);
 			const rawTags = parsed.frontmatter.value?.tags;
@@ -172,6 +174,11 @@ export function registerMetadata(coordinator: MaintenanceCoordinator, indexes: M
 		}
 		return { generation: revision };
 	});
+}
+
+export function tagCandidate(store: string, path: string, revision: string): { note: { store: string; path: string }; uri: string; title: string; revision: string } {
+	const note = { store, path };
+	return { note, uri: noteRefToUri(note), title: path, revision };
 }
 
 export function pageRendered<T>(items: T[], offset: number, budget: { maxBytes: number; maxLines: number }, render: (page: T[]) => unknown): { items: T[]; next?: number } {
