@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -72,4 +72,47 @@ test("ledger keeps progress, capacity, validation, and explicit cancel", async (
 	await chmod(join(dir, "fail"), 0o700);
 	assert.equal(failing.get(String(failingJob.refreshId))?.state, "failed");
 	assert.equal(failing.get(String(failingJob.refreshId))?.errorCode, "INDEX_CORRUPT");
+});
+
+test("a failed first admission rejects every coalesced caller and starts no runner", async () => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-admit-fail-")));
+	const owner = new MaintenanceCoordinator(join(root, "jobs.json"), () => new Set(["a"]));
+	let starts = 0;
+	owner.register("metadata", async () => { starts += 1; return { generation: "meta-" + "a".repeat(32) }; });
+	await owner.ensureLoaded();
+	await chmod(root, 0o500);
+	const calls = await Promise.allSettled([owner.enqueue("metadata", ["a"], "explicit-maintenance"), owner.enqueue("metadata", ["a"], "explicit-maintenance")]);
+	owner.shutdown();
+	await owner.settled();
+	assert.deepEqual(calls.map((call) => call.status), ["rejected", "rejected"]);
+	assert.equal(starts, 0);
+	await chmod(root, 0o700);
+	await rm(root, { recursive: true, force: true });
+});
+
+test("queued cancel stays cancelled after a held predecessor is released", async () => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-queue-cancel-")));
+	const owner = new MaintenanceCoordinator(join(root, "jobs.json"), () => new Set(["a", "b"]));
+	let started!: () => void;
+	const entered = new Promise<void>((resolve) => { started = resolve; });
+	let release!: () => void;
+	const held = new Promise<void>((resolve) => { release = resolve; });
+	owner.register("metadata", async (job, signal) => {
+		if (job.stores.includes("a")) { started(); await new Promise((_resolve, reject) => { signal.addEventListener("abort", () => reject(signal.reason), { once: true }); held.then(() => undefined); }); }
+		return { generation: "meta-" + "b".repeat(32) };
+	});
+	await owner.enqueue("metadata", ["a"], "explicit-maintenance");
+	await entered;
+	const queued = await owner.enqueue("metadata", ["b"], "explicit-maintenance");
+	const durable = owner.persisted(String(queued.refreshId));
+	await owner.cancel(String(queued.refreshId));
+	await durable;
+	assert.equal(owner.get(String(queued.refreshId))?.state, "cancelled");
+	owner.shutdown();
+	release();
+	await owner.settled();
+	assert.equal(owner.get(String(queued.refreshId))?.state, "cancelled");
+	const disk = JSON.parse(await readFile(join(root, "jobs.json"), "utf8")) as { jobs: { refreshId: string; state: string }[] };
+	assert.equal(disk.jobs.find((job) => job.refreshId === queued.refreshId)?.state, "cancelled");
+	await rm(root, { recursive: true, force: true });
 });

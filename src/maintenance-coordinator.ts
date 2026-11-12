@@ -61,6 +61,7 @@ export async function adoptLegacyApplicationJobs(stateRoot: string, stablePath: 
 export class MaintenanceCoordinator {
 	#jobs = new Map<string, QmdRefreshJob>();
 	#controllers = new Map<string, AbortController>();
+	#admissions = new Map<string, Promise<void>>();
 	#persisted = new Map<string, Promise<void>>();
 	#settlePersist = new Map<string, { resolve: () => void; reject: (error: unknown) => void }>();
 	#runners = new Map<Mode, MaintenanceRunner>();
@@ -134,17 +135,33 @@ export class MaintenanceCoordinator {
 		if (definition !== undefined && current !== undefined && definition !== current) throw new DatastoreError("STALE_INDEX");
 		definition ??= current;
 		const key = `${mode}:${ordered.join(",")}`;
+		const inflight = this.#admissions.get(key);
+		if (inflight) {
+			await inflight;
+			if (this.#closed) throw new DatastoreError("CANCELLED");
+			const admitted = [...this.#jobs.values()].find((job) => job.key === key && (job.state === "queued" || job.state === "running") && job.definition === definition);
+			if (!admitted) throw new DatastoreError("INDEX_CORRUPT");
+			this.launch(admitted);
+			return { ...structuredClone(admitted), coalesced: true };
+		}
 		const existing = [...this.#jobs.values()].find((job) => job.key === key && (job.state === "queued" || job.state === "running") && job.definition === definition);
 		if (existing) { this.launch(existing); return { ...structuredClone(existing), coalesced: true }; }
-		const terminal = this.jobs().filter((item) => !["queued", "running"].includes(item.state));
-		while (this.#jobs.size + 1 > TERMINAL_JOB_LIMIT && terminal.length) this.#jobs.delete(terminal.shift()!.refreshId);
-		if (this.#jobs.size + 1 > TERMINAL_JOB_LIMIT) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
-		const now = new Date().toISOString();
-		const job: QmdRefreshJob = { version: 1, refreshId: randomBytes(16).toString("hex"), key, mode, stores: ordered, ownership, definition, state: "queued", phase: "queued", createdAt: now, updatedAt: now, progress: { documentsCompleted: 0, sourceBytesCompleted: 0, chunksCompleted: 0, embeddingBytesCompleted: 0, errors: 0 } };
-		this.#jobs.set(job.refreshId, job);
-		try { await this.persist(); } catch (error) { this.#jobs.delete(job.refreshId); throw error; }
-		this.launch(job);
-		return { ...structuredClone(job), coalesced: false };
+		let admit!: () => void;
+		let refuse!: (error: unknown) => void;
+		const admission = new Promise<void>((resolve, reject) => { admit = resolve; refuse = reject; });
+		this.#admissions.set(key, admission);
+		try {
+			const terminal = this.jobs().filter((item) => !["queued", "running"].includes(item.state));
+			while (this.#jobs.size + 1 > TERMINAL_JOB_LIMIT && terminal.length) this.#jobs.delete(terminal.shift()!.refreshId);
+			if (this.#jobs.size + 1 > TERMINAL_JOB_LIMIT) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
+			const now = new Date().toISOString();
+			const job: QmdRefreshJob = { version: 1, refreshId: randomBytes(16).toString("hex"), key, mode, stores: ordered, ownership, definition, state: "queued", phase: "queued", createdAt: now, updatedAt: now, progress: { documentsCompleted: 0, sourceBytesCompleted: 0, chunksCompleted: 0, embeddingBytesCompleted: 0, errors: 0 } };
+			this.#jobs.set(job.refreshId, job);
+			try { await this.persist(); } catch (error) { this.#jobs.delete(job.refreshId); throw error; }
+			admit();
+			this.launch(job);
+			return { ...structuredClone(job), coalesced: false };
+		} catch (error) { refuse(error); throw error; } finally { this.#admissions.delete(key); }
 	}
 	relaunchQueued(): void { for (const job of this.#jobs.values()) if (job.state === "queued") this.launch(job); }
 	private launch(job: QmdRefreshJob): void {
@@ -202,7 +219,7 @@ export class MaintenanceCoordinator {
 		}
 		await this.persist();
 	}
-	#finish(refreshId: string): void { this.#settlePersist.get(refreshId)?.resolve(); this.#persisted.delete(refreshId); this.#settlePersist.delete(refreshId); this.#explicitCancel.delete(refreshId); }
+	#finish(refreshId: string): void { this.#settlePersist.get(refreshId)?.resolve(); this.#persisted.delete(refreshId); this.#settlePersist.delete(refreshId); if (!this.#controllers.has(refreshId)) this.#explicitCancel.delete(refreshId); }
 	#fail(refreshId: string, error: unknown): void { this.#settlePersist.get(refreshId)?.reject(error); this.#persisted.delete(refreshId); this.#settlePersist.delete(refreshId); this.#explicitCancel.delete(refreshId); }
 	async persisted(refreshId: string): Promise<void> {
 		await this.ensureLoaded();
