@@ -94,7 +94,7 @@ export type ReadResult = ResultEnvelope<ReadData>;
 export interface StatusInput { store?: StoreName }
 export type StatusResult = ResultEnvelope<{ stores: unknown[]; enabled: boolean }>;
 export type RefreshInput =
-	| { action?: "start"; store?: StoreName; mode?: "direct" | "lexical" | "semantic" | "all" | "metadata" }
+	| { action?: "start"; store?: StoreName; mode?: "direct" | "lexical" | "semantic" | "all" | "metadata" | "rebuild"; paths?: string[] }
 	| { action: "cancel"; refreshId: string };
 export type RefreshResult = ResultEnvelope<Record<string, unknown>>;
 

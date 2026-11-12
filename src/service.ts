@@ -14,7 +14,7 @@ import { SharedIndexClient } from "./shared-client.ts";
 import type { MaintenanceCoordinator } from "./maintenance-coordinator.ts";
 import type { IndexOwnership } from "./index-ownership.ts";
 import { sourceDefinition } from "./maintenance-coordinator.ts";
-import { continuationOffset, continuationToken, pageRendered, readPageToken, tagCandidate, type MetadataIndex } from "./metadata-index.ts";
+import { continuationOffset, continuationToken, pageRendered, readPageToken, reconcileChanged, tagCandidate, type MetadataIndex } from "./metadata-index.ts";
 import { tagIdentity } from "./wiki.ts";
 
 function elapsed(started: number): number { return Math.max(0, Date.now() - started); }
@@ -328,8 +328,9 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 			const qmd = await this.cancelRefresh(input.refreshId, signal); const data = { action: "cancel", qmd, durationMs: elapsed(started) }; return this.envelope("refresh", "*", data, started, JSON.stringify(data), false, undefined, [], [], undefined, 1) as RefreshResult;
 		}
 		const mode = input.mode ?? "direct"; const stores = input.store ? [this.store(input.store)] : [...this.config.stores.values()];
-		if (mode === "metadata") {
+		if (mode === "metadata" || mode === "rebuild") {
 			const local = stores.filter((store) => !store.shared).map((store) => store.name);
+			if (mode === "metadata" && input.paths?.length) for (const name of local) this.maintenance?.notePaths(name, input.paths);
 			const shared = stores.filter((store) => store.shared);
 			if (!local.length && !shared.length) throw new DatastoreError("STORE_UNKNOWN");
 			const receipt = local.length ? await this.maintenance?.enqueue("metadata", local, "explicit-maintenance", sourceDefinition(local.map((name) => this.store(name)))) : undefined;
@@ -380,7 +381,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		}
 		throw new DatastoreError(this.qmd || this.sharedClients?.size || this.maintenance ? "INVALID_NOTE_REF" : "CAPABILITY_UNAVAILABLE");
 	}
-	bindMetadata(coordinator: MaintenanceCoordinator, indexes: Map<string, MetadataIndex>, ownership?: IndexOwnership): void { this.maintenance = coordinator; this.metadata = indexes; this.#ownership = ownership; }
+	bindMetadata(coordinator: MaintenanceCoordinator, indexes: Map<string, MetadataIndex>, ownership?: IndexOwnership): void { this.maintenance = coordinator; this.metadata = indexes; this.#ownership = ownership; coordinator.startCycle(() => reconcileChanged(coordinator, indexes, this.config.stores)); }
 	private async metadataRead(store: StoreConfig, view: "links" | "backlinks", path: string, started: number, signal: AbortSignal, token?: string, budget = { maxBytes: this.config.defaults.maxResultBytes, maxLines: this.config.defaults.maxResultLines }): Promise<ReadResult> {
 		throwIfAborted(signal);
 		if (store.shared) {

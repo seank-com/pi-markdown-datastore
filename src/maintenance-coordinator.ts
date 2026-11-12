@@ -72,11 +72,19 @@ export class MaintenanceCoordinator {
 	#closed = false;
 	#hostClosing = false;
 	#explicitCancel = new Set<string>();
+	#pendingPaths = new Map<string, Set<string>>();
 	readonly jobsPath: string;
 	readonly knownStores: () => ReadonlySet<string>;
 	readonly definitionFor?: (job: { mode: string; stores: string[] }) => string;
 	constructor(jobsPath: string, knownStores: () => ReadonlySet<string>, definitionFor?: (job: { mode: string; stores: string[] }) => string) { this.jobsPath = jobsPath; this.knownStores = knownStores; this.definitionFor = definitionFor; }
 	register(mode: Mode, runner: MaintenanceRunner): void { this.#runners.set(mode, runner); }
+	hasRunner(mode: Mode): boolean { return this.#runners.has(mode); }
+	notePaths(store: string, paths: string[]): void { const set = this.#pendingPaths.get(store) ?? new Set<string>(); for (const path of paths) set.add(path); this.#pendingPaths.set(store, set); }
+	takePaths(store: string): string[] { const set = this.#pendingPaths.get(store); this.#pendingPaths.delete(store); return set ? [...set] : []; }
+	startCycle(run: () => Promise<void>, intervalMs = 300_000, schedule: typeof setTimeout = setTimeout): void {
+		const arm = () => { const timer = schedule(() => { void run().finally(arm); }, intervalMs); timer.unref?.(); };
+		arm();
+	}
 	jobs(): QmdRefreshJob[] { return [...this.#jobs.values()].sort((left, right) => right.createdAt.localeCompare(left.createdAt)).map((job) => structuredClone(job)); }
 	get(refreshId: string): QmdRefreshJob | undefined { return this.#jobs.get(refreshId); }
 	async ensureLoaded(): Promise<void> {
@@ -192,6 +200,7 @@ export class MaintenanceCoordinator {
 			job.state = safe.code === "CANCELLED" ? "cancelled" : "failed";
 			job.phase = job.state; job.errorCode = safe.code;
 		}).finally(async () => {
+			if (job.mode === "metadata" && ["succeeded", "failed", "cancelled"].includes(job.state)) for (const store of job.stores) if (this.#pendingPaths.get(store)?.size) void this.enqueue("metadata", [store], job.ownership);
 			job.updatedAt = new Date().toISOString();
 			if (["succeeded", "failed", "cancelled"].includes(job.state)) job.completedAt ??= job.updatedAt;
 			this.#controllers.delete(job.refreshId);

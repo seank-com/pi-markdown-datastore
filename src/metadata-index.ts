@@ -18,6 +18,7 @@ export interface MetadataEdge {
 	suffix?: string;
 	raw: string;
 	line: number;
+	written?: string;
 }
 export interface MetadataTag { identity: string; spelling: string; pages: string[] }
 export interface FileLink { target: string; kind: "link" | "embed"; fragment?: string; suffix?: string; raw: string; line: number; targetKind?: MetadataEdge["targetKind"] }
@@ -73,6 +74,35 @@ export class MetadataIndex {
 	async tagPages(identity: string): Promise<string[]> { return (await this.requireSnapshot()).tags[identity] ?? []; }
 	async catalog(): Promise<MetadataTag[]> { return catalogFrom(await this.requireSnapshot()); }
 	fileRevision(path: string, snapshot: MetadataSnapshot): string | undefined { return snapshot.files[path]?.revision; }
+	async updatePaths(store: StoreConfig, paths: string[], signal?: AbortSignal): Promise<MetadataSnapshot> {
+		const current = await this.load() ?? { version: 2 as const, revision: "", root: store.root, rootDev: store.rootDev, rootIno: store.rootIno, complete: true, diagnostics: [] as string[], files: {}, targets: {}, tags: {}, references: {} };
+		for (const path of paths) {
+			throwIfAborted(signal);
+			if (!path.endsWith(".md")) {
+				try { const inspected = await safeInspectContainedFile(store, path, signal); current.files[path] = { kind: "attachment", mtime: inspected.mtime, size: inspected.size }; }
+				catch (error) { if (error instanceof DatastoreError && error.code === "NOTE_NOT_FOUND") delete current.files[path]; else throw error; }
+				continue;
+			}
+			try {
+				const opened = await safeOpenNote(store, path, signal);
+				const prior = current.files[path];
+				if (prior?.kind === "note" && prior.revision === opened.revision) { current.files[path] = { ...prior, mtime: opened.mtime, size: opened.size }; continue; }
+				const parsed = parseMarkdown(opened);
+				const rawTags = parsed.frontmatter.value?.tags;
+				const spellings = typeof rawTags === "string" ? [rawTags] : Array.isArray(rawTags) && rawTags.every((item) => typeof item === "string") ? rawTags : [];
+				const pages = Object.entries(current.files).filter(([, file]) => file.kind === "note").map(([item]) => item);
+				if (!pages.includes(path)) pages.push(path);
+				const attachments = Object.entries(current.files).filter(([, file]) => file.kind === "attachment").map(([item]) => item);
+				const byBase = new Map<string, string[]>();
+				const links = extractWikilinks(opened.text, parsed.frontmatter.endLine ?? 0).map((ref) => ({ target: ref.target, kind: ref.kind, fragment: ref.fragment, suffix: ref.suffix, raw: ref.raw, line: ref.line, targetKind: resolveTarget(store, path, ref, pages, attachments, byBase).targetKind }));
+				current.files[path] = { kind: "note", mtime: opened.mtime, size: opened.size, revision: opened.revision, links, tags: spellings };
+			} catch (error) { if (error instanceof DatastoreError && error.code === "NOTE_NOT_FOUND") delete current.files[path]; else throw error; }
+		}
+		const next = reindex(store, current);
+		const previous = this.#snapshot;
+		try { await atomicJson(join(this.root, "index.json"), next); this.#snapshot = next; } catch (error) { this.#snapshot = previous; throw error; }
+		return next;
+	}
 	async refresh(store: StoreConfig, signal?: AbortSignal): Promise<MetadataSnapshot> {
 		throwIfAborted(signal);
 		await mkdir(this.root, { recursive: true, mode: 0o700 });
@@ -110,7 +140,7 @@ export class MetadataIndex {
 				tags.set(identity, existing);
 			}
 			for (const ref of extractWikilinks(opened.text, parsed.frontmatter.endLine ?? 0)) {
-				edges.push({ ...resolveTarget(store, note.note.path, ref, pages, files, byBase), kind: ref.kind, source: note.note.path, fragment: ref.fragment, suffix: ref.suffix, raw: ref.raw, line: ref.line });
+				edges.push({ ...resolveTarget(store, note.note.path, ref, pages, files, byBase), kind: ref.kind, source: note.note.path, fragment: ref.fragment, suffix: ref.suffix, raw: ref.raw, line: ref.line, written: ref.target });
 			}
 		}
 		await assertRootIdentity(store);
@@ -158,19 +188,54 @@ function publish(store: StoreConfig, diagnostics: string[], edges: MetadataEdge[
 	for (const path of [...pages, ...attachments]) addTarget(path);
 	for (const path of pages) {
 		const seen = observed.get(path);
-		files[path] = { kind: "note", mtime: seen?.mtime ?? "", revision: seen?.sourceRevision, size: seen?.size, links: edges.filter((edge) => edge.source === path).map((edge) => ({ target: edge.target, kind: edge.kind, fragment: edge.fragment, suffix: edge.suffix, raw: edge.raw, line: edge.line, targetKind: edge.targetKind })), tags: [] };
+		files[path] = { kind: "note", mtime: seen?.mtime ?? "", revision: seen?.sourceRevision, size: seen?.size, links: edges.filter((edge) => edge.source === path).map((edge) => ({ target: edge.written ?? edge.target, kind: edge.kind, fragment: edge.fragment, suffix: edge.suffix, raw: edge.raw, line: edge.line })), tags: [] };
 	}
 	for (const path of attachments) { const seen = observed.get(path); files[path] = { kind: "attachment", mtime: seen?.mtime ?? "", size: seen?.size }; }
 	for (const tag of tags.values()) { tagMembers[tag.identity] = tag.pages; for (const page of tag.pages) if (files[page]?.kind === "note") files[page].tags = [...(files[page].tags ?? []), tag.spelling]; }
-	for (const edge of edges) references[edge.target] = [...new Set([...(references[edge.target] ?? []), edge.source])];
+	for (const edge of edges) { const written = edge.written ?? edge.target; references[written] = [...new Set([...(references[written] ?? []), edge.source])]; }
 	return { version: 2, revision: `meta-${randomBytes(16).toString("hex")}`, root: store.root, rootDev: store.rootDev, rootIno: store.rootIno, complete: diagnostics.length === 0, diagnostics, files, targets, tags: tagMembers, references };
 }
 function catalogFrom(snapshot: MetadataSnapshot): MetadataTag[] {
 	return Object.entries(snapshot.tags).map(([identity, pages]) => ({ identity, spelling: pages.map((path) => snapshot.files[path]?.tags?.find((tag) => tagIdentity(tag) === identity)).find(Boolean) ?? identity, pages }));
 }
 function edgesFrom(snapshot: MetadataSnapshot, view: "links" | "backlinks", path: string): MetadataEdge[] {
-	if (view === "links") return (snapshot.files[path]?.links ?? []).map((link) => ({ ...link, source: path, targetKind: link.targetKind ?? "unresolved" }));
-	return (snapshot.references[path] ?? []).flatMap((source) => (snapshot.files[source]?.links ?? []).filter((link) => link.target === path).map((link) => ({ ...link, source, targetKind: snapshot.files[path]?.kind === "attachment" ? "attachment" as const : "note" as const })));
+	const present = (source: string, link: FileLink): MetadataEdge => ({ ...link, ...resolveWritten(snapshot, link.target, source), source });
+	if (view === "links") return (snapshot.files[path]?.links ?? []).map((link) => present(path, link));
+	const sources = new Set<string>();
+	for (const [written, referring] of Object.entries(snapshot.references)) {
+		const resolved = resolveWritten(snapshot, written);
+		if (resolved.target === path && resolved.targetKind !== "unresolved" && resolved.targetKind !== "ambiguous") for (const source of referring) sources.add(source);
+	}
+	return [...sources].flatMap((source) => (snapshot.files[source]?.links ?? []).filter((link) => resolveWritten(snapshot, link.target, source).target === path).map((link) => present(source, link)));
+}
+function resolveWritten(snapshot: MetadataSnapshot, written: string, source?: string): Pick<MetadataEdge, "target" | "targetKind"> {
+	if (!written && source) return { target: source, targetKind: "note" };
+	if (written.includes("\\") || written.split("/").includes("..")) return { target: written, targetKind: "unresolved" };
+	if (written.includes("/")) {
+		const withMd = written.endsWith(".md") ? written : `${written}.md`;
+		if (snapshot.files[written]?.kind === "note" || snapshot.files[written]?.kind === "attachment") return { target: written, targetKind: snapshot.files[written].kind === "attachment" ? "attachment" : "note" };
+		if (snapshot.files[withMd]?.kind === "note") return { target: withMd, targetKind: "note" };
+		return { target: written, targetKind: "unresolved" };
+	}
+	const stem = basename(written, extname(written));
+	let candidates = snapshot.targets[stem] ?? [];
+	if (extname(written)) candidates = candidates.filter((path) => basename(path) === written);
+	if (candidates.length === 1) return { target: candidates[0], targetKind: snapshot.files[candidates[0]]?.kind === "attachment" ? "attachment" : "note" };
+	if (candidates.length > 1) return { target: written, targetKind: "ambiguous" };
+	return { target: written, targetKind: "unresolved" };
+}
+function reindex(store: StoreConfig, current: MetadataSnapshot): MetadataSnapshot {
+	const targets: Record<string, string[]> = {};
+	const tags: Record<string, string[]> = {};
+	const references: Record<string, string[]> = {};
+	for (const [path, file] of Object.entries(current.files)) {
+		const stem = basename(path, extname(path));
+		targets[stem] = [...new Set([...(targets[stem] ?? []), path])];
+		if (file.kind !== "note") continue;
+		for (const spelling of file.tags ?? []) { const identity = tagIdentity(spelling); if (!identity) continue; tags[identity] = [...new Set([...(tags[identity] ?? []), path])]; }
+		for (const link of file.links ?? []) references[link.target] = [...new Set([...(references[link.target] ?? []), path])];
+	}
+	return { ...current, version: 2, revision: `meta-${randomBytes(16).toString("hex")}`, root: store.root, rootDev: store.rootDev, rootIno: store.rootIno, targets, tags, references };
 }
 function resolveTarget(store: StoreConfig, source: string, ref: WikiReference, pages: string[], files: string[], byBase: Map<string, string[]>): Pick<MetadataEdge, "target" | "targetKind"> {
 	const raw = ref.target;
@@ -195,6 +260,22 @@ function resolveTarget(store: StoreConfig, source: string, ref: WikiReference, p
 	return { target: raw, targetKind: "unresolved" };
 }
 
+export async function reconcileChanged(coordinator: MaintenanceCoordinator, indexes: Map<string, MetadataIndex>, stores: ReadonlyMap<string, StoreConfig>): Promise<void> {
+	for (const [name, store] of stores) {
+		if (store.shared) continue;
+		const index = indexes.get(name); if (!index) continue;
+		const snapshot = await index.snapshot();
+		const changed: string[] = []; const seen = new Set<string>();
+		await walkSafeNoteMetadata(store, (note) => { seen.add(note.note.path); const prior = snapshot?.files[note.note.path]; if (!prior || prior.mtime !== note.mtime) changed.push(note.note.path); });
+		await walkSafeAttachmentPaths(store, async (path) => { seen.add(path); const inspected = await safeInspectContainedFile(store, path); const prior = snapshot?.files[path]; if (!prior || prior.mtime !== inspected.mtime || prior.size !== inspected.size) changed.push(path); });
+		for (const path of Object.keys(snapshot?.files ?? {})) if (!seen.has(path)) changed.push(path);
+		if (!changed.length) continue;
+		coordinator.notePaths(name, changed);
+		const receipt = await coordinator.enqueue("metadata", [name], "startup-reconciliation");
+		await coordinator.persisted(String(receipt.refreshId));
+		if (coordinator.hasRunner("lexical")) await coordinator.enqueue("lexical", [name], "startup-reconciliation");
+	}
+}
 export function registerMetadata(coordinator: MaintenanceCoordinator, indexes: Map<string, MetadataIndex>, stores: ReadonlyMap<string, StoreConfig>): void {
 	coordinator.register("metadata", async (job, signal) => {
 		let revision = "";
@@ -202,7 +283,8 @@ export function registerMetadata(coordinator: MaintenanceCoordinator, indexes: M
 			const index = indexes.get(name);
 			const store = stores.get(name);
 			if (!index || !store) throw new DatastoreError("STORE_UNKNOWN");
-			revision = (await index.refresh(store, signal)).revision;
+			const paths = coordinator.takePaths(name);
+			revision = (paths.length ? await index.updatePaths(store, paths, signal) : await index.refresh(store, signal)).revision;
 		}
 		return { generation: revision };
 	});
