@@ -173,9 +173,9 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
   }
   const index = this.metadata?.get(store.name); if (!index) throw new DatastoreError("STALE_INDEX");
   const snapshot = await index.requireSnapshot();
-  const pages = snapshot.tags.find((tag) => tag.identity === query)?.pages ?? [];
+  const pages = await index.tagPages(query);
   const offset = continuationOffset(token, store.name, snapshot.revision, query);
-  const revisionOf = (path: string) => snapshot.observed?.find((entry) => entry.path === path)?.sourceRevision;
+  const revisionOf = (path: string) => index.fileRevision(path, snapshot);
   if (pages.some((path) => !revisionOf(path))) throw new DatastoreError("STALE_INDEX");
   const selected = pageRendered(pages.slice(0, offset + limit), offset, budget, (page) => ({ candidates: page.map((path) => tagCandidate(store.name, path, revisionOf(path)!)), examined: pages.length, partial: offset + page.length < pages.length }));
   const bounded = selected.items.slice(0, limit);
@@ -395,7 +395,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		if (!index) throw new DatastoreError("STALE_INDEX");
 		const snapshot = await index.requireSnapshot();
 		const query = `${view}:${path}`;
-		const edges = (view === "links" ? snapshot.edges.filter((edge) => edge.source === path) : snapshot.edges.filter((edge) => edge.target === path && edge.targetKind !== "unresolved" && edge.targetKind !== "ambiguous"));
+		const edges = view === "links" ? await index.links(path) : await index.backlinks(path);
 		const offset = continuationOffset(token, store.name, snapshot.revision, query);
 		const pageCount = new Set(edges.map((edge) => view === "links" ? edge.target : edge.source)).size;
 		const render = (items: typeof edges) => ({ note: { store: store.name, path }, view, edges: items, pageCount, occurrenceCount: edges.length, returned: items.length, complete: snapshot.complete, revision: snapshot.revision });
@@ -424,8 +424,9 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 			if (!index) throw new DatastoreError("STALE_INDEX");
 			const snapshot = await index.requireSnapshot();
 			const offset = continuationOffset(input.continuation, store.name, snapshot.revision, query);
-			const render = (items: typeof snapshot.tags) => ({ tags: items.map((tag) => ({ identity: tag.identity, spelling: tag.spelling, pageCount: tag.pages.length })), revision: snapshot.revision, returned: items.length, total: snapshot.tags.length });
-			const page = pageRendered(snapshot.tags, offset, budget, render);
+			const catalog = await index.catalog();
+			const render = (items: typeof catalog) => ({ tags: items.map((tag) => ({ identity: tag.identity, spelling: tag.spelling, pageCount: tag.pages.length })), revision: snapshot.revision, returned: items.length, total: catalog.length });
+			const page = pageRendered(catalog, offset, budget, render);
 			const admitted = await index.admit(store, [], active);
 			const data = render(page.items);
 			const continuation = page.next === undefined ? undefined : continuationToken(store.name, snapshot.revision, query, page.next, budget);

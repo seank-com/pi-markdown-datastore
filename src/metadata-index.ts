@@ -20,19 +20,20 @@ export interface MetadataEdge {
 	line: number;
 }
 export interface MetadataTag { identity: string; spelling: string; pages: string[] }
+export interface FileLink { target: string; kind: "link" | "embed"; fragment?: string; suffix?: string; raw: string; line: number; targetKind?: MetadataEdge["targetKind"] }
+export interface FileRecord { kind: "note" | "attachment"; mtime: string; revision?: string; size?: number; links?: FileLink[]; tags?: string[] }
 export interface MetadataSnapshot {
-	version: 1;
+	version: 2;
 	revision: string;
 	root?: string;
 	rootDev?: number;
 	rootIno?: number;
 	complete: boolean;
 	diagnostics: string[];
-	edges: MetadataEdge[];
-	tags: MetadataTag[];
-	pages: string[];
-	files: string[];
-	observed?: { path: string; size: number; mtime: string; sourceRevision?: string }[];
+	files: Record<string, FileRecord>;
+	targets: Record<string, string[]>;
+	tags: Record<string, string[]>;
+	references: Record<string, string[]>;
 }
 
 async function atomicJson(path: string, value: unknown): Promise<void> {
@@ -56,7 +57,7 @@ export class MetadataIndex {
 			const info = await lstat(path);
 			if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o077) !== 0) throw new DatastoreError("INDEX_CORRUPT");
 			const saved = JSON.parse(await readFile(path, "utf8")) as MetadataSnapshot;
-			if (saved.version !== 1 || typeof saved.revision !== "string") throw new DatastoreError("INDEX_CORRUPT");
+			if (saved.version !== 2 || typeof saved.revision !== "string" || !saved.files) return undefined;
 			this.#snapshot = saved;
 			return saved;
 		} catch (error: any) {
@@ -67,10 +68,11 @@ export class MetadataIndex {
 	}
 	async snapshot(): Promise<MetadataSnapshot | undefined> { return this.load(); }
 	async requireSnapshot(): Promise<MetadataSnapshot> { const snapshot = await this.load(); if (!snapshot) throw new DatastoreError("STALE_INDEX"); return snapshot; }
-	async links(path: string): Promise<MetadataEdge[]> { return (await this.requireSnapshot()).edges.filter((edge) => edge.source === path); }
-	async backlinks(path: string): Promise<MetadataEdge[]> { return (await this.requireSnapshot()).edges.filter((edge) => edge.target === path && edge.targetKind !== "unresolved" && edge.targetKind !== "ambiguous"); }
-	async tagPages(identity: string): Promise<string[]> { return (await this.requireSnapshot()).tags.find((tag) => tag.identity === identity)?.pages ?? []; }
-	async catalog(): Promise<MetadataTag[]> { return (await this.requireSnapshot()).tags; }
+	async links(path: string): Promise<MetadataEdge[]> { return edgesFrom(await this.requireSnapshot(), "links", path); }
+	async backlinks(path: string): Promise<MetadataEdge[]> { return edgesFrom(await this.requireSnapshot(), "backlinks", path); }
+	async tagPages(identity: string): Promise<string[]> { return (await this.requireSnapshot()).tags[identity] ?? []; }
+	async catalog(): Promise<MetadataTag[]> { return catalogFrom(await this.requireSnapshot()); }
+	fileRevision(path: string, snapshot: MetadataSnapshot): string | undefined { return snapshot.files[path]?.revision; }
 	async refresh(store: StoreConfig, signal?: AbortSignal): Promise<MetadataSnapshot> {
 		throwIfAborted(signal);
 		await mkdir(this.root, { recursive: true, mode: 0o700 });
@@ -112,7 +114,7 @@ export class MetadataIndex {
 			}
 		}
 		await assertRootIdentity(store);
-		const snapshot: MetadataSnapshot = { version: 1, revision: `meta-${randomBytes(16).toString("hex")}`, root: store.root, rootDev: store.rootDev, rootIno: store.rootIno, complete: diagnostics.length === 0, diagnostics, edges, tags: [...tags.values()].sort((a, b) => a.identity.localeCompare(b.identity)), pages, files: files.sort(), observed: [...observed.entries()].map(([path, item]) => ({ path, ...item })) };
+		const snapshot = publish(store, diagnostics, edges, tags, pages, files, observed);
 		await atomicJson(join(this.root, "index.json"), snapshot);
 		this.#snapshot = snapshot;
 		return snapshot;
@@ -129,10 +131,10 @@ export class MetadataIndex {
 			if (seen.has(key)) continue;
 			seen.add(key);
 			try {
-				const prior = snapshot.observed?.find((entry) => entry.path === item.path);
+				const prior = snapshot.files[item.path];
 				if (item.kind === "note") {
 					const opened = await safeOpenNote(store, item.path, signal);
-					if (!prior?.sourceRevision || prior.sourceRevision !== opened.revision) diagnostics.push(`${snapshot.revision}: ${item.path}: changed`);
+					if (!prior?.revision || prior.revision !== opened.revision) diagnostics.push(`${snapshot.revision}: ${item.path}: changed`);
 				} else {
 					const inspected = await safeInspectContainedFile(store, item.path, signal);
 					if (!prior || prior.size !== inspected.size || prior.mtime !== inspected.mtime) diagnostics.push(`${snapshot.revision}: ${item.path}: changed`);
@@ -147,6 +149,29 @@ export class MetadataIndex {
 	async shutdown(): Promise<void> { this.#snapshot = undefined; }
 }
 
+function publish(store: StoreConfig, diagnostics: string[], edges: MetadataEdge[], tags: Map<string, MetadataTag>, pages: string[], attachments: string[], observed: Map<string, { size: number; mtime: string; sourceRevision?: string }>): MetadataSnapshot {
+	const files: Record<string, FileRecord> = {};
+	const targets: Record<string, string[]> = {};
+	const tagMembers: Record<string, string[]> = {};
+	const references: Record<string, string[]> = {};
+	const addTarget = (path: string) => { const stem = basename(path, extname(path)); targets[stem] = [...new Set([...(targets[stem] ?? []), path])]; };
+	for (const path of [...pages, ...attachments]) addTarget(path);
+	for (const path of pages) {
+		const seen = observed.get(path);
+		files[path] = { kind: "note", mtime: seen?.mtime ?? "", revision: seen?.sourceRevision, size: seen?.size, links: edges.filter((edge) => edge.source === path).map((edge) => ({ target: edge.target, kind: edge.kind, fragment: edge.fragment, suffix: edge.suffix, raw: edge.raw, line: edge.line, targetKind: edge.targetKind })), tags: [] };
+	}
+	for (const path of attachments) { const seen = observed.get(path); files[path] = { kind: "attachment", mtime: seen?.mtime ?? "", size: seen?.size }; }
+	for (const tag of tags.values()) { tagMembers[tag.identity] = tag.pages; for (const page of tag.pages) if (files[page]?.kind === "note") files[page].tags = [...(files[page].tags ?? []), tag.spelling]; }
+	for (const edge of edges) references[edge.target] = [...new Set([...(references[edge.target] ?? []), edge.source])];
+	return { version: 2, revision: `meta-${randomBytes(16).toString("hex")}`, root: store.root, rootDev: store.rootDev, rootIno: store.rootIno, complete: diagnostics.length === 0, diagnostics, files, targets, tags: tagMembers, references };
+}
+function catalogFrom(snapshot: MetadataSnapshot): MetadataTag[] {
+	return Object.entries(snapshot.tags).map(([identity, pages]) => ({ identity, spelling: pages.map((path) => snapshot.files[path]?.tags?.find((tag) => tagIdentity(tag) === identity)).find(Boolean) ?? identity, pages }));
+}
+function edgesFrom(snapshot: MetadataSnapshot, view: "links" | "backlinks", path: string): MetadataEdge[] {
+	if (view === "links") return (snapshot.files[path]?.links ?? []).map((link) => ({ ...link, source: path, targetKind: link.targetKind ?? "unresolved" }));
+	return (snapshot.references[path] ?? []).flatMap((source) => (snapshot.files[source]?.links ?? []).filter((link) => link.target === path).map((link) => ({ ...link, source, targetKind: snapshot.files[path]?.kind === "attachment" ? "attachment" as const : "note" as const })));
+}
 function resolveTarget(store: StoreConfig, source: string, ref: WikiReference, pages: string[], files: string[], byBase: Map<string, string[]>): Pick<MetadataEdge, "target" | "targetKind"> {
 	const raw = ref.target;
 	if (!raw && ref.fragment) return { target: source, targetKind: "note" };

@@ -116,18 +116,19 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 					const responseStore = typeof call.input?.responseStore === "string" ? call.input.responseStore : message.store;
 					if (call.operation === "tags") {
 						const offset = continuationOffset(typeof call.input?.continuation === "string" ? call.input.continuation : undefined, responseStore, snapshot.revision, "catalog");
-						const render = (items: typeof snapshot.tags) => ({ tags: items.map((tag) => ({ identity: tag.identity, spelling: tag.spelling, pageCount: tag.pages.length })), total: snapshot.tags.length, returned: items.length, revision: snapshot.revision });
-						const page = pageRendered(snapshot.tags, offset, budget, render);
+						const catalog = await index.catalog();
+						const render = (items: typeof catalog) => ({ tags: items.map((tag) => ({ identity: tag.identity, spelling: tag.spelling, pageCount: tag.pages.length })), total: catalog.length, returned: items.length, revision: snapshot.revision });
+						const page = pageRendered(catalog, offset, budget, render);
 						const admitted = await index.admit(store, [], controller.signal);
 						result = { ...render(page.items), complete: admitted.current, diagnostics: admitted.diagnostics, continuation: page.next === undefined ? undefined : continuationToken(responseStore, snapshot.revision, "catalog", page.next, budget) };
 					} else if (call.operation === "tagPages") {
 						const tag = String(call.input?.tag);
-						const pages = snapshot.tags.find((item) => item.identity === tag)?.pages ?? [];
+						const pages = await index.tagPages(tag);
 						const limit = Number(call.input?.limit ?? 20);
 						if (!Number.isInteger(limit) || limit < 1 || limit > 20) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
 						const offset = continuationOffset(typeof call.input?.continuation === "string" ? call.input.continuation : undefined, responseStore, snapshot.revision, tag);
 						const window = pages.slice(0, offset + limit);
-						const revisionOf = (path: string) => snapshot.observed?.find((entry) => entry.path === path)?.sourceRevision;
+						const revisionOf = (path: string) => index.fileRevision(path, snapshot);
 						if (pages.some((path) => !revisionOf(path))) throw new DatastoreError("STALE_INDEX");
 						const render = (items: string[]) => ({ candidates: items.map((path) => tagCandidate(responseStore, path, revisionOf(path)!)), examined: pages.length, partial: offset + items.length < pages.length, revision: snapshot.revision });
 						const page = pageRendered(window, offset, budget, render);
@@ -136,7 +137,7 @@ export async function startSharedHost(catalogPath: string): Promise<SharedHost> 
 						result = { ...render(page.items), complete: admitted.current, diagnostics: admitted.diagnostics, continuation: next === undefined ? undefined : continuationToken(responseStore, snapshot.revision, tag, next, budget) };
 					} else {
 						const path = String(call.input?.path);
-						const edges = call.operation === "links" ? snapshot.edges.filter((edge) => edge.source === path) : snapshot.edges.filter((edge) => edge.target === path && edge.targetKind !== "unresolved" && edge.targetKind !== "ambiguous");
+						const edges = call.operation === "links" ? await index.links(path) : await index.backlinks(path);
 						const query = `${call.operation}:${path}`;
 						const offset = continuationOffset(typeof call.input?.continuation === "string" ? call.input.continuation : undefined, responseStore, snapshot.revision, query);
 						const pageCount = new Set(edges.map((edge) => call.operation === "links" ? edge.target : edge.source)).size;
