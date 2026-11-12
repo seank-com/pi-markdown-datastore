@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, copyFile, lstat, mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { legacyOwnerState } from "./index-ownership.ts";
+import { acquireIndexOwnership } from "./index-ownership.ts";
 import { DatastoreError, throwIfAborted } from "./errors.ts";
 import type { QmdRefreshJob, QmdRefreshPhase } from "./qmd-adapter.ts";
 import type { QmdWorkerProgress } from "./qmd-worker-client.ts";
@@ -24,21 +24,10 @@ async function atomicJson(path: string, value: unknown): Promise<void> {
 }
 
 /** Existing queue, receipt file, coalescing and cancellation. Backends register runners; they do not keep another queue. */
-function jobsMatch(raw: any, knownStores: ReadonlySet<string>): boolean {
-	if (raw?.version !== 1 || !Array.isArray(raw.jobs) || raw.jobs.length > TERMINAL_JOB_LIMIT) return false;
-	for (const value of raw.jobs) {
-		if (!value || typeof value !== "object" || value.version !== 1 || typeof value.refreshId !== "string" || !/^[0-9a-f]{32}$/.test(value.refreshId)) return false;
-		if (!["lexical", "semantic", "metadata"].includes(value.mode) || !Array.isArray(value.stores) || value.stores.some((name: unknown) => typeof name !== "string" || !knownStores.has(name))) return false;
-	}
-	return true;
-}
-
 export async function adoptLegacyApplicationJobs(stateRoot: string, stablePath: string, knownStores: ReadonlySet<string>, expectedDirectory: (version: string) => string): Promise<void> {
-	let stable: any;
-	try { stable = JSON.parse(await readFile(stablePath, "utf8")); } catch (error: any) { if (error?.code !== "ENOENT") throw error; }
-	if (stable && jobsMatch(stable, knownStores) && stable.jobs.length > 0) return;
+	try { await lstat(stablePath); return; } catch (error: any) { if (error?.code !== "ENOENT") throw error; }
 	const names = await readdir(stateRoot).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return []; throw error; });
-	const matches: string[] = [];
+	const matches: { directory: string; path: string }[] = [];
 	for (const name of names) {
 		const parsed = /^qmd-public-(.+)-([0-9a-f]{16})$/.exec(name);
 		if (!parsed) continue;
@@ -49,21 +38,20 @@ export async function adoptLegacyApplicationJobs(stateRoot: string, stablePath: 
 		const file = await lstat(path).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? undefined : Promise.reject(error));
 		if (!file) continue;
 		if (directory !== expectedDirectory(parsed[1])) throw new DatastoreError("INDEX_CORRUPT");
-		const owner = await legacyOwnerState(directory);
-		if (owner === "live") throw new DatastoreError("STORE_UNAVAILABLE");
-		if (owner === "uncertain") throw new DatastoreError("INDEX_CORRUPT");
-		if (!file.isFile() || file.isSymbolicLink() || file.nlink !== 1 || file.uid !== process.getuid?.() || (file.mode & 0o077) !== 0 || file.size > 256 * 1024) throw new DatastoreError("INDEX_CORRUPT");
-		const raw = JSON.parse(await readFile(path, "utf8"));
-		if (!jobsMatch(raw, knownStores)) throw new DatastoreError("INDEX_CORRUPT");
-		matches.push(path);
+		matches.push({ directory, path });
 	}
 	if (matches.length > 1) throw new DatastoreError("INDEX_CORRUPT");
 	if (matches.length !== 1) return;
-	const temp = `${stablePath}.adopting-${randomBytes(8).toString("hex")}`;
-	await copyFile(matches[0], temp);
-	const probe = new MaintenanceCoordinator(temp, () => knownStores);
-	try { await probe.ensureLoaded(); probe.shutdown(); await rename(temp, stablePath); }
-	catch (error) { probe.shutdown(); await rm(temp, { force: true }).catch(() => undefined); throw error; }
+	const lease = await acquireIndexOwnership(matches[0].directory);
+	try {
+		const file = await lstat(matches[0].path);
+		if (!file.isFile() || file.isSymbolicLink() || file.nlink !== 1 || file.uid !== process.getuid?.() || (file.mode & 0o077) !== 0 || file.size > 256 * 1024) throw new DatastoreError("INDEX_CORRUPT");
+		const temp = `${stablePath}.adopting-${randomBytes(8).toString("hex")}`;
+		await copyFile(matches[0].path, temp);
+		const probe = new MaintenanceCoordinator(temp, () => knownStores);
+		try { await probe.ensureLoaded(); probe.shutdown(); await rename(temp, stablePath); }
+		catch (error) { probe.shutdown(); await rm(temp, { force: true }).catch(() => undefined); throw error; }
+	} finally { await lease.release(); }
 }
 
 export class MaintenanceCoordinator {

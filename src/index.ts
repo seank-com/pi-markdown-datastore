@@ -233,9 +233,12 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 			if (config.qmd.enabled && privateStores.length) try { qmd = await (options.createQmd ?? createQmd)({ ...config, stores: new Map(privateStores.map((store) => [store.name, store])) }, coordinator); } catch {}
 			const indexes = new Map(privateStores.map((store) => [store.name, new MetadataIndex(join(config.stateRoot, `metadata-${store.name}`))]));
 			if (indexes.size) registerMetadata(coordinator, indexes, config.stores);
-			await coordinator.ensureLoaded();
+			const abandon = async () => { coordinator.shutdown(); await coordinator.settled(); await qmd?.shutdown(); await Promise.all([...sharedClients.values()].map((client) => client.shutdown())); await ownership.release(); };
+			try { await coordinator.ensureLoaded(); }
+			catch (error) { await abandon(); if (generation !== ownGeneration) return; unavailable = datastoreError(error, "INDEX_CORRUPT"); ctx.ui.setStatus("markdown-datastore", `datastore: disabled (${unavailable.code})`); return; }
+			if (generation !== ownGeneration) { await abandon(); return; }
 			coordinator.relaunchQueued();
-			if (generation !== ownGeneration) { coordinator.shutdown(); await ownership.release(); await qmd?.shutdown(); await Promise.all([...sharedClients.values()].map((client) => client.shutdown())); return; }
+			if (generation !== ownGeneration) { await abandon(); return; }
 			service = new MarkdownDatastoreService(config, undefined, qmd, sharedClients);
 			service.bindMetadata(coordinator, indexes, ownership);
 			if (generation !== ownGeneration) { const abandoned = service; service = undefined; await abandoned.shutdown(); return; }
