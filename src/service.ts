@@ -83,11 +83,6 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		return store;
 	}
 	private budget(input?: object): ResultBudget { return resolveResultBudget(input as { maxBytes?: unknown; maxLines?: unknown } | undefined, { maxBytes: this.config.defaults.maxResultBytes ?? null, maxLines: this.config.defaults.maxResultLines ?? null }); }
-	private payloadBudget(budget: ResultBudget, store: string): ResultBudget {
-		if (budget.maxBytes === null) return budget;
-		const overhead = Buffer.byteLength(JSON.stringify({ contractVersion: 1, operation: "read", store, data: { content: "" }, provenance: { sources: [{ kind: "filesystem", observedAt: "2026-01-01T00:00:00.000Z", freshness: "current" }], startedAt: "2026-01-01T00:00:00.000Z", completedAt: "2026-01-01T00:00:00.000Z", durationMs: 0 }, bounds: { maxBytes: budget.maxBytes, maxLines: budget.maxLines, returnedBytes: 0, returnedLines: 1, truncated: false, continuation: "" }, warnings: [] }));
-		return overhead >= budget.maxBytes ? budget : { maxBytes: budget.maxBytes - overhead, maxLines: budget.maxLines };
-	}
 	private envelope<T>(operation: ResultEnvelope<T>["operation"], store: string, data: T, started: number, text = "", truncated = false, continuation?: string, sources: ResultEnvelope<T>["provenance"]["sources"] = [], warnings: ResultEnvelope<T>["warnings"] = [], budget?: ResultBudget, measuredLines?: number, applied?: { operationApplied: true; refreshIds: string[] }): ResultEnvelope<T> {
 		const effectiveBudget = budget ?? this.budget(); const returnedLines = measuredLines ?? lines(text); const completedAt = new Date().toISOString();
 		let returnedBytes = 0; let result!: ResultEnvelope<T>;
