@@ -350,8 +350,9 @@ test("attachment backlinks stay current and an edited referrer does not", async 
 	await assert.rejects(service.read({ continuation: Buffer.from("1").toString("base64url") }), { code: "STALE_CONTINUATION" });
 	await assert.rejects(service.read({ continuation: "ab".repeat(16) }), { code: "EXPIRED_CONTINUATION" });
 	const huge = Buffer.from(JSON.stringify({ store: "notes", revision: image.data.revision, query: "backlinks:map.png", offset: 0, maxBytes: 10_000_000, maxLines: 1 })).toString("base64url");
-	const clamped = await service.read({ continuation: huge });
-	assert.equal(clamped.bounds.maxBytes <= 32 * 1024, true);
+	const explicit = await service.read({ continuation: huge });
+	assert.equal(explicit.bounds.maxBytes, 10_000_000);
+	assert.equal(explicit.bounds.returnedBytes, Buffer.byteLength(JSON.stringify(explicit)));
 });
 
 test("shared attachment backlink stays current until the referrer changes", async (t) => {

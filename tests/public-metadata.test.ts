@@ -145,7 +145,7 @@ test("shared tools page catalog, tag find, and links through the owner", async (
 	await chmod(socketDir, 0o700);
 	const notes = join(root, "notes");
 	await mkdir(notes, { recursive: true });
-	const links = [0, 1, 2].map((index) => `[[t${index}|${"y".repeat(180)}]]`).join(" ");
+	const links = [0, 1, 2].map((index) => `[[t${index}|${"y".repeat(400)}]]`).join(" ");
 	await writeFile(join(notes, "alpha.md"), `---\ntags: [Travel, Notes, Maps]\n---\n${links}\n`);
 	for (const name of ["t0.md", "t1.md", "t2.md"]) await writeFile(join(notes, name), "Target.\n");
 	const state = join(root, "state");
@@ -172,14 +172,17 @@ test("shared tools page catalog, tag find, and links through the owner", async (
 	const read = app.tools.find((tool) => tool.name === "datastore_read");
 	await refresh.execute("1", { store: "notebook", mode: "metadata" }, new AbortController().signal);
 	await host.coordinators.get("notebook")?.settled();
-	const catalog = JSON.parse((await tags.execute("2", { store: "notebook", maxBytes: 400 }, new AbortController().signal)).content[0].text);
+	await assert.rejects(tags.execute("too-small", { store: "notebook", maxBytes: 400 }, new AbortController().signal), { code: "RESULT_LIMIT_EXCEEDED" });
+	const catalog = JSON.parse((await tags.execute("2", { store: "notebook", maxBytes: 1600 }, new AbortController().signal)).content[0].text);
+	assert.equal(catalog.bounds.maxBytes, 1600);
+	assert.ok(Buffer.byteLength(JSON.stringify(catalog)) <= 1600);
 	assert.equal(catalog.data.tags.length >= 1, true);
 	assert.equal(catalog.data.total, 3);
 	assert.equal("pages" in catalog.data.tags[0], false);
 	const seen = new Set<string>();
 	let token = catalog.bounds.continuation;
 	while (token) {
-		const next = JSON.parse((await tags.execute("3", { store: "notebook", maxBytes: 400, continuation: token }, new AbortController().signal)).content[0].text);
+		const next = JSON.parse((await tags.execute("3", { store: "notebook", maxBytes: 1600, continuation: token }, new AbortController().signal)).content[0].text);
 		for (const tag of next.data.tags) seen.add(tag.identity);
 		token = next.bounds.continuation;
 	}
@@ -191,7 +194,7 @@ test("shared tools page catalog, tag find, and links through the owner", async (
 	assert.equal(found.data.candidates[0].uri, "datastore://notebook/alpha.md");
 	assert.notEqual(found.data.candidates[0].revision, found.provenance.sources[0].indexRevision);
 	assert.match(String(found.provenance.sources[0].indexRevision), /^meta-/);
-	const first = JSON.parse((await read.execute("6", { store: "notebook", note: { store: "notebook", path: "alpha.md" }, view: "links", maxBytes: 800 }, new AbortController().signal)).content[0].text);
+	const first = JSON.parse((await read.execute("6", { store: "notebook", note: { store: "notebook", path: "alpha.md" }, view: "links", maxBytes: 2400 }, new AbortController().signal)).content[0].text);
 	assert.equal(first.data.returned >= 1, true);
 	assert.equal(first.data.occurrenceCount, 3);
 	assert.ok(first.bounds.continuation);
@@ -206,6 +209,7 @@ test("shared tools page catalog, tag find, and links through the owner", async (
 	assert.equal(changed.provenance.sources[0].freshness, "stale");
 	assert.match(changed.warnings.map((warning) => warning.message).join("\n"), new RegExp(String(first.data.revision)));
 	const client = createMarkdownDatastoreClient(app.pi.events, { timeoutMs: 3000 });
-	const viaClient = await client.tags({ store: "notebook", maxBytes: 400 });
+	const viaClient = await client.tags({ store: "notebook", maxBytes: 1600 });
+	assert.equal(viaClient.bounds.maxBytes, 1600);
 	assert.equal(viaClient.data.total, 3);
 });
