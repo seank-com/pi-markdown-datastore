@@ -20,7 +20,7 @@ async function fixture(t: import("node:test").TestContext, options: { holdHello?
 		attachSharedParser(socket, (message: any) => {
 			seen.push(message.operation);
 			const send = (result: unknown, invalid = false) => { if (!socket.destroyed) socket.write(encodeSharedMessage({ version: 1, requestId: message.requestId, generation: invalid && options.invalid === "generation" ? "gen-" + "a".repeat(32) : generation, definitionRevision: invalid && options.invalid === "definition" ? "b".repeat(64) : definitionRevision, ok: true, result })); };
-			if (message.operation === "hello") { helloSeen(); void held.then(() => send({ generation, version: "fixture" })); }
+			if (message.operation === "hello") { helloSeen(); void held.then(() => send({ generation, version: "fixture", resultBudgetVersion: 1 })); }
 			if (message.operation === "activity") send({ state: "idle", active: false, queued: false, embeddingActive: false, jobs: [] }, true);
 		}, () => socket.destroy());
 	});
