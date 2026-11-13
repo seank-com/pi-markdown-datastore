@@ -221,8 +221,11 @@ immediately; malformed/incompatible or duplicate replies grant no capability.
 All six model-facing tools use object-root parameter schemas. Conditional
 `anyOf`/`oneOf` object branches explicitly declare their object type, including
 presence constraints inside `not`, so provider validators do not infer a
-non-object union. The read-view/continuation and refresh-action exclusions remain
-part of the schema and runtime validation.
+non-object union. Refresh uses flat root alternatives for start without paths,
+metadata start with paths, and cancellation: xAI rejects the equivalent nested
+start/path choice even when its branches declare object types. The
+read-view/continuation and refresh-action exclusions remain part of the schema
+and runtime validation.
 
 All six model-facing tools and the event responder register independently of
 configuration success. Configuration/backend construction occurs in

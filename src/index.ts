@@ -73,7 +73,9 @@ const Schemas = {
 		},
 		additionalProperties: false,
 		anyOf: [
-			{ type: "object", properties: { action: { type: "string", enum: ["start"] } }, not: { type: "object", required: ["refreshId"] }, anyOf: [{ type: "object", not: { type: "object", required: ["paths"] } }, { type: "object", required: ["mode"], properties: { mode: { type: "string", enum: ["metadata"] } } }] },
+			// Keep root alternatives flat: xAI rejects the equivalent nested path choice.
+			{ type: "object", properties: { action: { type: "string", enum: ["start"] } }, ...forbidden("refreshId", "paths") },
+			{ type: "object", required: ["mode", "paths"], properties: { action: { type: "string", enum: ["start"] }, mode: { type: "string", enum: ["metadata"] } }, not: { type: "object", required: ["refreshId"] } },
 			{ type: "object", required: ["action", "refreshId"], properties: { action: { type: "string", enum: ["cancel"] } }, not: { type: "object", anyOf: [{ type: "object", required: ["store"] }, { type: "object", required: ["mode"] }, { type: "object", required: ["paths"] }] } },
 		],
 	}),

@@ -106,11 +106,16 @@ test("conditional read/refresh schemas explicitly declare object branches withou
 	for (const tool of app.tools) visit(tool.parameters);
 	const read = app.tools.find(tool => tool.name === "datastore_read").parameters;
 	const refresh = app.tools.find(tool => tool.name === "datastore_refresh").parameters;
+	// xAI rejects the nested start/path union despite explicit object types.
+	for (const branch of refresh.anyOf) {
+		assert.equal(branch.anyOf, undefined, "refresh root alternatives must be flat");
+		assert.equal(branch.oneOf, undefined, "refresh root alternatives must be flat");
+	}
 	for (const input of [{}, { note: { store: "memory", path: "one.md" } }, { continuation: "opaque" }, { view: "section", headingPath: ["Heading"] }, { view: "outline" }]) assert.equal(Check(read, input), true);
 	for (const input of [null, [], "text", { continuation: "opaque", store: "memory" }, { continuation: "opaque", maxLines: 10 }, { view: "content", headingPath: ["Heading"] }, { view: "section", includeFrontmatter: true }, { view: "outline", sectionHandle: "opaque" }, { unknown: true }]) assert.equal(Check(read, input), false);
 	const refreshId = "a".repeat(32);
-	for (const input of [{}, { action: "start", store: "memory", mode: "lexical" }, { action: "cancel", refreshId }]) assert.equal(Check(refresh, input), true);
-	for (const input of [null, [], "text", { refreshId }, { action: "start", refreshId }, { action: "cancel" }, { action: "cancel", refreshId, store: "memory" }, { action: "cancel", refreshId, mode: "semantic" }]) assert.equal(Check(refresh, input), false);
+	for (const input of [{}, { action: "start", store: "memory", mode: "lexical" }, { mode: "metadata" }, { mode: "metadata", paths: ["one.md"] }, { action: "start", mode: "metadata", paths: ["one.md"] }, { mode: "rebuild" }, { action: "cancel", refreshId }]) assert.equal(Check(refresh, input), true);
+	for (const input of [null, [], "text", { refreshId }, { action: "start", refreshId }, { action: "cancel" }, { action: "cancel", refreshId, store: "memory" }, { action: "cancel", refreshId, mode: "semantic" }, { action: "cancel", refreshId, paths: ["one.md"] }, { paths: ["one.md"] }, { mode: "lexical", paths: ["one.md"] }, { mode: "rebuild", paths: ["one.md"] }, { mode: "metadata", paths: [] }, { mode: "metadata", paths: [""] }]) assert.equal(Check(refresh, input), false);
 });
 
 test("refresh end metrics include only structural counts and backend state", async (t) => {
