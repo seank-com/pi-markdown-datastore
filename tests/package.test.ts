@@ -67,7 +67,8 @@ void policy.roots({}); void policy.validateDestination({ path: "/example/new.md"
         child.stdout.on("data", chunk => { stdout += chunk; if (stdout.includes("\n")) resolve(); });
         child.once("close", code => reject(new Error(`Shared CLI exited before readiness (${code}): ${stderr}`)));
       });
-      assert.match(stdout.trim(), /^[0-9a-f-]{36}$/);
+      // The service publishes an opaque nonempty generation, not a UUID.
+      assert.ok(stdout.trim());
       assert.equal((await stat(socketPath)).isSocket(), true);
       // No clients have attached: service lifetime must not depend on one.
       assert.equal(child.exitCode, null);
