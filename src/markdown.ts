@@ -141,7 +141,8 @@ export function boundedPage(text: string, cursor: number, maxBytes: number | nul
 		const point = text.codePointAt(index)!;
 		const char = String.fromCodePoint(point);
 		const charBytes = Buffer.byteLength(char);
-		if ((maxBytes !== null && bytes + charBytes > maxBytes) || (maxLines !== null && char === "\n" && newlines + 1 >= maxLines)) { longLine = newlines === 0 && !output.includes("\n"); break; }
+		if (maxBytes !== null && bytes + charBytes > maxBytes) { longLine = newlines === 0 && !output.includes("\n"); break; }
+		if (maxLines !== null && char === "\n" && newlines + 1 >= maxLines) { output += char; bytes += charBytes; index += char.length; break; }
 		output += char; bytes += charBytes; if (char === "\n") newlines += 1; index += char.length;
 	}
 	if (index < text.length && output.length === 0) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");

@@ -59,7 +59,8 @@ export interface ResultEnvelope<T> {
 	warnings: DatastoreWarning[];
 }
 
-export interface SearchInput {
+export interface ResultBudgetInput { maxBytes?: number; maxLines?: number }
+export interface SearchInput extends ResultBudgetInput {
 	store: StoreName; query: string; mode?: SearchMode; limit?: number; minScore?: number;
 	freshness?: FreshnessPolicy; includeContent?: boolean;
 }
@@ -80,7 +81,7 @@ export type FindSelector =
 	| { kind: "tag"; value: string }
 	| { kind: "property"; name: string; value: string | number | boolean | null }
 	| { kind: "link"; target: string };
-export interface FindInput { store: StoreName; selectors: FindSelector[]; match?: "all" | "any"; limit?: number }
+export interface FindInput extends ResultBudgetInput { store: StoreName; selectors: FindSelector[]; match?: "all" | "any"; limit?: number }
 export interface FindCandidate { note: NoteRef; uri: NoteUri; title: string; revision: string }
 export interface FindData { candidates: FindCandidate[]; examined: number; partial: boolean }
 export type FindResult = ResultEnvelope<FindData>;
@@ -93,17 +94,17 @@ export interface ReadInput {
 }
 export type ReadData = Record<string, unknown>;
 export type ReadResult = ResultEnvelope<ReadData>;
-export interface StatusInput { store?: StoreName }
+export interface StatusInput extends ResultBudgetInput { store?: StoreName }
 export type StatusResult = ResultEnvelope<{ stores: unknown[]; enabled: boolean }>;
-export type RefreshInput =
+export type RefreshInput = ResultBudgetInput & (
 	| { action?: "start"; store?: StoreName; mode?: "direct" | "lexical" | "semantic" | "all" | "metadata" | "rebuild"; paths?: string[] }
-	| { action: "cancel"; refreshId: string };
+	| { action: "cancel"; refreshId: string });
 export type RefreshResult = ResultEnvelope<Record<string, unknown>>;
 
-export type RootsInput = Record<string, never>;
+export type RootsInput = ResultBudgetInput;
 export interface DatastoreRoot { store: string; path: string; device: number; inode: number }
 export type RootsResult = ResultEnvelope<{ roots: DatastoreRoot[] }>;
-export interface DestinationInput { path: string }
+export interface DestinationInput extends ResultBudgetInput { path: string }
 export type DestinationResult = ResultEnvelope<{ path: string; owned: boolean; stores: string[] }>;
 
 export type MarkdownDatastoreRequest =

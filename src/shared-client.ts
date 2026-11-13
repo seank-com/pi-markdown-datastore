@@ -62,8 +62,9 @@ export class SharedIndexClient {
 			pending.clear();
 		});
 		try {
-			const hello = await this.send(socket, pending, "hello", undefined, signal) as { generation?: string; version?: string };
+			const hello = await this.send(socket, pending, "hello", undefined, signal) as { generation?: string; version?: string; resultBudgetVersion?: number };
 			if (typeof hello?.generation !== "string" || hello.generation !== boundGeneration || typeof hello.version !== "string") throw new DatastoreError("BACKEND_OUTPUT_INVALID");
+			if (hello.resultBudgetVersion !== 1) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
 			throwIfAborted(signal);
 			if (socket.destroyed) throw new DatastoreError("STORE_UNAVAILABLE");
 			this.#generation = hello.generation; this.version = hello.version;

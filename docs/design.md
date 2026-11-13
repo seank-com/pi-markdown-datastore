@@ -65,9 +65,7 @@ changed candidates. Semantic retrieval requires complete backend embeddings;
 
 Results retain provenance, bounds and warnings. Omitted `maxBytes` and `maxLines` are unbounded unless configuration sets an explicit finite default. Bounds use null for an unbounded dimension. `resultBudgetVersion: 1` advertises that contract. A caller may pass a positive finite budget on any operation. Other limits include 10 MiB per source file, 20 search hits, 500 backend candidates and 100 outline entries. Body and section continuations, and section handles, are
 revision-bound, expire after 15 minutes, and live in a bounded 256-entry registry.
-Metadata continuations are stateless tokens bound to the store, index revision, and query. They are not registry entries and have no separate lifetime. Snippets use
-current body paragraphs, exclude frontmatter, and obey 1024-byte/30-line and
-aggregate limits. They do not interpret backend chunk offsets.
+Metadata continuations are stateless tokens bound to the store, index revision, and query. They are not registry entries and have no separate lifetime. Snippets use current body paragraphs and exclude frontmatter. They are not cut to a fixed excerpt size. They do not interpret backend chunk offsets.
 
 ## Metadata index
 

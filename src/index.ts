@@ -54,7 +54,7 @@ const Schemas = {
 		},
 		additionalProperties: false,
 		anyOf: [
-			{ type: "object", required: ["continuation"], ...forbidden("store", "note", "uri", "view", "includeFrontmatter", "excludeSections", "headingPath", "occurrence", "sectionHandle", "includeSemanticRelated", "maxBytes", "maxLines") },
+			{ type: "object", required: ["continuation"], ...forbidden("store", "note", "uri", "view", "includeFrontmatter", "excludeSections", "headingPath", "occurrence", "sectionHandle", "includeSemanticRelated") },
 			{ type: "object", properties: { view: { type: "string", enum: ["content"] } }, ...forbidden("continuation", "headingPath", "occurrence", "sectionHandle", "includeSemanticRelated") },
 			{ type: "object", required: ["view"], properties: { view: { type: "string", enum: ["section"] } }, ...forbidden("continuation", "includeFrontmatter", "excludeSections", "includeSemanticRelated") },
 			{ type: "object", required: ["view"], properties: { view: { type: "string", enum: ["outline"] } }, ...forbidden("continuation", "includeFrontmatter", "excludeSections", "headingPath", "occurrence", "sectionHandle", "includeSemanticRelated") },

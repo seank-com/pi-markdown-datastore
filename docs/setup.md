@@ -13,14 +13,12 @@ mkdir -p notes .pi/markdown-datastore
 chmod 700 .pi/markdown-datastore
 ```
 
-Write `.pi/markdown-datastore/config.json` with generic store identities:
+Write `.pi/markdown-datastore/config.json` with generic store identities. Omit `maxResultBytes` and `maxResultLines` for unbounded results. An explicit positive finite value is optional and is honored as a default, not a hidden ceiling:
 
 ```json
 {
   "schemaVersion": 1,
   "defaults": {
-    "maxResultBytes": 12288,
-    "maxResultLines": 300,
     "operationTimeoutMs": 10000
   },
   "qmd": {
@@ -114,8 +112,6 @@ For example, a catalog can use this shape. The numeric settings repeat the priva
   "socketPath": "/example/run/markdown.sock",
   "stateRoot": "/example/state/shared",
   "defaults": {
-    "maxResultBytes": 12288,
-    "maxResultLines": 300,
     "operationTimeoutMs": 10000
   },
   "qmd": {

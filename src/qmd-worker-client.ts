@@ -67,7 +67,7 @@ export class QmdWorkerClient {
 		return child;
 	}
 	private consume(chunk: Buffer): void {
-		const incoming = Buffer.from(chunk); this.#stdout = this.#stdout.length === 0 ? incoming : Buffer.concat([this.#stdout, incoming]);
+		this.#stdout = this.#stdout.length === 0 ? Buffer.concat([chunk]) : Buffer.concat([this.#stdout, chunk]);
 		for (;;) {
 			const newline = this.#stdout.indexOf(10); if (newline < 0) return;
 			const line = this.#stdout.subarray(0, newline);

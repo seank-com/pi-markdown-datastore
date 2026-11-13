@@ -82,16 +82,19 @@ function endpointIsLive(socketPath: string): Promise<boolean> {
 export function attachSharedParser(socket: Socket, onMessage: (message: SharedRequest | SharedReply) => void, onFailure: (error: unknown) => void): void {
 	let pending = "";
 	socket.setEncoding("utf8");
-	socket.on("data", (chunk: string) => {
+	const release = () => { pending = ""; socket.off("data", onData); socket.off("close", release); };
+	const onData = (chunk: string) => {
 		pending += chunk;
 		let newline = pending.indexOf("\n");
 		while (newline >= 0) {
 			const line = pending.slice(0, newline);
 			pending = pending.slice(newline + 1);
-			try { onMessage(JSON.parse(line)); } catch (error) { onFailure(error); return; }
+			try { onMessage(JSON.parse(line)); } catch (error) { release(); onFailure(error); return; }
 			newline = pending.indexOf("\n");
 		}
-	});
+	};
+	socket.on("data", onData);
+	socket.on("close", release);
 }
 
 export async function listenOwnedSocket(socketPath: string, onConnection: (socket: Socket) => void): Promise<Server> {
