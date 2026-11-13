@@ -4,7 +4,8 @@ import { discoverQmdBinding, prepareQmdStateDirectory, qmdApplicationDirectory, 
 import { acquireIndexOwnership, type IndexOwnership } from "./index-ownership.ts";
 import { adoptLegacyApplicationJobs, MaintenanceCoordinator, sourceDefinition } from "./maintenance-coordinator.ts";
 import { MetadataIndex, registerMetadata, reconcileChanged, pageRendered, continuationOffset, continuationToken, tagCandidate } from "./metadata-index.ts";
-import { clampReadBudget, type MarkdownDatastoreConfig, type StoreConfig } from "./config.ts";
+import type { MarkdownDatastoreConfig, StoreConfig } from "./config.ts";
+import { clampReadBudget } from "./config-common.ts";
 import { validateRelativeContainedPath } from "./containment.ts";
 import { DatastoreError } from "./errors.ts";
 import { loadSharedCatalog, type SharedCatalog, type SharedStoreDefinition } from "./shared-catalog.ts";

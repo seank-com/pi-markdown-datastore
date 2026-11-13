@@ -139,7 +139,7 @@ The source root and the state/socket parents must exist. The host creates and va
 
 ### Manual foreground check
 
-The service runs in the foreground; an operator or service manager owns that process. For a manual check after building:
+The service runs in the foreground; an operator or service manager owns that process. The foreground entry uses Node and this package's production dependencies, without requiring Pi/TypeBox peers or the Pi extension loader. The hosted Pi extension still uses its host's peers and project configuration directory. For a manual check after building:
 
 ```bash
 node dist/shared-service-main.js --catalog /absolute/catalog.json

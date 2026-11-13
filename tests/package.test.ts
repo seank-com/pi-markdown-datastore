@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFileSync, spawn } from "node:child_process";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -44,6 +44,43 @@ void policy.roots({}); void policy.validateDestination({ path: "/example/new.md"
     stores: { notes: { root: "notes", include: ["**/*.md"], exclude: [], maxFileBytes: 4096, search: { defaultMode: "lexical", qmdCollection: "notes" } } },
   };
   await writeFile(join(configDir, "config.json"), JSON.stringify(config), { mode: 0o600 });
+  await t.test("foreground shared CLI starts and stops without installed Pi peers", async () => {
+    const run = await realpath(await mkdtemp("/tmp/datastore-cli-"));
+    const catalog = join(run, "catalog.json"), socketPath = join(run, "owner.sock");
+    await writeFile(catalog, JSON.stringify({ ...config, socketPath, stateRoot: join(run, "state"),
+      stores: { notes: { ...config.stores.notes, root: await realpath(join(consumer, "notes")) } },
+    }), { mode: 0o600 });
+    for (const name of ["@earendil-works", "typebox"]) {
+      await assert.rejects(stat(join(consumer, "node_modules", name)), { code: "ENOENT" });
+    }
+    const child = spawn(process.execPath, [join(consumer, "node_modules/@seank/pi-markdown-datastore/dist/shared-service-main.js"), "--catalog", catalog], {
+      cwd: consumer, stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stderr = "", stdout = "";
+    child.stderr.on("data", chunk => { stderr += chunk; });
+    const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(resolve => {
+      child.once("close", (code, signal) => resolve({ code, signal }));
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        child.once("error", reject);
+        child.stdout.on("data", chunk => { stdout += chunk; if (stdout.includes("\n")) resolve(); });
+        child.once("close", code => reject(new Error(`Shared CLI exited before readiness (${code}): ${stderr}`)));
+      });
+      assert.match(stdout.trim(), /^[0-9a-f-]{36}$/);
+      assert.equal((await stat(socketPath)).isSocket(), true);
+      // No clients have attached: service lifetime must not depend on one.
+      assert.equal(child.exitCode, null);
+      child.kill("SIGTERM");
+      assert.deepEqual(await exited, { code: 0, signal: null });
+      await assert.rejects(stat(socketPath), { code: "ENOENT" });
+      assert.equal(await readFile(join(consumer, "notes/one.md"), "utf8"), "# One\nPacked source text\n");
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+      await exited;
+      await rm(run, { recursive: true, force: true });
+    }
+  });
   const sdkRoot = await createQmdFixture(consumer);
   await writeFile(join(consumer, "probe.ts"), `
 import assert from "node:assert/strict";

@@ -4,7 +4,7 @@ import type {
 	RootsInput, RootsResult, DestinationInput, DestinationResult, MarkdownDatastorePolicyV1,
 } from "./contract.ts";
 import type { MarkdownDatastoreConfig, StoreConfig } from "./config.ts";
-import { clampReadBudget, HARD_MAX_RESULT_BYTES, HARD_MAX_RESULT_LINES } from "./config.ts";
+import { clampReadBudget, HARD_MAX_RESULT_BYTES, HARD_MAX_RESULT_LINES } from "./config-common.ts";
 import { assertRootIdentity, inspectDestination, ownsDestination, noteUriToRef, redactedRoot, safeOpenNote, validateRelativeContainedPath, validateRelativeNotePath } from "./containment.ts";
 import { ContinuationRegistry, type ContinuationDescriptor } from "./continuations.ts";
 import { DatastoreError, throwIfAborted } from "./errors.ts";

@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open, realpath, stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
-import { assertNoDuplicateJsonKeys, type QmdConfig, type StoreConfig } from "./config.ts";
+import type { QmdConfig, StoreConfig } from "./config.ts";
+import { assertNoDuplicateJsonKeys } from "./config-common.ts";
 import { DatastoreError } from "./errors.ts";
 
 export interface SharedStoreDefinition {

@@ -6,7 +6,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { SearchMode } from "./contract.ts";
 import type { MarkdownDatastoreConfig, StoreConfig } from "./config.ts";
-import { HARD_MAX_CANDIDATES } from "./config.ts";
+import { HARD_MAX_CANDIDATES } from "./config-common.ts";
 import { validateRelativeNotePath, walkSafeNoteMetadata } from "./containment.ts";
 import { abortError, DatastoreError, throwIfAborted } from "./errors.ts";
 import { QmdWorkerClient, type QmdWorkerProgress, type QmdWorkerRequest } from "./qmd-worker-client.ts";
