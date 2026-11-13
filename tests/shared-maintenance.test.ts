@@ -197,7 +197,7 @@ test("concurrent calls wait for one completed attachment", async (t) => {
 		socket.once("close", () => sockets.delete(socket));
 		attachSharedParser(socket, (message: any) => {
 			seen.push(message.operation);
-			if (message.operation === "hello") { helloSeen(); void held.then(() => socket.write(encodeSharedMessage({ version: 1, requestId: message.requestId, generation, definitionRevision: "c".repeat(64), ok: true, result: { generation, version: "fixture" } }))); }
+			if (message.operation === "hello") { helloSeen(); void held.then(() => socket.write(encodeSharedMessage({ version: 1, requestId: message.requestId, generation, definitionRevision: "c".repeat(64), ok: true, result: { generation, version: "fixture", resultBudgetVersion: 1 } }))); }
 			if (message.operation === "activity") socket.write(encodeSharedMessage({ version: 1, requestId: message.requestId, generation, definitionRevision: "c".repeat(64), ok: true, result: { state: "idle", active: false, queued: false, embeddingActive: false, jobs: [] } }));
 		}, () => socket.destroy());
 	});
