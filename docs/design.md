@@ -1,8 +1,22 @@
 # Markdown datastore design
 
 Source Markdown is authoritative. The extension owns configured source scope,
-safe reads, bounded results, Pi tools/events, and supervised maintenance. qmd
-owns indexing, embeddings, ranking, model lifetime, cache storage and recovery.
+safe reads, caller-controlled results, Pi tools/events, and supervised maintenance.
+qmd owns indexing, embeddings, ranking, model lifetime, cache storage and recovery.
+
+## Reading map
+
+- [Identity and source validation](#identity-and-source-validation)
+- [Operations and bounds](#operations-and-bounds): [caller budgets](#result-budgets),
+  [paging and applied work](#paging-and-applied-work), and implementation boundaries
+- [Metadata index](#metadata-index)
+- [Restrictions register](#restrictions-register)
+- [Public qmd lifecycle](#public-qmd-lifecycle)
+- [Refresh and recovery](#refresh-and-recovery)
+- [Shared datastores](#shared-datastores)
+- [Integration lifecycle and packaging](#integration-lifecycle-and-packaging):
+  [request ownership](#request-and-resource-ownership) and
+  [root/destination policy](#public-root-and-destination-policy)
 
 ## Identity and source validation
 
@@ -47,8 +61,7 @@ may be absent until the next explicit/startup reconciliation.
 
 ## Operations and bounds
 
-The [result-budget contract](result-budget-design.md) describes caller-controlled
-byte/line output and resource ownership across local, shared and model interfaces.
+### Supported operations
 
 `datastore_find` accepts exact `.md` paths, datastore URIs, and a single frontmatter tag. A tag query uses the same one-leading-`#` identity as the index.
 `datastore_read` provides content, section, direct heading outlines, `links`, and `backlinks`. An attachment may be the subject of a backlink read; that read does not open the attachment as Markdown. Raw frontmatter is available through content reads with `includeFrontmatter`.
@@ -62,13 +75,94 @@ them when displaying results. Strict freshness rejects unreconciled state or
 changed candidates. Semantic retrieval requires complete backend embeddings;
 `allow-stale` does not select an older semantic snapshot.
 
-Results retain provenance, bounds and warnings. Omitted `maxBytes` and `maxLines` are unbounded unless configuration sets an explicit finite default. Bounds use null for an unbounded dimension. `resultBudgetVersion: 1` advertises that contract. A caller may pass a positive finite budget on any operation, overriding configured defaults. Byte counts and budgets include the complete serialized envelope. Logical payload lines count a final newline as a terminator, not an extra empty line. Continuation calls can change budgets without changing selection or revision. Page fitting allocates only returned content tokens; it does not consume registry entries for failed trials or use a fixed retry count. An undersized response after applied maintenance preserves all actual refresh IDs and the applied outcome. Other limits include 10 MiB per source file, 20 search hits, 500 backend candidates and 100 outline entries. Body and section continuations, and section handles, are
-revision-bound, expire after 15 minutes, and live in a bounded 256-entry registry.
-Metadata continuations are stateless tokens bound to the store, index revision, and query. They are not registry entries and have no separate lifetime. Snippets use current body paragraphs and exclude frontmatter. They are not cut to a fixed excerpt size. They do not interpret backend chunk offsets.
+### Result budgets
+
+Datastore supplies local knowledge, not a model-context policy. `maxBytes` and
+`maxLines` are optional caller controls on every public result operation: search,
+find, all read views, tags, status, refresh/cancel, roots and destination validation.
+The same contract applies to tools, event clients and shared hosting.
+
+Each omitted dimension uses an explicit `defaults.maxResultBytes` or
+`defaults.maxResultLines` if configured; otherwise it is unbounded. A caller value
+is a positive finite safe integer and overrides the configured default rather
+than being clamped to it. Invalid values are rejected. No helper, formatter or transport
+adds a replacement ceiling. Existing finite configuration remains effective until
+the operator deliberately changes it.
+
+Results retain provenance, bounds and warnings. `bounds.maxBytes` and
+`bounds.maxLines` use JSON null for an unbounded dimension, never JSON infinity.
+Byte budgets and `returnedBytes` cover the complete serialized envelope, including
+metadata. Logical payload lines count a final newline as a terminator, not an
+extra empty line; snippet lines aggregate across hits independently of JSON
+formatting. Search excerpts select current relevant body paragraphs, exclude
+frontmatter and do not interpret backend chunk offsets or impose a separate size
+ceiling.
+
+### Paging and applied work
+
+Pageable results fit the actual full envelope and provide a continuation when
+more remains. Content fitting makes progress without a fixed attempt count and
+allocates only a token that will be returned; failed trials cannot evict earlier
+tokens. Caller budgets can change on later pages without changing the token's
+selection, cursor, source revision or query. Otherwise valid older finite tokens
+retain their meaning.
+
+Body/section continuations and section handles are revision-bound, expire after
+15 minutes and occupy the existing 256-entry registry. Metadata continuations are
+stateless store/index-revision/query-bound tokens with no separate lifetime.
+
+A nonpageable status, policy or receipt is not silently projected, stripped of
+fields or truncated into invalid JSON to fit a budget. If an honest result cannot
+fit, even at its minimum envelope, the call reports `RESULT_LIMIT_EXCEEDED` rather
+than raising the caller's value. An error is not itself promised to fit an
+impossibly small result budget. Root policy never returns an incomplete authority
+scope as though it were complete.
+
+Budget validation precedes maintenance admission or cancellation. If work has
+already been applied when its response fails the budget, error details retain
+`operationApplied: true` and `refreshIds` with every actual known job ID. Shared
+and event clients preserve this outcome; model-facing error text includes the IDs.
+A response failure does not replay, cancel or terminalize the accepted work.
+
+### Budget flow and compatibility
+
+`contract`, `client` and `index` own typed inputs, discovery, tool schemas and
+result/error serialization. `config-common`, `config` and `shared-catalog` resolve
+the optional controls; `service`, `markdown`, `metadata-index` and `continuations`
+apply them while preserving source and paging identity.
+
+Discovery and the shared handshake advertise `resultBudgetVersion: 1`. A new
+client reports `CAPABILITY_UNAVAILABLE` rather than silently promising unbounded behavior
+from an older bounded owner. A client's selected budget does not become catalog
+policy for other clients. Output-budget changes do not change source/index
+identity or themselves require an index rebuild.
+
+Result sizing is separate from query selection, source-file validation, retention
+and execution policy. Existing limits include 10 MiB per source file, 20 search
+hits, 500 backend candidates and 100 outline entries. Their effective values and
+unresolved approvals remain in the [restrictions register](#restrictions-register).
 
 ## Metadata index
 
-Wikilink edges and frontmatter tags are a source-derived index beside qmd. The committed snapshot is one JSON object with `files`, stem-only `targets`, tag membership, and written-target `references`, plus revision, source-root identity, completeness, and diagnostics. A file link stores the written target, not a resolved path. Resolution happens when a link or backlink is read, against the current target list, so adding or removing a candidate changes resolution without reparsing the referring note. A missing shorthand target keeps an empty target entry. An explicit path is a reference, not an extra target alias. An unchanged content revision updates only the recorded timestamp and keeps that file's diagnostics. A path update with no snapshot, or a snapshot for a different source root, rebuilds that root instead of publishing a partial or merged index. A later path update changes only that file's lookup contributions. A failed lexical reconciliation stays due on the next cycle even when the graph is already current, and is cleared only by a successful lexical job. Shutdown stops the cycle timer before settlement and does not rearm it. `reconcile` compares inventory and timestamps, then opens changed notes. `rebuild` rereads every note and ignores stored timestamps. The four objects are replaced together; a failed write leaves the previous snapshot in memory and on disk. Dictionary keys are own properties, including names that would otherwise be inherited.  The maintenance coordinator and its job file live at the application state root and are created before qmd. Qmd receives that coordinator. The metadata index stays there when qmd is disabled or unavailable. Ordinary Markdown links are not edges. A backslash in a wikilink is unsupported syntax, not a path separator. Code identified by the Markdown parser is not an edge. One leading `#` is removed from a tag identity, once, for both indexing and query. A tag catalog entry is an identity, the retained display spelling, and the distinct page count. Relationship and catalog pages use the existing result envelope and the same caller budget resolution and full-envelope fitting. A continuation is bound to the store, the index revision, and the query. It is not a registry entry and has no separate lifetime. A query admits the indexed source root, the returned note by the source revision observed at refresh, and an attachment by contained-file inspection of size and mtime. It does not read an attachment body and does not claim a content hash for one. An incomplete scan or a changed returned note is stale, not current. Direct reads stay available when this index is rebuilding. The host acquires that stable directory before admission and releases it only after accepted work has settled. Capability discovery adds `metadata.links`, `metadata.backlinks`, and `metadata.tags` without removing the older ready, store, contract, or policy fields.
+Wikilink edges and frontmatter tags are a source-derived index beside qmd.
+
+### Snapshot and target resolution
+
+The committed snapshot is one JSON object with `files`, stem-only `targets`, tag membership, and written-target `references`, plus revision, source-root identity, completeness, and diagnostics. A file link stores the written target, not a resolved path. Resolution happens when a link or backlink is read, against the current target list, so adding or removing a candidate changes resolution without reparsing the referring note. A missing shorthand target keeps an empty target entry. An explicit path is a reference, not an extra target alias.
+
+### Incremental maintenance and ownership
+
+An unchanged content revision updates only the recorded timestamp and keeps that file's diagnostics. A path update with no snapshot, or a snapshot for a different source root, rebuilds that root instead of publishing a partial or merged index. A later path update changes only that file's lookup contributions. A failed lexical reconciliation stays due on the next cycle even when the graph is already current, and is cleared only by a successful lexical job. Shutdown stops the cycle timer before settlement and does not rearm it. `reconcile` compares inventory and timestamps, then opens changed notes. `rebuild` rereads every note and ignores stored timestamps. The four objects are replaced together; a failed write leaves the previous snapshot in memory and on disk. Dictionary keys are own properties, including names that would otherwise be inherited.  The maintenance coordinator and its job file live at the application state root and are created before qmd. Qmd receives that coordinator. The metadata index stays there when qmd is disabled or unavailable.
+
+### Parsing and tag identity
+
+Ordinary Markdown links are not edges. A backslash in a wikilink is unsupported syntax, not a path separator. Code identified by the Markdown parser is not an edge. One leading `#` is removed from a tag identity, once, for both indexing and query. A tag catalog entry is an identity, the retained display spelling, and the distinct page count.
+
+### Read admission and freshness
+
+Relationship and catalog pages use the existing result envelope and the same caller budget resolution and full-envelope fitting. A continuation is bound to the store, the index revision, and the query. It is not a registry entry and has no separate lifetime. A query admits the indexed source root, the returned note by the source revision observed at refresh, and an attachment by contained-file inspection of size and mtime. It does not read an attachment body and does not claim a content hash for one. An incomplete scan or a changed returned note is stale, not current. Direct reads stay available when this index is rebuilding. The host acquires that stable directory before admission and releases it only after accepted work has settled. Capability discovery adds `metadata.links`, `metadata.backlinks`, and `metadata.tags` without removing the older ready, store, contract, or policy fields.
+
+### Durable path scopes
 
 Metadata receipts own their admitted paths or explicit rebuild intent. A queued scope can coalesce more paths only after the combined scope is durably written; a rejected merge restores the earlier accepted scope before execution. New paths cannot change a running scope: they receive a queued follow-up without waiting for the running maintenance to finish. Explicit cancellation discards that receipt's work, not newer independently admitted notifications. Qmd jobs do not claim metadata paths.
 
@@ -96,7 +190,7 @@ additional encountered restrictions rather than assuming this list is exhaustive
 | Publication scanner Git-output capture is 256 MiB. Location: `scripts/check-private-terms.ts`; fixed by scanner maintainers. | Can reject large captured Git output. Specific necessity/approval is not established by the registry or revision-selection rules. |
 | Operator-managed user LaunchAgent with `RunAtLoad=true`, documented in `docs/setup.md`; no `KeepAlive` or custom launchd deadline in the example. | Starts the shared catalog service at OS-account login independently of client connections. Operator owns installation and lifecycle; accepted by Sean during PR #13 review. It does not provide pre-login boot startup or authorize live activation. |
 | Shared catalog uses protected JSON, the inherited 64 KiB configuration bound and one include pattern per native collection; the socket parent is owner-only and the socket mode is `0600`. Locations: `src/shared-catalog.ts`, `src/shared-ipc.ts`; catalog values belong to the operator. | Canonical definitions and owner-account-only local IPC are approved in issue #4. The catalog reuses existing reader/file/operation ranges rather than selecting a new transport deadline or frame cap. Reuse does not approve legacy numeric bounds; the single-pattern mapping follows the qualified qmd collection interface. |
-| Metadata catalog and relationship pages use the existing result envelope. Location: `src/service.ts`. The inherited 20-job and 256 KiB ledger checks remain in the common coordinator. | Prevents an unbounded tag or edge response from being treated as a complete page. No new item cap or continuation TTL is added. Reuse of the envelope and ledger bounds does not approve them. |
+| Metadata catalog and relationship pages use caller budgets in the common result envelope. Location: `src/service.ts`. The inherited 20-job and 256 KiB ledger checks remain in the common coordinator. | A finite response is explicitly partial with a continuation or reports that it cannot fit; unbounded results may include the complete catalog. No new item cap or continuation TTL is added. The independent ledger limits retain their unresolved approval gaps. |
 | Frontmatter depth 8, 1,000 nodes, 16 KiB strings, and 10 YAML aliases. Location: `src/markdown.ts`. Exceeding one fails the note as `FRONTMATTER_INVALID`. | Bounds YAML walked while parsing notes. Issue #2 surfaced these inherited values. This table records them. It does not approve them. |
 | One maintenance owner per derived index, independent of IPC path. Protected ownership directory `0700`, records `0600`; live or unverifiable owner/worker PIDs refuse admission. Locations: `src/index-ownership.ts`, `QmdAdapter`, native-worker registration. | Approved single-index ownership and operator restart without manual dead-owner cleanup, issue #4 and the owner's 2026-11-12 recovery decision. Atomic nonempty-directory admission prevents simultaneous reclaimers replacing one another. Only proven-dead process records are reclaimed; no lease timer, election, process killing or autostart. PID reuse is conservatively treated as live, not guessed dead. |
 
@@ -132,7 +226,8 @@ retryable error. Pending embeddings alone do not imply an active job. No fallbac
 is applied to arbitrary backend failures, empty results or incomplete embeddings.
 External maintenance must not run against an owned index concurrently.
 
-Workers use bounded v2 JSON frames and filtered environments. Caller cancellation
+Workers use v2 JSON frames and filtered environments. Valid request/result frames
+have no fixed size ceiling; diagnostic stderr has its separately registered bound. Caller cancellation
 terminates the owned process with bounded TERM/KILL escalation and waits for
 exit. The SDK does not accept an AbortSignal. Dispatched qmd reader requests use
 configured `operationTimeoutMs`, excluding their preceding queue wait. A native
@@ -216,6 +311,29 @@ configured store names, and optional `policyVersion: 1` plus `instanceId` for th
 supported policy API. No paths or write grant are returned by discovery. The
 query subscribes, emits, and unsubscribes synchronously. Missing services return
 immediately; malformed/incompatible or duplicate replies grant no capability.
+
+### Request and resource ownership
+
+Request-owned buffers, timers, abort handlers, waiters and subscriptions are
+released when the request succeeds, fails, is cancelled, disconnects or shuts
+down. Retired stream error handlers still consume late errors without letting an
+old child affect a newer call. Shared waiter detachment does not cancel accepted
+maintenance.
+
+`qmd-worker-client` collects frame fragments and assembles a completed frame once,
+rather than repeatedly copying its growing prefix. Drained backing storage and
+incomplete storage on retirement/close are released; a tiny tail does not retain
+an already consumed frame. `shared-ipc` releases partial frames and data/close
+subscriptions on close or parse failure. Neither path stores an additional
+long-lived serialized-result cache.
+
+Caller-held results, the current derived metadata snapshot, descriptor-only
+continuations and intentionally warm SDK workers have legitimate separate
+lifetimes. Resource cleanup does not imply zero-copy processing, immediate GC or
+a promise to recover from arbitrary memory exhaustion. These ownership rules are
+independent of caller output budgets, not a reason to impose another result cap.
+
+### Tool schemas and readiness
 
 All six model-facing tools use object-root parameter schemas. Conditional
 `anyOf`/`oneOf` object branches explicitly declare their object type, including
