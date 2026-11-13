@@ -47,6 +47,10 @@ may be absent until the next explicit/startup reconciliation.
 
 ## Operations and bounds
 
+The [unbounded result-size update](result-budget-design.md) specifies the authorized
+byte/line-budget and resource-lifecycle change under implementation. The limits
+below describe the current implementation until that update is completed.
+
 `datastore_find` accepts exact `.md` paths, datastore URIs, and a single frontmatter tag. A tag query uses the same one-leading-`#` identity as the index.
 `datastore_read` provides content, section, direct heading outlines, `links`, and `backlinks`. An attachment may be the subject of a backlink read; that read does not open the attachment as Markdown. Raw frontmatter is available through content reads with `includeFrontmatter`.
 `datastore_tags` lists tag identity, display spelling, and distinct page count. `datastore_refresh` mode `metadata` builds that index without qmd.
