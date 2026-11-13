@@ -36,7 +36,7 @@ test("public tags tool and client page the catalog and links exactly once", asyn
 	await writeFile(join(notes, "alpha.md"), `---\ntags: [Travel, Travel]\n---\n${links}\n![[map.png]]\n`);
 	for (let index = 0; index < 4; index += 1) await writeFile(join(notes, `t${index}.md`), "Target.\n");
 	await writeFile(join(notes, "map.png"), "not-read");
-	await writeFile(join(dir, "config.json"), JSON.stringify({ schemaVersion: 1, defaults: { maxResultBytes: 2200, maxResultLines: 100, operationTimeoutMs: 3000 }, qmd: { enabled: false, installation: { executable: "qmd" }, minimumVersion: "2.8.3" }, stores: { memory: { root: "notes", include: ["**/*.md"], exclude: [], maxFileBytes: 200000, search: { defaultMode: "lexical", qmdCollection: "memory" } } } }), { mode: 0o600 });
+	await writeFile(join(dir, "config.json"), JSON.stringify({ schemaVersion: 1, defaults: { maxResultBytes: 8000, maxResultLines: 100, operationTimeoutMs: 3000 }, qmd: { enabled: false, installation: { executable: "qmd" }, minimumVersion: "2.8.3" }, stores: { memory: { root: "notes", include: ["**/*.md"], exclude: [], maxFileBytes: 200000, search: { defaultMode: "lexical", qmdCollection: "memory" } } } }), { mode: 0o600 });
 	const app = harness(root);
 	createMarkdownDatastoreExtension({ projectRoot: root })(app.pi);
 	await app.fire("session_start");

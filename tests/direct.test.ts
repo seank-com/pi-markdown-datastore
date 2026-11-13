@@ -139,8 +139,9 @@ test("direct service pages bounded content and invalidates stale continuations",
 	const current = await fixture(t);
 	await writeFile(join(current.storeRoot, "note.md"), "# Heading\nline one\nline two\nline three\nline four\nline five\n");
 	const service = new MarkdownDatastoreService(await loadMarkdownDatastoreConfig(current.project, current.configPath));
-	const first = await service.read({ note: { store: "memory", path: "note.md" }, view: "content", maxBytes: 32, maxLines: 3 });
-	assert.equal(first.bounds.truncated, true); assert.equal(first.bounds.maxBytes, 32); assert.equal(first.bounds.maxLines, 3); assertBounded(first);
+	await assert.rejects(service.read({ note: { store: "memory", path: "note.md" }, view: "content", maxBytes: 32, maxLines: 3 }), { code: "RESULT_LIMIT_EXCEEDED" });
+	const first = await service.read({ note: { store: "memory", path: "note.md" }, view: "content", maxBytes: 2000, maxLines: 3 });
+	assert.equal(first.bounds.truncated, true); assert.equal(first.bounds.maxBytes, 2000); assert.equal(first.bounds.maxLines, 3); assertBounded(first);
 	assert.match(String(first.data.content), /Heading/);
 	assert.ok(first.bounds.continuation);
 	await writeFile(join(current.storeRoot, "note.md"), "# Changed\n");

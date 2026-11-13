@@ -14,6 +14,8 @@ export interface MarkdownDatastoreCapability {
 	readonly instanceId?: string;
 	/** Additive. Absent on older contracts; present when graph and tag reads are served. */
 	readonly metadata?: { readonly links: true; readonly backlinks: true; readonly tags: true };
+	/** Additive. Present when omitted result budgets are unbounded and null bounds mean unbounded. */
+	readonly resultBudgetVersion?: 1;
 }
 export interface MarkdownDatastoreCapabilityRequest { version: 1; requestId: string }
 export interface MarkdownDatastoreCapabilityReply {
@@ -53,7 +55,7 @@ export interface ResultEnvelope<T> {
 	store: string;
 	data: T;
 	provenance: { sources: SourceProvenance[]; startedAt: string; completedAt: string; durationMs: number };
-	bounds: { maxBytes: number; maxLines: number; returnedBytes: number; returnedLines: number; truncated: boolean; continuation?: string };
+	bounds: { maxBytes: number | null; maxLines: number | null; returnedBytes: number; returnedLines: number; truncated: boolean; continuation?: string };
 	warnings: DatastoreWarning[];
 }
 

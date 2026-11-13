@@ -133,14 +133,15 @@ export function contentWithoutSections(parsed: ParsedNote, text: string, exclusi
 }
 
 export interface Page { content: string; nextCursor?: number; returnedBytes: number; returnedLines: number; truncated: boolean; longLine: boolean }
-export function boundedPage(text: string, cursor: number, maxBytes: number, maxLines: number): Page {
+export function boundedPage(text: string, cursor: number, maxBytes: number | null, maxLines: number | null): Page {
 	if (!Number.isInteger(cursor) || cursor < 0 || cursor > text.length) throw new DatastoreError("EXPIRED_CONTINUATION");
+	if (maxBytes === null && maxLines === null) { const content = text.slice(cursor); return { content, nextCursor: undefined, returnedBytes: Buffer.byteLength(content), returnedLines: content.length === 0 ? 0 : content.split("\n").length, truncated: false, longLine: false }; }
 	let index = cursor; let bytes = 0; let newlines = 0; let output = ""; let longLine = false;
 	while (index < text.length) {
 		const point = text.codePointAt(index)!;
 		const char = String.fromCodePoint(point);
 		const charBytes = Buffer.byteLength(char);
-		if (bytes + charBytes > maxBytes || (char === "\n" && newlines + 1 >= maxLines)) { longLine = newlines === 0 && !output.includes("\n"); break; }
+		if ((maxBytes !== null && bytes + charBytes > maxBytes) || (maxLines !== null && char === "\n" && newlines + 1 >= maxLines)) { longLine = newlines === 0 && !output.includes("\n"); break; }
 		output += char; bytes += charBytes; if (char === "\n") newlines += 1; index += char.length;
 	}
 	if (index < text.length && output.length === 0) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");

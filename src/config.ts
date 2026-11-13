@@ -5,10 +5,11 @@ import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { DatastoreError } from "./errors.ts";
 import { loadSharedCatalog } from "./shared-catalog.ts";
 
-import { assertNoDuplicateJsonKeys, HARD_MAX_FILE_BYTES, HARD_MAX_RESULT_BYTES, HARD_MAX_RESULT_LINES } from "./config-common.ts";
-export { assertNoDuplicateJsonKeys, clampReadBudget, HARD_MAX_CANDIDATES, HARD_MAX_FILE_BYTES, HARD_MAX_OUTLINE, HARD_MAX_RESULT_BYTES, HARD_MAX_RESULT_LINES, HARD_MAX_SEARCH_RESULTS } from "./config-common.ts";
+import { assertNoDuplicateJsonKeys, HARD_MAX_FILE_BYTES } from "./config-common.ts";
+export { assertNoDuplicateJsonKeys, clampReadBudget, exceedsBudget, HARD_MAX_CANDIDATES, HARD_MAX_FILE_BYTES, HARD_MAX_OUTLINE, HARD_MAX_SEARCH_RESULTS, resolveResultBudget } from "./config-common.ts";
+export type { ResultBudget } from "./config-common.ts";
 
-export interface DatastoreDefaults { maxResultBytes: number; maxResultLines: number; operationTimeoutMs: number }
+export interface DatastoreDefaults { maxResultBytes?: number; maxResultLines?: number; operationTimeoutMs: number }
 export interface QmdConfig { enabled: boolean; installation: { executable?: string; packageRoot?: string }; minimumVersion: string }
 
 export interface SharedStoreReference { catalog: string; store: string; socketPath: string; definitionRevision: string }
@@ -50,6 +51,11 @@ function bool(value: unknown): boolean {
 }
 function integer(value: unknown, min: number, max: number): number {
 	if (!Number.isInteger(value) || (value as number) < min || (value as number) > max) throw new DatastoreError("CONFIG_INVALID");
+	return value as number;
+}
+function optionalBudget(value: unknown): number | undefined {
+	if (value === undefined) return undefined;
+	if (!Number.isSafeInteger(value) || (value as number) < 1) throw new DatastoreError("CONFIG_INVALID");
 	return value as number;
 }
 function stringArray(value: unknown): string[] {
@@ -123,8 +129,8 @@ export async function loadMarkdownDatastoreConfig(projectRootInput: string, conf
 
 	const defaultsRaw = record(top.defaults); exactKeys(defaultsRaw, DEFAULT_KEYS);
 	const defaults: DatastoreDefaults = {
-		maxResultBytes: integer(defaultsRaw.maxResultBytes, 1, HARD_MAX_RESULT_BYTES),
-		maxResultLines: integer(defaultsRaw.maxResultLines, 1, HARD_MAX_RESULT_LINES),
+		maxResultBytes: optionalBudget(defaultsRaw.maxResultBytes),
+		maxResultLines: optionalBudget(defaultsRaw.maxResultLines),
 		operationTimeoutMs: integer(defaultsRaw.operationTimeoutMs, 100, 60_000),
 	};
 	const qmdRaw = record(top.qmd); exactKeys(qmdRaw, QMD_KEYS);

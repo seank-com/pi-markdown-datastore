@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { truncateHead } from "@earendil-works/pi-coding-agent";
+
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import {
@@ -11,7 +11,7 @@ import {
 	type MarkdownDatastoreRequest, type MarkdownDatastoreResult, type MarkdownDatastoreRpcEnvelope,
 	type ReadInput, type RefreshInput,
 } from "./contract.ts";
-import { HARD_MAX_RESULT_BYTES, HARD_MAX_RESULT_LINES, loadMarkdownDatastoreConfig, projectDatastoreConfigPath } from "./config.ts";
+import { loadMarkdownDatastoreConfig, projectDatastoreConfigPath } from "./config.ts";
 import { DatastoreError, datastoreError } from "./errors.ts";
 import { discoverQmdBinding, qmdApplicationDirectory, QmdAdapter } from "./qmd-adapter.ts";
 import { adoptLegacyApplicationJobs, MaintenanceCoordinator, sourceDefinition } from "./maintenance-coordinator.ts";
@@ -33,15 +33,16 @@ const Selector = Type.Union([
 	Type.Object({ kind: StringEnum(["uri"] as const), uri: Type.String() }, { additionalProperties: false }),
 ]);
 const ReadIdentity = { store: Type.Optional(Type.String()), note: Type.Optional(Note), uri: Type.Optional(Type.String()) };
-const ReadBounds = { maxBytes: Type.Optional(Type.Integer({ minimum: 4, maximum: HARD_MAX_RESULT_BYTES })), maxLines: Type.Optional(Type.Integer({ minimum: 1, maximum: HARD_MAX_RESULT_LINES })) };
+const Budget = { maxBytes: Type.Optional(Type.Integer({ minimum: 1 })), maxLines: Type.Optional(Type.Integer({ minimum: 1 })) };
+const ReadBounds = Budget;
 const forbidden = (...keys: string[]) => ({ not: { type: "object", anyOf: keys.map((key) => ({ type: "object", required: [key] })) } });
 const PolicySchemas = {
-	roots: Type.Object({}, { additionalProperties: false }),
-	validateDestination: Type.Object({ path: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
+	roots: Type.Object({ ...Budget }, { additionalProperties: false }),
+	validateDestination: Type.Object({ path: Type.String({ minLength: 1 }), ...Budget }, { additionalProperties: false }),
 };
 const Schemas = {
-	search: Type.Object({ store: Type.String(), query: Type.String({ minLength: 1, maxLength: 4096 }), mode: Type.Optional(StringEnum(["lexical", "semantic", "hybrid"] as const)), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })), minScore: Type.Optional(Type.Number()), freshness: Type.Optional(StringEnum(["allow-stale", "require-current-lexical", "require-current-semantic"] as const)), includeContent: Type.Optional(Type.Boolean()) }, { additionalProperties: false }),
-	find: Type.Object({ store: Type.String(), selectors: Type.Array(Selector, { minItems: 1, maxItems: 8 }), match: Type.Optional(StringEnum(["all", "any"] as const)), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })), continuation: Type.Optional(Type.String()) }, { additionalProperties: false }),
+	search: Type.Object({ store: Type.String(), query: Type.String({ minLength: 1, maxLength: 4096 }), mode: Type.Optional(StringEnum(["lexical", "semantic", "hybrid"] as const)), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })), minScore: Type.Optional(Type.Number()), freshness: Type.Optional(StringEnum(["allow-stale", "require-current-lexical", "require-current-semantic"] as const)), includeContent: Type.Optional(Type.Boolean()), ...Budget }, { additionalProperties: false }),
+	find: Type.Object({ store: Type.String(), selectors: Type.Array(Selector, { minItems: 1, maxItems: 8 }), match: Type.Optional(StringEnum(["all", "any"] as const)), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })), continuation: Type.Optional(Type.String()), ...Budget }, { additionalProperties: false }),
 	read: Type.Unsafe<ReadInput>({
 		type: "object",
 		properties: {
@@ -60,7 +61,7 @@ const Schemas = {
 			{ type: "object", required: ["view"], properties: { view: { type: "string", enum: ["links", "backlinks"] } }, ...forbidden("includeFrontmatter", "excludeSections", "headingPath", "occurrence", "sectionHandle", "includeSemanticRelated") },
 		],
 	}),
-	status: Type.Object({ store: Type.Optional(Type.String()) }, { additionalProperties: false }),
+	status: Type.Object({ store: Type.Optional(Type.String()), ...Budget }, { additionalProperties: false }),
 	tags: Type.Object({ store: Type.String(), continuation: Type.Optional(Type.String()), maxBytes: Type.Optional(Type.Integer({ minimum: 1 })), maxLines: Type.Optional(Type.Integer({ minimum: 1 })) }, { additionalProperties: false }),
 	refresh: Type.Unsafe<RefreshInput>({
 		type: "object",
@@ -70,6 +71,8 @@ const Schemas = {
 			mode: { type: "string", enum: ["direct", "lexical", "semantic", "all", "metadata", "rebuild"], description: "Derived state to refresh. metadata accepts paths. rebuild rereads the store and ignores stored timestamps. Valid only for start." },
 			paths: { type: "array", minItems: 1, items: { type: "string", minLength: 1 }, description: "Relative paths changed by a publication. Valid only for metadata start. Invalid paths are rejected and do not become a rebuild." },
 			refreshId: { type: "string", pattern: "^[0-9a-f]{32}$", description: "Lexical or semantic job ID returned by a prior start. Required only for cancel." },
+			maxBytes: { type: "integer", minimum: 1 },
+			maxLines: { type: "integer", minimum: 1 },
 		},
 		additionalProperties: false,
 		anyOf: [
@@ -110,8 +113,7 @@ function validRpcRequest(value: unknown): value is MarkdownDatastoreRequest {
 
 function toolText(result: MarkdownDatastoreResult): string {
 	const serialized = JSON.stringify(result);
-	const bounded = truncateHead(serialized, { maxBytes: HARD_MAX_RESULT_BYTES, maxLines: HARD_MAX_RESULT_LINES });
-	return bounded.truncated ? `${bounded.content}\n[RESULT_LIMIT_EXCEEDED: structured result truncated at the datastore hard ceiling]` : bounded.content;
+	return serialized;
 }
 
 export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExtensionOptions = {}) {
@@ -126,7 +128,7 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 			if (!request || request.version !== 1 || typeof request.requestId !== "string" || request.requestId.length < 1 || request.requestId.length > 128) return;
 			const ownGeneration = generation;
 			const capability: MarkdownDatastoreCapability = {
-				version: 1, contractVersion: MARKDOWN_DATASTORE_CONTRACT_VERSION, policyVersion: 1,
+				version: 1, contractVersion: MARKDOWN_DATASTORE_CONTRACT_VERSION, policyVersion: 1, resultBudgetVersion: 1 as const,
 				get instanceId() { return generation === ownGeneration ? instanceId : undefined; },
 				get ready() { return generation === ownGeneration && service !== undefined; },
 				get stores() { return generation === ownGeneration && service ? [...service.config.stores.keys()] : []; },

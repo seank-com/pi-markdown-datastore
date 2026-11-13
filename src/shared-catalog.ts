@@ -22,7 +22,7 @@ export interface SharedCatalog {
 	path: string;
 	socketPath: string;
 	stateRoot: string;
-	defaults: { maxResultBytes: number; maxResultLines: number; operationTimeoutMs: number };
+	defaults: { maxResultBytes?: number; maxResultLines?: number; operationTimeoutMs: number };
 	qmd: QmdConfig;
 	stores: ReadonlyMap<string, SharedStoreDefinition>;
 }
@@ -88,8 +88,8 @@ export async function loadSharedCatalog(pathInput: string): Promise<SharedCatalo
 	if (!isAbsolute(socketPath) || !isAbsolute(stateRoot)) throw new DatastoreError("CONFIG_INVALID");
 	const defaultsRaw = record(top.defaults); exact(defaultsRaw, DEFAULTS);
 	const defaults = {
-		maxResultBytes: integer(defaultsRaw.maxResultBytes, 1, 32 * 1024),
-		maxResultLines: integer(defaultsRaw.maxResultLines, 1, 800),
+		maxResultBytes: defaultsRaw.maxResultBytes === undefined ? undefined : integer(defaultsRaw.maxResultBytes, 1, Number.MAX_SAFE_INTEGER),
+		maxResultLines: defaultsRaw.maxResultLines === undefined ? undefined : integer(defaultsRaw.maxResultLines, 1, Number.MAX_SAFE_INTEGER),
 		operationTimeoutMs: integer(defaultsRaw.operationTimeoutMs, 100, 60_000),
 	};
 	const qmdRaw = record(top.qmd); exact(qmdRaw, QMD);

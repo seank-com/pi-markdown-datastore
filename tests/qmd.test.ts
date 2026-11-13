@@ -150,7 +150,7 @@ test("search snippets exclude frontmatter while preserving body fallback and bud
 		assert.equal(hit.sourceRevision, hit.indexedRevision);
 		assert.doesNotMatch(hit.snippet!, /messageId:|provenance:|\uFFFD/);
 		if (item.expected !== undefined) { assert.equal(hit.snippet, item.expected); assert.equal(hit.truncated, false); }
-		else { assert.ok(hit.snippet!.startsWith("55 界")); assert.ok(Buffer.byteLength(hit.snippet!) <= 1024); assert.equal(hit.truncated, true); }
+		else { assert.ok(hit.snippet!.startsWith("55 界")); assert.ok(Buffer.byteLength(hit.snippet!) > 1024); assert.equal(Buffer.byteLength(hit.snippet!) % 3, 2); assert.equal(hit.truncated, false); }
 		assert.equal(await readFile(join(current.notes, "alpha.md"), "utf8"), item.text);
 	});
 });

@@ -334,14 +334,14 @@ export function tagCandidate(store: string, path: string, revision: string): { n
 	return { note, uri: noteRefToUri(note), title: path, revision };
 }
 
-export function pageRendered<T>(items: T[], offset: number, budget: { maxBytes: number; maxLines: number }, render: (page: T[]) => unknown): { items: T[]; next?: number } {
+export function pageRendered<T>(items: T[], offset: number, budget: { maxBytes: number | null; maxLines: number | null }, render: (page: T[]) => unknown): { items: T[]; next?: number } {
 	if (!Number.isInteger(offset) || offset < 0 || offset > items.length) throw new DatastoreError("STALE_CONTINUATION");
 	const selected: T[] = [];
 	let index = offset;
 	for (; index < items.length; index += 1) {
 		const candidate = [...selected, items[index]];
 		const text = JSON.stringify(render(candidate));
-		if (Buffer.byteLength(text) > budget.maxBytes || text.split("\n").length > budget.maxLines) {
+		if ((budget.maxBytes !== null && Buffer.byteLength(text) > budget.maxBytes) || (budget.maxLines !== null && text.split("\n").length > budget.maxLines)) {
 			if (selected.length === 0) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
 			break;
 		}
@@ -365,11 +365,11 @@ export function continuationOffset(token: string | undefined, store: string, rev
 	return parsed.offset ?? 0;
 }
 
-export function continuationToken(store: string, revision: string, query: string, offset: number, budget?: { maxBytes: number; maxLines: number }): string {
+export function continuationToken(store: string, revision: string, query: string, offset: number, budget?: { maxBytes: number | null; maxLines: number | null }): string {
 	return Buffer.from(JSON.stringify({ store, revision, query, offset, maxBytes: budget?.maxBytes, maxLines: budget?.maxLines })).toString("base64url");
 }
 
-export function readPageToken(token: string): { store: string; revision: string; query: string; offset: number; maxBytes?: number; maxLines?: number } {
+export function readPageToken(token: string): { store: string; revision: string; query: string; offset: number; maxBytes?: number | null; maxLines?: number | null } {
 	const parsed = decodePageToken(token);
 	if (typeof parsed.store !== "string" || typeof parsed.revision !== "string" || typeof parsed.query !== "string" || !Number.isInteger(parsed.offset) || (parsed.offset ?? -1) < 0) throw new DatastoreError("STALE_CONTINUATION");
 	return { store: parsed.store, revision: parsed.revision, query: parsed.query, offset: parsed.offset ?? 0, maxBytes: parsed.maxBytes, maxLines: parsed.maxLines };

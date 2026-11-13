@@ -54,7 +54,7 @@ async function execute(r) {
 }
 const lines=createInterface({input:process.stdin,crlfDelay:Infinity});
 lines.on('line',line=>{
- if(Buffer.byteLength(line)>1024*1024){void close();return;}
+
  let r;try{r=JSON.parse(line);}catch{void close();return;}
  if(r.version===2 && r.type==='shutdown'){if(!active)void close();else lines.close();return;}
  // Native SDK has no abort signal. The parent terminates this owned process and waits for exit.

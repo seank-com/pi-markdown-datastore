@@ -1,17 +1,27 @@
 import { DatastoreError } from "./errors.ts";
 
-export const HARD_MAX_RESULT_BYTES = 32 * 1024;
-export const HARD_MAX_RESULT_LINES = 800;
 export const HARD_MAX_FILE_BYTES = 10 * 1024 * 1024;
 export const HARD_MAX_SEARCH_RESULTS = 20;
 export const HARD_MAX_CANDIDATES = 500;
 export const HARD_MAX_OUTLINE = 100;
 
-export function clampReadBudget(requested: { maxBytes?: unknown; maxLines?: unknown } | undefined, defaults: { maxBytes: number; maxLines: number }): { maxBytes: number; maxLines: number } {
-	const maxBytes = requested?.maxBytes === undefined ? defaults.maxBytes : requested.maxBytes;
-	const maxLines = requested?.maxLines === undefined ? defaults.maxLines : requested.maxLines;
-	if (typeof maxBytes !== "number" || !Number.isInteger(maxBytes) || maxBytes < 4 || typeof maxLines !== "number" || !Number.isInteger(maxLines) || maxLines < 1) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
-	return { maxBytes: Math.min(maxBytes, HARD_MAX_RESULT_BYTES), maxLines: Math.min(maxLines, HARD_MAX_RESULT_LINES) };
+export type ResultBudget = { maxBytes: number | null; maxLines: number | null };
+function finiteBudget(value: unknown): number {
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
+	return value;
+}
+export function resolveResultBudget(requested: { maxBytes?: unknown; maxLines?: unknown } | undefined, defaults: { maxBytes?: number | null; maxLines?: number | null } = {}): ResultBudget {
+	const maxBytes = requested?.maxBytes === undefined ? defaults.maxBytes ?? null : requested.maxBytes;
+	const maxLines = requested?.maxLines === undefined ? defaults.maxLines ?? null : requested.maxLines;
+	return { maxBytes: maxBytes === null ? null : finiteBudget(maxBytes), maxLines: maxLines === null ? null : finiteBudget(maxLines) };
+}
+export function clampReadBudget(requested: { maxBytes?: unknown; maxLines?: unknown } | undefined, defaults: { maxBytes?: number | null; maxLines?: number | null } = {}): ResultBudget {
+	return resolveResultBudget(requested, defaults);
+}
+export function exceedsBudget(text: string, budget: ResultBudget, measuredLines?: number): boolean {
+	if (budget.maxBytes !== null && Buffer.byteLength(text) > budget.maxBytes) return true;
+	if (budget.maxLines !== null && (measuredLines ?? text.split("\n").length) > budget.maxLines) return true;
+	return false;
 }
 
 /** Strict JSON duplicate-key pass. JSON.parse alone silently accepts the last duplicate. */

@@ -100,7 +100,7 @@ export async function startSharedHost(catalogPath: string, options: { schedule?:
 			const coordinator = coordinators.get(message.store);
 			if (!definition || !index || !coordinator || message.definitionRevision !== definition.definitionRevision) throw new DatastoreError("STORE_UNAVAILABLE");
 			if (message.operation === "hello") {
-				send({ version: 1, requestId: message.requestId, generation, definitionRevision: definition.definitionRevision, ok: true, result: { generation, version: adapter?.binding.version ?? "metadata" } });
+				send({ version: 1, requestId: message.requestId, generation, definitionRevision: definition.definitionRevision, ok: true, result: { generation, version: adapter?.binding.version ?? "metadata", resultBudgetVersion: 1 } });
 				return;
 			}
 			const call = message as SharedCall;

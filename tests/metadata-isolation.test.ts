@@ -196,7 +196,7 @@ test("tag find pages the rendered candidate, not the path string", async (t) => 
 	const dir = join(root, ".pi", "markdown-datastore");
 	await mkdir(dir, { recursive: true, mode: 0o700 });
 	await chmod(dir, 0o700);
-	await writeFile(join(dir, "config.json"), JSON.stringify({ schemaVersion: 1, defaults: { maxResultBytes: 700, maxResultLines: 20, operationTimeoutMs: 3000 }, qmd: { enabled: false, installation: { executable: "qmd" }, minimumVersion: "2.8.3" }, stores: { notes: { root: "notes", include: ["**/*.md"], exclude: [], maxFileBytes: 20000, search: { defaultMode: "lexical", qmdCollection: "notes" } } } }), { mode: 0o600 });
+	await writeFile(join(dir, "config.json"), JSON.stringify({ schemaVersion: 1, defaults: { operationTimeoutMs: 3000 }, qmd: { enabled: false, installation: { executable: "qmd" }, minimumVersion: "2.8.3" }, stores: { notes: { root: "notes", include: ["**/*.md"], exclude: [], maxFileBytes: 20000, search: { defaultMode: "lexical", qmdCollection: "notes" } } } }), { mode: 0o600 });
 	const config = await loadMarkdownDatastoreConfig(root);
 	const index = new MetadataIndex(join(root, "state", "metadata-notes"));
 	const coordinator = new MaintenanceCoordinator(join(root, "state", "jobs.json"), () => new Set(["notes"]));
@@ -205,10 +205,11 @@ test("tag find pages the rendered candidate, not the path string", async (t) => 
 	service.bindMetadata(coordinator, new Map([["notes", index]]));
 	await service.refresh({ store: "notes", mode: "metadata" });
 	await coordinator.settled();
-	const found = await service.find({ store: "notes", selectors: [{ kind: "tag", value: "travel" }], limit: 20 });
-	assert.equal(Buffer.byteLength(JSON.stringify(found.data)) <= 700, true);
-	assert.equal(found.data.candidates.length, 1);
-	assert.equal(found.bounds.truncated, true);
+	await assert.rejects(service.find({ store: "notes", selectors: [{ kind: "tag", value: "travel" }], limit: 20, maxBytes: 400, maxLines: 20 } as never), { code: "RESULT_LIMIT_EXCEEDED" });
+	const found = await service.find({ store: "notes", selectors: [{ kind: "tag", value: "travel" }], limit: 20, maxBytes: 4000, maxLines: 20 } as never);
+	assert.equal(Buffer.byteLength(JSON.stringify(found)) <= 4000, true);
+	assert.equal(found.data.candidates.length, 2);
+	assert.equal(found.bounds.truncated, false);
 	assert.equal(found.data.candidates[0].uri.startsWith("datastore://notes/"), true);
 	assert.notEqual(found.data.candidates[0].revision, found.provenance.sources[0].indexRevision);
 });
