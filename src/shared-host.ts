@@ -84,7 +84,9 @@ export async function startSharedHost(catalogPath: string, options: { schedule?:
 		const send = (reply: SharedReply) => { if (!socket.destroyed) socket.write(encodeSharedMessage(reply)); };
 		const fail = (requestId: string | undefined, definitionRevision: string, error: unknown) => {
 			const code = error instanceof DatastoreError ? error.code : "STORE_UNAVAILABLE";
-			send({ version: 1, requestId, generation, definitionRevision, ok: false, error: { code } });
+			const applied = error instanceof DatastoreError && error.details?.operationApplied === true;
+			const refreshIds = applied && Array.isArray(error.details?.refreshIds) ? error.details.refreshIds.filter((id): id is string => typeof id === "string" && /^[0-9a-f]{32}$/.test(id)) : [];
+			send({ version: 1, requestId, generation, definitionRevision, ok: false, error: { code, ...(applied ? { details: { operationApplied: true, refreshIds } } : {}) } });
 		};
 		attachSharedParser(socket, (message) => {
 			let request;

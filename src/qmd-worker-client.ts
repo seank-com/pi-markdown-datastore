@@ -5,7 +5,7 @@ import { datastoreChildEnvironment } from "./child-environment.ts";
 import { abortError, DatastoreError, throwIfAborted } from "./errors.ts";
 
 const WORKER_PATH = fileURLToPath(new URL("./qmd-worker.mjs", import.meta.url));
-const MAX_MESSAGE_BYTES = 1024 * 1024;
+const MAX_DIAGNOSTIC_STDERR_BYTES = 1024 * 1024;
 const CANCEL_GRACE_MS = 100;
 const KILL_GRACE_MS = 250;
 
@@ -42,11 +42,13 @@ function validateProgress(value: unknown): QmdWorkerProgress {
 }
 
 export class QmdWorkerClient {
-	readonly timeoutMs: number; #child?: ChildProcessWithoutNullStreams; #pending?: Pending; #stdout = Buffer.alloc(0); #stderrBytes = 0; #closed = false; #terminating = false; #terminationError?: DatastoreError;
+	readonly timeoutMs: number; #child?: ChildProcessWithoutNullStreams; #pending?: Pending; #stdout: Buffer[] = []; #stdoutBytes = 0; #stderrBytes = 0; #closed = false; #terminating = false; #terminationError?: DatastoreError;
 	readonly idleExitMs?: number;
 	constructor(timeoutMs: number, options: { idleExitMs?: number } = {}) { this.timeoutMs = timeoutMs; if (options.idleExitMs !== undefined && (!Number.isSafeInteger(options.idleExitMs) || options.idleExitMs < 25 || options.idleExitMs > 300_000)) throw new DatastoreError("BACKEND_OUTPUT_INVALID"); this.idleExitMs = options.idleExitMs; }
 	get busy(): boolean { return this.#pending !== undefined || this.#terminating; }
 	get processId(): number | undefined { return this.#child?.pid; }
+	get bufferedBytes(): number { return this.#stdoutBytes; }
+	private releaseFrame(): void { this.#stdout = []; this.#stdoutBytes = 0; }
 	private ensureChild(): ChildProcessWithoutNullStreams {
 		if (this.#closed) throw new DatastoreError("CANCELLED"); if (this.#terminating) throw new DatastoreError("BACKEND_FAILED");
 		if (this.#child) {
@@ -54,27 +56,33 @@ export class QmdWorkerClient {
 			if (child.exitCode !== null || child.signalCode !== null || child.stdin.destroyed || !child.stdin.writable) { this.fail(new DatastoreError("BACKEND_FAILED"), true); throw new DatastoreError("BACKEND_FAILED"); }
 			return child;
 		}
-		const child = spawn(process.execPath, [WORKER_PATH, ...(this.idleExitMs === undefined ? [] : [`--idle-exit-ms=${this.idleExitMs}`])], { stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", env: datastoreChildEnvironment() }); this.#child = child; this.#stdout = Buffer.alloc(0); this.#stderrBytes = 0;
+		const child = spawn(process.execPath, [WORKER_PATH, ...(this.idleExitMs === undefined ? [] : [`--idle-exit-ms=${this.idleExitMs}`])], { stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", env: datastoreChildEnvironment() }); this.#child = child; this.releaseFrame(); this.#stderrBytes = 0;
 		const transportError = () => { if (this.#child === child) this.fail(new DatastoreError("BACKEND_FAILED"), true); };
 		// Socket errors are emitted separately from write callbacks, including on
 		// cancel/shutdown. Keep these listeners after retirement to consume late errors.
 		for (const stream of [child.stdin, child.stdout, child.stderr]) stream.on("error", transportError);
 		child.stdout.on("data", (chunk: Buffer) => { if (this.#child === child && !this.#terminating) this.consume(chunk); });
-		child.stderr.on("data", (chunk: Buffer) => { if (this.#child !== child) return; this.#stderrBytes += chunk.length; if (this.#stderrBytes > MAX_MESSAGE_BYTES) this.fail(new DatastoreError("BACKEND_OUTPUT_INVALID"), true); });
+		child.stderr.on("data", (chunk: Buffer) => { if (this.#child !== child) return; this.#stderrBytes += chunk.length; if (this.#stderrBytes > MAX_DIAGNOSTIC_STDERR_BYTES) this.fail(new DatastoreError("BACKEND_OUTPUT_INVALID"), true); });
 		child.on("error", transportError);
 		child.on("exit", () => { if (this.#child === child) { this.#terminating = true; this.#terminationError ??= new DatastoreError("BACKEND_FAILED"); } });
-		child.on("close", () => { if (this.#child !== child) return; this.#stdout = Buffer.alloc(0); const error = this.#terminationError ?? new DatastoreError("BACKEND_FAILED"); this.#child = undefined; this.#terminating = false; this.#terminationError = undefined; this.settle(error); });
+		child.on("close", () => { if (this.#child !== child) return; this.releaseFrame(); const error = this.#terminationError ?? new DatastoreError("BACKEND_FAILED"); this.#child = undefined; this.#terminating = false; this.#terminationError = undefined; this.settle(error); });
 		return child;
 	}
 	private consume(chunk: Buffer): void {
-		this.#stdout = this.#stdout.length === 0 ? Buffer.concat([chunk]) : Buffer.concat([this.#stdout, chunk]);
-		for (;;) {
-			const newline = this.#stdout.indexOf(10); if (newline < 0) return;
-			const line = this.#stdout.subarray(0, newline);
-			const rest = this.#stdout.subarray(newline + 1);
-			this.#stdout = rest.length === 0 ? Buffer.alloc(0) : Buffer.from(rest);
-			if (line.length === 0) continue;
-			let message: any; try { message = JSON.parse(line.toString("utf8")); } catch { this.fail(new DatastoreError("BACKEND_OUTPUT_INVALID"), true); return; }
+		let offset = 0;
+		while (offset < chunk.length && !this.#terminating) {
+			const newline = chunk.indexOf(10, offset), end = newline < 0 ? chunk.length : newline;
+			const fragment = chunk.subarray(offset, end);
+			if (fragment.length) {
+				// Copy only a partial tail that would retain an already drained frame.
+				this.#stdout.push(newline < 0 && offset > 0 ? Buffer.from(fragment) : fragment);
+				this.#stdoutBytes += fragment.length;
+			}
+			if (newline < 0) return;
+			const frame = this.#stdout.length === 1 ? this.#stdout[0] : Buffer.concat(this.#stdout, this.#stdoutBytes);
+			this.releaseFrame(); offset = newline + 1;
+			if (!frame.length) continue;
+			let message: any; try { message = JSON.parse(frame.toString("utf8")); } catch { this.fail(new DatastoreError("BACKEND_OUTPUT_INVALID"), true); return; }
 			this.message(message);
 		}
 	}

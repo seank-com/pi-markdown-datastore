@@ -20,6 +20,16 @@ async function waitJob(adapter:QmdAdapter,id:string) {for(let i=0;i<1000;i++){co
 async function ready(f:Awaited<ReturnType<typeof fixture>>,semantic=false){const r=semantic?await f.adapter.startSemanticRefresh([f.store]):await f.adapter.startLexicalRefresh([f.store]);const j=await waitJob(f.adapter,String(r.refreshId));assert.equal(j.state,'succeeded',JSON.stringify(j));}
 async function behavior(f:Awaited<ReturnType<typeof fixture>>,value:unknown){await mkdir(f.adapter.root,{recursive:true,mode:0o700});await writeFile(join(f.adapter.root,'behavior.json'),JSON.stringify(value),{mode:0o600});}
 
+test('larger caller search budgets do not inherit a per-excerpt default ceiling', async t => {
+ const f = await fixture(t); f.store.maxFileBytes = 20000; f.config.defaults.maxResultBytes = 1000;
+ const paragraph = 'Copper ' + 'complete paragraph '.repeat(400);
+ await writeFile(join(f.notes, 'alpha.md'), paragraph + '\n'); await ready(f);
+ const result = await f.service.search({ store: 'memory', query: 'copper', mode: 'lexical', includeContent: true, maxBytes: 20000 });
+ assert.equal(result.bounds.maxBytes, 20000); assert.equal(result.data.hits.length, 1);
+ assert(result.data.hits[0].snippet!.includes(paragraph)); assert.equal(result.data.hits[0].truncated, false);
+ assert.equal(result.bounds.returnedBytes, Buffer.byteLength(JSON.stringify(result)));
+});
+
 test('public URI identity is literal and collection-qualified',()=>{assert.equal(decodeQmdUri('qmd://notes/100%25.md','notes'),'100%25.md');for(const uri of ['qmd://other/a.md','qmd://notes/../a.md','#abcdef'])assert.throws(()=>decodeQmdUri(uri,'notes'));});
 test('child environment passes supported local runtime controls without credentials',()=>{assert.deepEqual(datastoreChildEnvironment({HOME:'/tmp/home',QMD_EMBED_MODEL:'/tmp/model.gguf',XDG_CACHE_HOME:'/tmp/cache',QMD_FORCE_CPU:'1',OPENAI_API_KEY:'secret',NODE_OPTIONS:'bad',QMD_CONFIG_DIR:'/global'}),{HOME:'/tmp/home',PATH:'/usr/bin:/bin:/usr/sbin:/sbin',QMD_EMBED_MODEL:'/tmp/model.gguf',XDG_CACHE_HOME:'/tmp/cache',QMD_FORCE_CPU:'1'});});
 

@@ -1,12 +1,12 @@
 # Unbounded result-size defaults and caller budgets
 
-Status: implementation specification. The existing implementation and deployed configuration still apply until this update is qualified and separately activated.
+This contract describes result budgeting and resource ownership. Installation, configuration migration and named runtime activation remain separate operator decisions.
 
 ## Purpose and scope
 
 Datastore is local knowledge infrastructure, not a model-context policy engine. It must not choose an arbitrary byte/line ceiling on the caller's behalf. A caller can request less data to manage context. Resource ownership and cleanup are separate responsibilities, not reasons to invent replacement result caps.
 
-This update changes byte/line result-size policy across direct operations, event RPC, shared service, backend framing and model tools. Remove the 32 KiB/800-line hard result ceilings, the implicit 12 KiB/300-line example defaults, fixed 1,024-byte/30-line excerpt truncation, and the 1 MiB request/result framing ceiling that would otherwise block the same output path. Preserve excerpt selection (the relevant paragraph), not its arbitrary byte/line truncation.
+Byte/line controls have the same meaning across direct operations, event RPC, shared service, backend framing and model tools. No fixed output or request/result framing ceiling substitutes for an omitted budget. Excerpts select the relevant paragraph rather than impose another byte/line truncation.
 
 It does not change what a query selects: search/find result-count selection, source-file validation, input/query limits, ledger retention, deadlines, worker count, diagnostic-stderr policy and namespace/authority checks remain separate existing policies. They are not approved merely by being outside this change. Keep unresolved approval gaps explicit in the restrictions register. Do not silently turn this into all-corpus search, a transport redesign, a Pi upgrade or new operational limits.
 
@@ -17,7 +17,7 @@ It does not change what a query selects: search/find result-count selection, sou
 - An explicit caller value is a positive finite safe integer. It overrides a configured default; a configured default is not a maximum. Reject invalid values rather than silently clamp them.
 - Configuration keeps accepting existing explicit finite `defaults.maxResultBytes` and `defaults.maxResultLines` without the old maxima; those keys become optional. Other required configuration and existing timeout semantics do not acquire new defaults in this update.
 - JSON does not carry `Infinity`. In result bounds, `maxBytes: null` or `maxLines: null` means the corresponding dimension is unbounded. Finite bounds remain numbers. Add an optional discovery field `resultBudgetVersion: 1` to advertise this interpretation and uniform caller controls without renaming the v1 event or replacing existing capabilities.
-- A finite byte budget covers the complete serialized result envelope exposed by the API/tool, including metadata, not just the document body. Returned byte counts describe that representation. Line budgets retain the operation's documented logical-payload line accounting (content lines or aggregate snippet lines), rather than depend on incidental JSON pretty-printing. Test and document the accounting consistently.
+- A finite byte budget covers the complete serialized result envelope exposed by the API/tool, including metadata, not just the document body. Returned byte counts describe that representation. Line budgets use logical-payload lines (content lines or aggregate snippet lines), counting a final newline as a terminator rather than another empty line; they do not depend on incidental JSON pretty-printing. Test and document the accounting consistently.
 - Existing pageable views use their continuation mechanism when a finite budget requires paging. Do not silently omit fields from otherwise nonpageable status, policy or receipt results, or invent a default summary projection to conceal a large result. A finite budget that cannot represent an honest result returns `RESULT_LIMIT_EXCEEDED`, not corrupt/truncated JSON or an unrequested partial authority scope.
 - Tiny budgets may be too small even for the minimum envelope. That is a controlled caller-budget error, not a reason to raise the caller's value. The error itself is not a result payload promised to fit an impossible budget.
 

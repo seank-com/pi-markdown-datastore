@@ -19,7 +19,19 @@ import { tagIdentity } from "./wiki.ts";
 
 function elapsed(started: number): number { return Math.max(0, Date.now() - started); }
 function propagateControlError(error: unknown): void { if (error instanceof DatastoreError && (error.code === "CANCELLED" || error.code === "TIMEOUT")) throw error; }
-function lines(value: string): number { return value.length === 0 ? 0 : value.split("\n").length; }
+function lines(value: string): number {
+	if (!value.length) return 0;
+	let count = value.endsWith("\n") ? 0 : 1;
+	for (let offset = value.indexOf("\n"); offset >= 0; offset = value.indexOf("\n", offset + 1)) count += 1;
+	return count;
+}
+function appliedRefreshes(...receipts: unknown[]): { operationApplied: true; refreshIds: string[] } {
+	const ids = receipts.flatMap(receipt => {
+		const id = receipt && typeof receipt === "object" ? (receipt as { refreshId?: unknown }).refreshId : undefined;
+		return typeof id === "string" && /^[0-9a-f]{32}$/.test(id) ? [id] : [];
+	});
+	return { operationApplied: true, refreshIds: [...new Set(ids)] };
+}
 function boundedArrays(first: unknown[], second: unknown[], firstKey: string, secondKey: string, base: Record<string, unknown>, maximum: number, budget: ResultBudget): { first: unknown[]; second: unknown[]; text: string; returnedLines: number; truncated: boolean } {
 	const selectedFirst: unknown[] = []; const selectedSecond: unknown[] = []; let truncated = false;
 	for (const [target, items] of [[selectedFirst, first], [selectedSecond, second]] as const) for (const item of items) { const candidate = [...target, item]; const data = { ...base, [firstKey]: target === selectedFirst ? candidate : selectedFirst, [secondKey]: target === selectedSecond ? candidate : selectedSecond }; const text = JSON.stringify(data); if (selectedFirst.length + selectedSecond.length >= maximum || (budget.maxBytes !== null && Buffer.byteLength(text) > budget.maxBytes) || (budget.maxLines !== null && selectedFirst.length + selectedSecond.length + 1 > budget.maxLines)) { truncated = true; continue; } target.push(item); }
@@ -85,15 +97,32 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 	private budget(input?: object): ResultBudget { return resolveResultBudget(input as { maxBytes?: unknown; maxLines?: unknown } | undefined, { maxBytes: this.config.defaults.maxResultBytes ?? null, maxLines: this.config.defaults.maxResultLines ?? null }); }
 	private envelope<T>(operation: ResultEnvelope<T>["operation"], store: string, data: T, started: number, text = "", truncated = false, continuation?: string, sources: ResultEnvelope<T>["provenance"]["sources"] = [], warnings: ResultEnvelope<T>["warnings"] = [], budget?: ResultBudget, measuredLines?: number, applied?: { operationApplied: true; refreshIds: string[] }): ResultEnvelope<T> {
 		const effectiveBudget = budget ?? this.budget(); const returnedLines = measuredLines ?? lines(text); const completedAt = new Date().toISOString();
-		let returnedBytes = 0; let result!: ResultEnvelope<T>;
-		for (let attempt = 0; attempt < 4; attempt += 1) {
-			result = { contractVersion: 1, operation, store, data, provenance: { sources, startedAt: new Date(started).toISOString(), completedAt, durationMs: elapsed(started) }, bounds: { maxBytes: effectiveBudget.maxBytes, maxLines: effectiveBudget.maxLines, returnedBytes, returnedLines, truncated, continuation }, warnings };
-			const size = Buffer.byteLength(JSON.stringify(result));
-			if (size === returnedBytes) break;
-			returnedBytes = size;
+		const result: ResultEnvelope<T> = { contractVersion: 1, operation, store, data, provenance: { sources, startedAt: new Date(started).toISOString(), completedAt, durationMs: elapsed(started) }, bounds: { maxBytes: effectiveBudget.maxBytes, maxLines: effectiveBudget.maxLines, returnedBytes: 0, returnedLines, truncated, continuation }, warnings };
+		// Serialize once; only the decimal width of returnedBytes changes.
+		const baseBytes = Buffer.byteLength(JSON.stringify(result));
+		let returnedBytes = baseBytes;
+		for (;;) { const size = baseBytes - 1 + String(returnedBytes).length; if (size === returnedBytes) break; returnedBytes = size; }
+		result.bounds.returnedBytes = returnedBytes;
+		if ((effectiveBudget.maxBytes !== null && returnedBytes > effectiveBudget.maxBytes) || (effectiveBudget.maxLines !== null && returnedLines > effectiveBudget.maxLines)) {
+			const shared = (data as { shared?: unknown })?.shared;
+			const outcome = applied ? appliedRefreshes(...applied.refreshIds.map(refreshId => ({ refreshId })), ...(Array.isArray(shared) ? shared : [])) : undefined;
+			throw new DatastoreError("RESULT_LIMIT_EXCEEDED", { ...outcome, requiredBytes: returnedBytes, requiredLines: returnedLines });
 		}
-		if (exceedsBudget(JSON.stringify(result), { maxBytes: effectiveBudget.maxBytes, maxLines: null }) || (effectiveBudget.maxLines !== null && returnedLines > effectiveBudget.maxLines)) throw new DatastoreError("RESULT_LIMIT_EXCEEDED", applied);
 		return result;
+	}
+	private metadataEnvelope<Item, Data extends object>(operation: "read" | "tags" | "find", store: string, items: readonly Item[], started: number, budget: ResultBudget, page: {
+		revision: string; query: string; offset: number; more: boolean;
+		render: (items: Item[], more: boolean) => Data;
+		sources?: ReadResult["provenance"]["sources"]; warnings?: ReadResult["warnings"];
+	}): ResultEnvelope<Data> {
+		const selected = [...items];
+		for (;;) {
+			const more = page.more || selected.length < items.length;
+			if (!selected.length && more) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
+			const continuation = more ? continuationToken(store, page.revision, page.query, page.offset + selected.length, budget) : undefined;
+			try { return this.envelope(operation, store, page.render(selected, more), started, "", more, continuation, page.sources ?? [], page.warnings ?? [], budget, 1); }
+			catch (error) { if (!(error instanceof DatastoreError) || error.code !== "RESULT_LIMIT_EXCEEDED" || !selected.length) throw error; selected.pop(); }
+		}
 	}
 	private async searchInner(input: SearchInput, signal: AbortSignal): Promise<SearchResult> {
 		const started = Date.now(); throwIfAborted(signal); const store = this.store(input.store);
@@ -142,7 +171,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 			for (;;) {
 				const pageText = JSON.stringify(hits); const pageLines = aggregateLines();
 				try { return this.envelope("search", store.name, { hits, examined: backend.candidates.length + (backend.rejectedCandidates ?? 0), dropped, returned: hits.length, requestedMode: backend.requestedMode, effectiveMode: backend.effectiveMode, queueMs: backend.queueMs, operationMs: backend.operationMs, workerId: backend.workerId }, started, pageText, budgetTruncated, undefined, [{ kind: "qmd", backendVersion, observationId: backend.generation, observedAt: new Date().toISOString(), freshness: indexCurrent ? "current" : "stale" }, { kind: "filesystem", observedAt: new Date().toISOString(), freshness: "current" }], warnings, this.budget(input), pageLines) as SearchResult; }
-				catch (error) { if (!(error instanceof DatastoreError) || error.code !== "RESULT_LIMIT_EXCEEDED" || hits.length === 0) throw error; hits.pop(); budgetTruncated = true; }
+				catch (error) { if (!(error instanceof DatastoreError) || error.code !== "RESULT_LIMIT_EXCEEDED" || hits.length === 0) throw error; hits.pop(); if (!budgetTruncated) warnings.push({ code: "RESULT_LIMIT_EXCEEDED", message: "Search hits were truncated at the caller's aggregate result budget." }); budgetTruncated = true; }
 			}
 		}
 	}
@@ -157,8 +186,8 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 			const blocks = body.split(/\n{2,}/); selected = blocks.find((block) => terms.some((term) => block.toLocaleLowerCase("en-US").includes(term))) ?? blocks.find((block) => block.trim().length > 0) ?? "";
 		}
 		if (!selected) return { content: "", truncated: false };
-		const budget = this.budget(); const page = boundedPage(selected, 0, budget.maxBytes, budget.maxLines);
-		return { content: page.content, truncated: page.truncated };
+		// Paragraph selection is the excerpt; only the caller's aggregate result budget clips output.
+		return { content: selected, truncated: false };
 	}
 
 	private async findInner(input: FindInput, signal: AbortSignal): Promise<FindResult> {
@@ -173,8 +202,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
   if (store.shared) {
    const client = this.sharedClients?.get(store.name); if (!client) throw new DatastoreError("STORE_UNAVAILABLE");
    const page = await client.tagPages(query, { continuation: token, limit, ...budget, responseStore: store.name }, signal);
-   const data = { candidates: page.candidates, examined: page.examined, partial: page.continuation !== undefined };
-   return this.envelope("find", store.name, data, started, JSON.stringify(data), page.continuation !== undefined, page.continuation, [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: page.complete ? "current" : "stale", indexRevision: page.revision }], [], budget) as FindResult;
+   return this.metadataEnvelope("find", store.name, page.candidates, started, budget, { revision: page.revision, query, offset: continuationOffset(token, store.name, page.revision, query), more: page.continuation !== undefined, render: (items, more) => ({ candidates: items, examined: page.examined, partial: more }), sources: [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: page.complete ? "current" : "stale", indexRevision: page.revision }] }) as FindResult;
   }
   const index = this.metadata?.get(store.name); if (!index) throw new DatastoreError("STALE_INDEX");
   const snapshot = await index.requireSnapshot();
@@ -186,9 +214,8 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
   const bounded = selected.items.slice(0, limit);
   const admitted = await index.admit(store, bounded.map((path) => ({ path, kind: "note" as const })), signal);
   const next = offset + bounded.length < pages.length ? offset + bounded.length : undefined;
-  const data = { candidates: bounded.map((path) => tagCandidate(store.name, path, revisionOf(path)!)), examined: pages.length, partial: next !== undefined };
   const warnings = admitted.diagnostics.map((message) => ({ code: "STALE_INDEX" as const, message }));
-  return this.envelope("find", store.name, data, started, JSON.stringify(data), next !== undefined, next === undefined ? undefined : continuationToken(store.name, snapshot.revision, query, next, budget), [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: admitted.current ? "current" : "stale", indexRevision: snapshot.revision }], warnings, budget) as FindResult;
+  return this.metadataEnvelope("find", store.name, bounded, started, budget, { revision: snapshot.revision, query, offset, more: next !== undefined, render: (items, more) => ({ candidates: items.map(path => tagCandidate(store.name, path, revisionOf(path)!)), examined: pages.length, partial: more }), sources: [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: admitted.current ? "current" : "stale", indexRevision: snapshot.revision }], warnings }) as FindResult;
  }
  const notes=input.selectors.map(s=>{if(s.kind!=="uri" && (s.kind!=="path" || !s.path.endsWith(".md")))throw new DatastoreError("CAPABILITY_UNAVAILABLE");const note=s.kind==="uri"?noteUriToRef(s.uri):{store:store.name,path:validateRelativeNotePath(s.path)};if(note.store!==store.name)throw new DatastoreError("INVALID_NOTE_REF");return note;});
  const paths=[...new Set(notes.map(n=>n.path))];const candidates=[];
@@ -199,17 +226,17 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
  }
 
 	private readDescriptor(input: ReadInput): { store: StoreConfig; descriptor: Omit<ContinuationDescriptor, "kind" | "revision" | "cursor" | "createdAt" | "expiresAt">; expectedRevision?: string; cursor: number } {
-		if (input.continuation && Object.keys(input).every((key) => key === "continuation")) {
+		if (input.continuation && Object.keys(input).every((key) => key === "continuation" || key === "maxBytes" || key === "maxLines")) {
 			try {
 				const existing = this.continuations.getRead(input.continuation);
-				return { store: this.store(existing.note.store), descriptor: existing, expectedRevision: existing.revision, cursor: existing.cursor };
+				return { store: this.store(existing.note.store), descriptor: { ...existing, ...resolveResultBudget(input, existing) }, expectedRevision: existing.revision, cursor: existing.cursor };
 			} catch (error) {
 				if (!(error instanceof DatastoreError)) throw error;
 				let parsed; try { parsed = readPageToken(input.continuation); } catch (decode) { if (/^[0-9a-f]{32}$/.test(input.continuation)) throw error; throw decode instanceof DatastoreError ? decode : new DatastoreError("STALE_CONTINUATION"); }
 				const view = parsed.query.startsWith("links:") ? "links" : parsed.query.startsWith("backlinks:") ? "backlinks" : undefined;
 				if (!view) throw new DatastoreError("STALE_CONTINUATION");
 				let store; try { store = this.store(parsed.store); } catch (lookup) { if (lookup instanceof DatastoreError && lookup.code === "STORE_UNKNOWN") throw new DatastoreError("STALE_CONTINUATION"); throw lookup; }
-				const budget = this.budget(parsed);
+				const budget = resolveResultBudget(input, resolveResultBudget(parsed, this.budget()));
 				return { store, descriptor: { note: { store: store.name, path: parsed.query.slice(view.length + 1) }, view, includeFrontmatter: false, excludeSections: [], includeSemanticRelated: false, ...budget }, cursor: 0 };
 			}
 		}
@@ -277,19 +304,25 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		}
 		throwIfAborted(signal);
 		let byteCap = descriptor.maxBytes;
-		for (let attempt = 0; attempt < 12; attempt += 1) {
+		for (;;) {
 			const page = boundedPage(selected, cursor, byteCap, descriptor.maxLines);
-			const continuation = page.nextCursor === undefined ? undefined : this.continuations.create({ kind: "read", ...descriptor, revision: source.fullRevision, cursor: page.nextCursor });
+			// Trial pages own no registry state. An issued token has this same width.
+			const continuation = page.nextCursor === undefined ? undefined : "0".repeat(32);
 			const data: Record<string, unknown> = { note: source.note, uri: source.uri, revision: source.revision, mtime: source.mtime, title: parsed.title, view: descriptor.view, content: page.content };
 			if (section) data.section = section;
 			if (parsed.frontmatter.error) data.diagnostics = [parsed.frontmatter.error];
-			try { return this.envelope("read", store.name, data, started, page.content, page.truncated, continuation, [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: "current" }], [], descriptor) as ReadResult; }
-			catch (error) {
-				if (!(error instanceof DatastoreError) || error.code !== "RESULT_LIMIT_EXCEEDED" || byteCap === null || page.content.length === 0) throw error;
-				byteCap = Math.max(1, Math.floor(Buffer.byteLength(page.content) / 2));
+			try {
+				const result = this.envelope("read", store.name, data, started, page.content, page.truncated, continuation, [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: "current" }], [], descriptor) as ReadResult;
+				if (page.nextCursor !== undefined) result.bounds.continuation = this.continuations.create({ kind: "read", ...descriptor, revision: source.fullRevision, cursor: page.nextCursor });
+				return result;
+			} catch (error) {
+				if (!(error instanceof DatastoreError) || error.code !== "RESULT_LIMIT_EXCEEDED" || byteCap === null || !page.content.length) throw error;
+				const excess = Number(error.details?.requiredBytes) - descriptor.maxBytes!;
+				const next = Buffer.byteLength(page.content) - excess;
+				if (!(excess > 0) || next < 1 || next >= byteCap) throw error;
+				byteCap = next;
 			}
 		}
-		throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
 	}
 
 	private localReceipt<T extends object>(value: T, store: StoreConfig): T {
@@ -337,6 +370,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 	}
 
 	private async refreshInner(input: RefreshInput, signal: AbortSignal): Promise<RefreshResult> {
+		this.budget(input); // Validate before durable admission or cancellation.
 		if (Object.hasOwn(input, "paths") && (input.action === "cancel" || input.mode !== "metadata")) throw new DatastoreError("INVALID_NOTE_REF");
 		const started = Date.now(); throwIfAborted(signal);
 		if (input.action === "cancel") {
@@ -406,9 +440,9 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 			const client = this.sharedClients?.get(store.name);
 			if (!client) throw new DatastoreError("STORE_UNAVAILABLE");
 			const page = view === "links" ? await client.links(path, { continuation: token, ...budget, responseStore: store.name }, signal) : await client.backlinks(path, { continuation: token, ...budget, responseStore: store.name }, signal);
-			const data = { note: { store: store.name, path }, view, edges: page.edges, pageCount: page.pageCount, occurrenceCount: page.occurrenceCount, returned: page.returned, complete: page.complete, revision: page.revision };
+			const query = `${view}:${path}`;
 			const warnings = (page.diagnostics ?? []).map((message) => ({ code: "STALE_INDEX" as const, message }));
-			return this.envelope("read", store.name, data, started, JSON.stringify(data), page.continuation !== undefined, page.continuation, [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: page.complete ? "current" : "stale" }], warnings) as ReadResult;
+			return this.metadataEnvelope("read", store.name, page.edges, started, budget, { revision: page.revision, query, offset: continuationOffset(token, store.name, page.revision, query), more: page.continuation !== undefined, render: items => ({ note: { store: store.name, path }, view, edges: items, pageCount: page.pageCount, occurrenceCount: page.occurrenceCount, returned: items.length, complete: page.complete, revision: page.revision }), sources: [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: page.complete ? "current" : "stale" }], warnings });
 		}
 		const index = this.metadata?.get(store.name);
 		if (!index) throw new DatastoreError("STALE_INDEX");
@@ -421,9 +455,8 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		const page = pageRendered(edges, offset, budget, render);
 		const subject = { path, kind: view === "backlinks" && !path.endsWith(".md") ? "attachment" as const : "note" as const };
 		const admitted = await index.admit(store, [subject, ...page.items.flatMap((edge) => [{ path: edge.source, kind: "note" as const }, ...(edge.targetKind === "note" || edge.targetKind === "attachment" ? [{ path: edge.target, kind: edge.targetKind }] : [])])], signal);
-		const data = { ...render(page.items), complete: admitted.current };
 		const warnings = admitted.diagnostics.map((message) => ({ code: "STALE_INDEX" as const, message }));
-		return this.envelope("read", store.name, data, started, JSON.stringify(data), page.next !== undefined, page.next === undefined ? undefined : continuationToken(store.name, snapshot.revision, query, page.next, budget), [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: admitted.current ? "current" : "stale" }], warnings) as ReadResult;
+		return this.metadataEnvelope("read", store.name, page.items, started, budget, { revision: snapshot.revision, query, offset, more: page.next !== undefined, render: items => ({ ...render(items), complete: admitted.current }), sources: [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: admitted.current ? "current" : "stale" }], warnings });
 	}
 	async tags(input: { store: string; continuation?: string; maxBytes?: number; maxLines?: number }, signal?: AbortSignal): Promise<RefreshResult> {
 		return this.runOperation(signal, async (active) => {
@@ -436,8 +469,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 			if (store.shared) {
 				const client = this.sharedClients?.get(store.name); if (!client) throw new DatastoreError("STORE_UNAVAILABLE");
 				const page = await client.tags({ continuation: input.continuation, ...budget, responseStore: store.name }, signal);
-				const data = { tags: page.tags, revision: page.revision, returned: page.returned, total: page.total };
-				return this.envelope("tags", store.name, data, started, JSON.stringify(data), page.continuation !== undefined, page.continuation) as RefreshResult;
+				return this.metadataEnvelope("tags", store.name, page.tags, started, budget, { revision: page.revision, query, offset: continuationOffset(input.continuation, store.name, page.revision, query), more: page.continuation !== undefined, render: items => ({ tags: items, revision: page.revision, returned: items.length, total: page.total }) });
 			}
 			const index = this.metadata?.get(store.name);
 			if (!index) throw new DatastoreError("STALE_INDEX");
@@ -447,10 +479,8 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 			const render = (items: typeof catalog) => ({ tags: items.map((tag) => ({ identity: tag.identity, spelling: tag.spelling, pageCount: tag.pages.length })), revision: snapshot.revision, returned: items.length, total: catalog.length });
 			const page = pageRendered(catalog, offset, budget, render);
 			const admitted = await index.admit(store, [], active);
-			const data = render(page.items);
-			const continuation = page.next === undefined ? undefined : continuationToken(store.name, snapshot.revision, query, page.next, budget);
 			const warnings = admitted.diagnostics.map((message) => ({ code: "STALE_INDEX" as const, message }));
-			return this.envelope("tags", store.name, data, started, JSON.stringify(data), page.next !== undefined, continuation, [], warnings) as RefreshResult;
+			return this.metadataEnvelope("tags", store.name, page.items, started, budget, { revision: snapshot.revision, query, offset, more: page.next !== undefined, render: items => render(items), warnings });
 		});
 	}
 	async shutdown(): Promise<void> {

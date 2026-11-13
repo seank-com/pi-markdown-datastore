@@ -33,7 +33,7 @@ const Selector = Type.Union([
 	Type.Object({ kind: StringEnum(["uri"] as const), uri: Type.String() }, { additionalProperties: false }),
 ]);
 const ReadIdentity = { store: Type.Optional(Type.String()), note: Type.Optional(Note), uri: Type.Optional(Type.String()) };
-const Budget = { maxBytes: Type.Optional(Type.Integer({ minimum: 1 })), maxLines: Type.Optional(Type.Integer({ minimum: 1 })) };
+const Budget = { maxBytes: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum complete result-envelope UTF-8 bytes. Overrides a configured default; otherwise omission is unbounded." })), maxLines: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum logical payload lines. Overrides a configured default; otherwise omission is unbounded." })) };
 const ReadBounds = Budget;
 const forbidden = (...keys: string[]) => ({ not: { type: "object", anyOf: keys.map((key) => ({ type: "object", required: [key] })) } });
 const PolicySchemas = {
@@ -71,8 +71,8 @@ const Schemas = {
 			mode: { type: "string", enum: ["direct", "lexical", "semantic", "all", "metadata", "rebuild"], description: "Derived state to refresh. metadata accepts paths. rebuild rereads the store and ignores stored timestamps. Valid only for start." },
 			paths: { type: "array", minItems: 1, items: { type: "string", minLength: 1 }, description: "Relative paths changed by a publication. Valid only for metadata start. Invalid paths are rejected and do not become a rebuild." },
 			refreshId: { type: "string", pattern: "^[0-9a-f]{32}$", description: "Lexical or semantic job ID returned by a prior start. Required only for cancel." },
-			maxBytes: { type: "integer", minimum: 1 },
-			maxLines: { type: "integer", minimum: 1 },
+			maxBytes: { type: "integer", minimum: 1, description: "Maximum complete receipt-envelope UTF-8 bytes; overrides a configured default, otherwise omission is unbounded." },
+			maxLines: { type: "integer", minimum: 1, description: "Maximum logical payload lines; overrides a configured default, otherwise omission is unbounded." },
 		},
 		additionalProperties: false,
 		anyOf: [
@@ -175,9 +175,9 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 		};
 		const registerTools = (): void => {
 			if (registered) return; registered = true;
-			pi.registerTool({ name: "datastore_search", label: "Datastore search", description: "Ranked lexical, semantic, or hybrid retrieval from one configured Markdown store. Returns at most 20 directly validated hits and bounded snippets.", parameters: Schemas.search, execute: (_id, input, signal) => execute({ operation: "search", input }, signal) });
+			pi.registerTool({ name: "datastore_search", label: "Datastore search", description: "Ranked lexical, semantic, or hybrid retrieval from one configured Markdown store. Returns at most 20 directly validated hits with relevant-paragraph snippets. Optional caller budgets control output size.", parameters: Schemas.search, execute: (_id, input, signal) => execute({ operation: "search", input }, signal) });
 			pi.registerTool({ name: "datastore_find", label: "Datastore find", description: "Deterministically find Markdown notes by exact path or datastore URI. Does not perform similarity search.", parameters: Schemas.find, execute: (_id, input, signal) => execute({ operation: "find", input }, signal) });
-			pi.registerTool({ name: "datastore_read", label: "Datastore read", description: "Read a bounded direct Markdown content, section, or outline view. Truncation uses opaque continuations.", parameters: Schemas.read, execute: (_id, input, signal) => execute({ operation: "read", input }, signal) });
+			pi.registerTool({ name: "datastore_read", label: "Datastore read", description: "Read direct Markdown content, section, outline, links, or backlinks. Optional caller budgets control page size; continuations preserve selection and allow a changed budget.", parameters: Schemas.read, execute: (_id, input, signal) => execute({ operation: "read", input }, signal) });
 			pi.registerTool({ name: "datastore_status", label: "Datastore status", description: "Report configured Markdown store capabilities, protected backend readiness, freshness, counts, and permission warnings without note contents.", parameters: Schemas.status, execute: (_id, input, signal) => execute({ operation: "status", input }, signal) });
 			pi.registerTool({ name: "datastore_refresh", label: "Datastore refresh", description: "Start or cancel read-only derived datastore maintenance. Lexical, semantic, and all return prompt durable job receipts; direct performs only bounded root revalidation. Status reports progress. Never mutates source Markdown or runs source synchronization.", parameters: Schemas.refresh, executionMode: "sequential", execute: (_id, input, signal) => execute({ operation: "refresh", input }, signal) });
 			pi.registerTool({ name: "datastore_tags", label: "Datastore tags", description: "List frontmatter tag identities, display spellings, and distinct page counts for one configured store. Pages by the existing result envelope. Not a note and not a refresh.", parameters: Schemas.tags, execute: (_id, input, signal) => execute({ operation: "tags", input }, signal) });

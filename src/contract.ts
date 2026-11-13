@@ -81,7 +81,8 @@ export type FindSelector =
 	| { kind: "tag"; value: string }
 	| { kind: "property"; name: string; value: string | number | boolean | null }
 	| { kind: "link"; target: string };
-export interface FindInput extends ResultBudgetInput { store: StoreName; selectors: FindSelector[]; match?: "all" | "any"; limit?: number }
+export interface FindInput extends ResultBudgetInput { store: StoreName; selectors: FindSelector[]; match?: "all" | "any"; limit?: number; continuation?: string }
+export interface TagsInput extends ResultBudgetInput { store: StoreName; continuation?: string }
 export interface FindCandidate { note: NoteRef; uri: NoteUri; title: string; revision: string }
 export interface FindData { candidates: FindCandidate[]; examined: number; partial: boolean }
 export type FindResult = ResultEnvelope<FindData>;
@@ -115,7 +116,7 @@ export type MarkdownDatastoreRequest =
 	| { operation: "read"; input: ReadInput }
 	| { operation: "status"; input: StatusInput }
 	| { operation: "refresh"; input: RefreshInput }
-	| { operation: "tags"; input: { store: StoreName; continuation?: string } };
+	| { operation: "tags"; input: TagsInput };
 export type MarkdownDatastoreResult = SearchResult | FindResult | ReadResult | StatusResult | RefreshResult | RootsResult | DestinationResult;
 
 export interface MarkdownDatastorePolicyV1 {
@@ -129,7 +130,7 @@ export interface MarkdownDatastoreServiceV1 {
 	read(input: ReadInput, signal?: AbortSignal): Promise<ReadResult>;
 	status(input: StatusInput, signal?: AbortSignal): Promise<StatusResult>;
 	refresh(input: RefreshInput, signal?: AbortSignal): Promise<RefreshResult>;
-	tags(input: { store: StoreName; continuation?: string }, signal?: AbortSignal): Promise<RefreshResult>;
+	tags(input: TagsInput, signal?: AbortSignal): Promise<RefreshResult>;
 }
 
 export interface MarkdownDatastoreRpcEnvelope {

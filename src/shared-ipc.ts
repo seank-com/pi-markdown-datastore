@@ -33,7 +33,7 @@ export interface SharedReply {
 	definitionRevision: string;
 	ok: boolean;
 	result?: unknown;
-	error?: { code: string };
+	error?: { code: string; details?: { operationApplied: true; refreshIds: string[] } };
 }
 
 export function encodeSharedMessage(value: unknown): string {
@@ -66,7 +66,7 @@ export function parseSharedReply(value: unknown): SharedReply {
 	const message = record(value);
 	if (message.version !== 1 || typeof message.generation !== "string" || !GENERATION.test(message.generation) || typeof message.definitionRevision !== "string" || typeof message.ok !== "boolean") throw new DatastoreError("BACKEND_OUTPUT_INVALID");
 	if (message.requestId !== undefined && (typeof message.requestId !== "string" || !ID.test(message.requestId))) throw new DatastoreError("BACKEND_OUTPUT_INVALID");
-	return { version: 1, requestId: message.requestId as string | undefined, generation: message.generation, definitionRevision: message.definitionRevision, ok: message.ok, result: message.result, error: message.error && typeof message.error === "object" ? message.error as { code: string } : undefined };
+	return { version: 1, requestId: message.requestId as string | undefined, generation: message.generation, definitionRevision: message.definitionRevision, ok: message.ok, result: message.result, error: message.error && typeof message.error === "object" ? message.error as SharedReply["error"] : undefined };
 }
 export function containSocket(socket: Socket): void {
 	socket.on("error", () => { socket.destroy(); });
@@ -136,7 +136,15 @@ export function generationId(): string {
 }
 
 export function sharedError(error: unknown): DatastoreError {
-	if (error && typeof error === "object" && "code" in error && typeof error.code === "string") return new DatastoreError(error.code as DatastoreError["code"]);
+	if (error && typeof error === "object" && "code" in error && typeof error.code === "string") {
+		const details = (error as { details?: unknown }).details;
+		if (details && typeof details === "object" && "operationApplied" in details && details.operationApplied === true) {
+			const ids = (details as { refreshIds?: unknown }).refreshIds;
+			if (!Array.isArray(ids) || !ids.every(id => typeof id === "string" && /^[0-9a-f]{32}$/.test(id))) return new DatastoreError("BACKEND_OUTPUT_INVALID");
+			return new DatastoreError(error.code as DatastoreError["code"], { operationApplied: true, refreshIds: [...ids] });
+		}
+		return new DatastoreError(error.code as DatastoreError["code"]);
+	}
 	return datastoreError(error, "STORE_UNAVAILABLE");
 }
 

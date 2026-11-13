@@ -336,6 +336,7 @@ export function tagCandidate(store: string, path: string, revision: string): { n
 
 export function pageRendered<T>(items: T[], offset: number, budget: { maxBytes: number | null; maxLines: number | null }, render: (page: T[]) => unknown): { items: T[]; next?: number } {
 	if (!Number.isInteger(offset) || offset < 0 || offset > items.length) throw new DatastoreError("STALE_CONTINUATION");
+	if (budget.maxBytes === null && budget.maxLines === null) return { items: items.slice(offset) };
 	const selected: T[] = [];
 	let index = offset;
 	for (; index < items.length; index += 1) {
