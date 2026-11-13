@@ -99,7 +99,10 @@ test("shared socket detach leaves the accepted metadata job, and explicit cancel
 	const host = await startSharedHost(catalogPath);
 	t.after(() => host.close());
 	t.after(() => rm(root, { recursive: true, force: true }));
-	const defined = (await loadSharedCatalog(catalogPath)).stores.get("notebook")!;
+	const catalog = await loadSharedCatalog(catalogPath);
+	assert.equal(catalog.qmd.enabled, false, "the operator's disabled backend must stay disabled");
+	assert.equal(host.adapters.size, 0, "metadata-only behavior must not depend on a locally installed qmd");
+	const defined = catalog.stores.get("notebook")!;
 	const coordinator = host.coordinators.get("notebook")!;
 	let started!: () => void;
 	const holding = new Promise<void>((resolve) => { started = resolve; });

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -179,8 +179,12 @@ test("a replaced source root or unsafe target is not a current graph result", as
 	const unsafe = await service.read({ store: "notes", note: { store: "notes", path: "alpha.md" }, view: "links" });
 	assert.equal(unsafe.provenance.sources[0].freshness, "stale");
 	assert.match(unsafe.warnings.map((warning) => warning.message).join("\n"), new RegExp(String(current.data.revision)));
-	await rm(notes, { recursive: true, force: true });
+	const original = await stat(notes);
+	// Keep the original inode allocated: remove/mkdir may recycle it on Linux.
+	await rename(notes, join(root, "retired-notes"));
 	await mkdir(notes);
+	const replacement = await stat(notes);
+	assert.notDeepEqual({ dev: replacement.dev, ino: replacement.ino }, { dev: original.dev, ino: original.ino });
 	await writeFile(join(notes, "alpha.md"), "Replacement.\n");
 	await assert.rejects(service.read({ store: "notes", note: { store: "notes", path: "alpha.md" }, view: "links" }), { code: "STORE_UNAVAILABLE" });
 });

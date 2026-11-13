@@ -98,7 +98,7 @@ export async function loadSharedCatalog(pathInput: string): Promise<SharedCatalo
 	const packageRoot = installationRaw.packageRoot === undefined ? undefined : text(installationRaw.packageRoot);
 	if ((executable === undefined) === (packageRoot === undefined) || (packageRoot !== undefined && !isAbsolute(packageRoot))) throw new DatastoreError("CONFIG_INVALID");
 	if (typeof qmdRaw.enabled !== "boolean") throw new DatastoreError("CONFIG_INVALID");
-	const qmd: QmdConfig = { enabled: true, installation: { executable, packageRoot }, minimumVersion: text(qmdRaw.minimumVersion) };
+	const qmd: QmdConfig = { enabled: qmdRaw.enabled, installation: { executable, packageRoot }, minimumVersion: text(qmdRaw.minimumVersion) };
 	const storesRaw = record(top.stores);
 	if (Object.keys(storesRaw).length === 0) throw new DatastoreError("CONFIG_INVALID");
 	const stores = new Map<string, SharedStoreDefinition>();

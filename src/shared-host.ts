@@ -171,6 +171,7 @@ export async function startSharedHost(catalogPath: string, options: { schedule?:
 					else if (call.operation === "activity") result = { ...adapter.activity(), metadata };
 					else result = { ...await adapter.status(controller.signal), metadata };
 				}
+				else if (call.operation === "cancel") result = adapter ? await adapter.cancelRefresh(String(call.input?.refreshId)) : await coordinator.cancel(String(call.input?.refreshId));
 				else if (!adapter || !store) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
 				else if (call.operation === "search") {
 					const input = call.input ?? {};
@@ -178,7 +179,6 @@ export async function startSharedHost(catalogPath: string, options: { schedule?:
 				}
 				else if (call.operation === "startLexical") result = await adapter.startLexicalRefresh([store]);
 				else if (call.operation === "startSemantic") result = await adapter.startSemanticRefresh([store]);
-				else if (call.operation === "cancel") result = adapter ? await adapter.cancelRefresh(String(call.input?.refreshId)) : await coordinator.cancel(String(call.input?.refreshId));
 				else throw new DatastoreError("CAPABILITY_UNAVAILABLE");
 				send({ version: 1, requestId: call.requestId, generation, definitionRevision: definition.definitionRevision, ok: true, result });
 			} finally { if (call.requestId) waiters.delete(call.requestId); }
