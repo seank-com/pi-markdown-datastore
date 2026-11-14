@@ -228,6 +228,36 @@ containment/types/links, per-file sizes and aggregate document/byte limits. It
 does not open and decode every note; later content reads and result validation
 are separate. Failed receipts remain observable. The common cycle keeps due lexical reconciliation separate from graph currency; failed embedding jobs are not replayed automatically and require an explicit retry. Do not assume that an interrupted refresh preserves an unchanged previous index.
 
+## Terminal legacy maintenance history
+
+If startup cannot prove which versioned application ledger belongs to the current
+configuration, do not delete its state or guess an adoption source. Inspect the
+application state with the packaged, peer-independent operator command:
+
+```sh
+node node_modules/@seank/pi-markdown-datastore/dist/maintenance-migration-main.js \
+  --state-root /absolute/project/.pi/markdown-datastore/state
+```
+
+Inspection changes no live state. It reports existing stable state, historical
+application ledger hashes/counts, unfinished work and ownership. For terminal-only
+history, obtain the required runtime stop/recovery authorization and stop the
+consuming project before explicitly initializing a fresh active queue:
+
+```sh
+node node_modules/@seank/pi-markdown-datastore/dist/maintenance-migration-main.js \
+  --state-root /absolute/project/.pi/markdown-datastore/state \
+  --initialize-terminal-history
+```
+
+Retain both JSON reports as deployment evidence. All historical receipt files
+stay unchanged; the new stable queue contains no replayed work. Existing stable
+state is never overwritten. Unfinished work, live/uncertain ownership, malformed
+history or an inventory change refuses the operation. Resolve that specific
+condition rather than deleting receipts, retrying blindly or rebuilding native
+storage. Start the project only through its separately authorized lifecycle and
+verify its real private/shared tool path before accepting the deployment.
+
 ## Integration and troubleshooting
 
 Use `/client`'s synchronous capability query at `resources_discover`, after all

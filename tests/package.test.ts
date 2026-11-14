@@ -82,6 +82,33 @@ void policy.roots({}); void policy.validateDestination({ path: "/example/new.md"
       await rm(run, { recursive: true, force: true });
     }
   });
+  await t.test("terminal-history operator CLI needs no Pi peers and preserves legacy receipts", async () => {
+    const state = await realpath(await mkdtemp(join(tmpdir(), "packed-maintenance-state-")));
+    try {
+      const history = join(state, "qmd-public-2.8.3-aaaaaaaaaaaaaaaa");
+      await mkdir(history, { mode: 0o700 });
+      const bytes = JSON.stringify({ version: 1, jobs: [] });
+      await writeFile(join(history, "jobs.json"), bytes, { mode: 0o600 });
+      const cli = join(consumer, "node_modules/@seank/pi-markdown-datastore/dist/maintenance-migration-main.js");
+      const invoke = (args: string[]) => new Promise<string>((resolve, reject) => {
+        const child = spawn(process.execPath, [cli, "--state-root", state, ...args], { cwd: consumer, stdio: ["ignore", "pipe", "pipe"] });
+        let output = "", errors = "";
+        child.stdout.on("data", chunk => { output += chunk; });
+        child.stderr.on("data", chunk => { errors += chunk; });
+        child.once("error", reject);
+        child.once("close", (code, signal) => code === 0 && signal === null ? resolve(output) : reject(new Error(`Migration CLI failed (${code}/${signal}): ${errors}`)));
+      });
+      const inspected = JSON.parse(await invoke([]));
+      assert.equal(inspected.eligible, true); assert.equal(inspected.initialized, false);
+      await assert.rejects(stat(join(state, "jobs.json")), { code: "ENOENT" });
+      const initialized = JSON.parse(await invoke(["--initialize-terminal-history"]));
+      assert.equal(initialized.initialized, true);
+      assert.deepEqual(JSON.parse(await readFile(join(state, "jobs.json"), "utf8")), { version: 1, jobs: [] });
+      assert.equal(await readFile(join(history, "jobs.json"), "utf8"), bytes);
+      assert.equal(JSON.parse(await invoke(["--initialize-terminal-history"])).initialized, false);
+      for (const name of ["@earendil-works", "typebox"]) await assert.rejects(stat(join(consumer, "node_modules", name)), { code: "ENOENT" });
+    } finally { await rm(state, { recursive: true, force: true }); }
+  });
   const sdkRoot = await createQmdFixture(consumer);
   await writeFile(join(consumer, "probe.ts"), `
 import assert from "node:assert/strict";

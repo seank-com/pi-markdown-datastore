@@ -191,6 +191,7 @@ additional encountered restrictions rather than assuming this list is exhaustive
 | Operator-managed user LaunchAgent with `RunAtLoad=true`, documented in `docs/setup.md`; no `KeepAlive` or custom launchd deadline in the example. | Starts the shared catalog service at OS-account login independently of client connections. Operator owns installation and lifecycle; accepted by Sean during PR #13 review. It does not provide pre-login boot startup or authorize live activation. |
 | Shared catalog uses protected JSON, the inherited 64 KiB configuration bound and one include pattern per native collection; the socket parent is owner-only and the socket mode is `0600`. Locations: `src/shared-catalog.ts`, `src/shared-ipc.ts`; catalog values belong to the operator. | Canonical definitions and owner-account-only local IPC are approved in issue #4. The catalog reuses existing reader/file/operation ranges rather than selecting a new transport deadline or frame cap. Reuse does not approve legacy numeric bounds; the single-pattern mapping follows the qualified qmd collection interface. |
 | Metadata catalog and relationship pages use caller budgets in the common result envelope. Location: `src/service.ts`. The inherited 20-job and 256 KiB ledger checks remain in the common coordinator. | A finite response is explicitly partial with a continuation or reports that it cannot fit; unbounded results may include the complete catalog. No new item cap or continuation TTL is added. The independent ledger limits retain their unresolved approval gaps. |
+| Explicit terminal-history initialization requires an absent stable ledger, validated terminal-only history and existing exclusive application/historical ownership. Locations: `maintenance-migration` and its operator CLI. Owner-directed receipt-preserving recovery, 2026-11-14. Existing per-ledger 20-job/256 KiB schema checks are reused; their numeric approval remains unresolved and no total-history cap is added. | Prevents abandoning unfinished work, replacing a current queue or guessing a historical source identity. Automatic adoption remains strict. Inspection uses protected disposable copies; original receipts and native qmd storage remain untouched. |
 | Frontmatter depth 8, 1,000 nodes, 16 KiB strings, and 10 YAML aliases. Location: `src/markdown.ts`. Exceeding one fails the note as `FRONTMATTER_INVALID`. | Bounds YAML walked while parsing notes. Issue #2 surfaced these inherited values. This table records them. It does not approve them. |
 | One maintenance owner per derived index, independent of IPC path. Protected ownership directory `0700`, records `0600`; live or unverifiable owner/worker PIDs refuse admission. Locations: `src/index-ownership.ts`, `QmdAdapter`, native-worker registration. | Approved single-index ownership and operator restart without manual dead-owner cleanup, issue #4 and the owner's 2026-11-12 recovery decision. Atomic nonempty-directory admission prevents simultaneous reclaimers replacing one another. Only proven-dead process records are reclaimed; no lease timer, election, process killing or autostart. PID reuse is conservatively treated as live, not guessed dead. |
 
@@ -257,6 +258,29 @@ When qmd is available, startup also requeues interrupted qmd jobs and schedules 
 active jobs coalesce; different requests serialize. Cancelling a request waiter
 does not cancel shared maintenance; explicit cancellation owns that decision.
 The latest 20 job records are retained, subject to the active-job bound.
+### Explicit terminal-history initialization
+
+An operator may inspect the application state with `maintenance-migration-main`
+and explicitly initialize its absent stable ledger when all retained legacy work
+is terminal. This is a fresh active queue, not adoption of a historical source
+definition. Every historical application ledger remains byte-for-byte in place,
+including receipts outside the active queue's retention window. The report lists
+their paths, SHA-256 values and job counts. No historical job is replayed,
+rebound, cancelled or copied into the current queue.
+
+The command validates protected copies through the existing coordinator schema,
+never normalizing the original receipts. Inspection does not change live state.
+Initialization acquires the application and historical ownership leases,
+revalidates the inventory and hashes, and atomically publishes only the absent
+`jobs.json`. Queued/running work, a live or uncertain owner, malformed history or
+a changed inventory prevents initialization. Existing stable state is never
+replaced. A later runtime start loads the ordinary empty version-1 ledger and
+keeps the normal strict automatic-adoption behavior unchanged. Operators retain
+the inspection/initialization reports with their deployment evidence and obtain
+separate runtime stop/start authorization. No native qmd storage is opened.
+
+### Backend reconciliation and recovery
+
 A backend refresh failure marks the index for rebuild on the next lexical
 reconciliation: close both public stores, quarantine the entire opaque backend directory,
 and build a fresh index from all configured collections. Successful recovery
