@@ -1,4 +1,3 @@
-import { pathToFileURL } from "node:url";
 import { inspectTerminalHistory, initializeTerminalHistory } from "./maintenance-migration.ts";
 
 export async function main(args: string[]): Promise<void> {
@@ -12,7 +11,7 @@ export async function main(args: string[]): Promise<void> {
  const report = await (initialize ? initializeTerminalHistory(stateRoot) : inspectTerminalHistory(stateRoot));
  process.stdout.write(JSON.stringify(report) + "\n");
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (import.meta.main) {
  void main(process.argv.slice(2)).catch(error => {
   process.stderr.write(`${error.code ? error.code + ": " : ""}${error.message}\n`);
   process.exitCode = 1;

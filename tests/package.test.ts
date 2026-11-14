@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -90,15 +90,17 @@ void policy.roots({}); void policy.validateDestination({ path: "/example/new.md"
       const bytes = JSON.stringify({ version: 1, jobs: [] });
       await writeFile(join(history, "jobs.json"), bytes, { mode: 0o600 });
       const cli = join(consumer, "node_modules/@seank/pi-markdown-datastore/dist/maintenance-migration-main.js");
-      const invoke = (args: string[]) => new Promise<string>((resolve, reject) => {
-        const child = spawn(process.execPath, [cli, "--state-root", state, ...args], { cwd: consumer, stdio: ["ignore", "pipe", "pipe"] });
+      const invoke = (args: string[], entry = cli) => new Promise<string>((resolve, reject) => {
+        const child = spawn(process.execPath, [entry, "--state-root", state, ...args], { cwd: consumer, stdio: ["ignore", "pipe", "pipe"] });
         let output = "", errors = "";
         child.stdout.on("data", chunk => { output += chunk; });
         child.stderr.on("data", chunk => { errors += chunk; });
         child.once("error", reject);
         child.once("close", (code, signal) => code === 0 && signal === null ? resolve(output) : reject(new Error(`Migration CLI failed (${code}/${signal}): ${errors}`)));
       });
-      const inspected = JSON.parse(await invoke([]));
+      const alias = join(state, "migration-cli.js");
+      await symlink(cli, alias);
+      const inspected = JSON.parse(await invoke([], alias));
       assert.equal(inspected.eligible, true); assert.equal(inspected.initialized, false);
       await assert.rejects(stat(join(state, "jobs.json")), { code: "ENOENT" });
       const initialized = JSON.parse(await invoke(["--initialize-terminal-history"]));
