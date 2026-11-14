@@ -90,6 +90,20 @@ test("trusted valid configuration registers exactly five strict tools", async (t
 	assert.ok(app.entries.every((entry) => !JSON.stringify(entry).includes("one.md") && !JSON.stringify(entry).includes("Body")));
 });
 
+test("tool enum fields retain plain string-enum wire schemas", () => {
+	const app = harness("/synthetic-schema-project");
+	createMarkdownDatastoreExtension({ projectRoot: "/synthetic-schema-project" })(app.pi);
+	const search = JSON.parse(JSON.stringify(app.tools.find(tool => tool.name === "datastore_search").parameters));
+	const find = JSON.parse(JSON.stringify(app.tools.find(tool => tool.name === "datastore_find").parameters));
+	const read = JSON.parse(JSON.stringify(app.tools.find(tool => tool.name === "datastore_read").parameters));
+	assert.deepEqual(search.properties.mode, { type: "string", enum: ["lexical", "semantic", "hybrid"] });
+	assert.deepEqual(search.properties.freshness, { type: "string", enum: ["allow-stale", "require-current-lexical", "require-current-semantic"] });
+	assert.deepEqual(find.properties.match, { type: "string", enum: ["all", "any"] });
+	assert.deepEqual(find.properties.selectors.items.anyOf[0].properties.kind, { type: "string", enum: ["path"] });
+	assert.deepEqual(find.properties.selectors.items.anyOf[1].properties.kind, { type: "string", enum: ["uri"] });
+	assert.deepEqual(read.properties.view, { type: "string", enum: ["content", "section", "outline", "links", "backlinks"] });
+});
+
 test("conditional read/refresh schemas explicitly declare object branches without changing valid inputs", () => {
 	const app = harness("/synthetic-schema-project");
 	createMarkdownDatastoreExtension({ projectRoot: "/synthetic-schema-project" })(app.pi);

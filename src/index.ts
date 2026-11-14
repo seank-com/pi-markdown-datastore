@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import {
 	MARKDOWN_DATASTORE_CONTRACT_VERSION, MARKDOWN_DATASTORE_REQUEST_EVENT,
@@ -29,8 +28,8 @@ async function createQmd(config: Awaited<ReturnType<typeof loadMarkdownDatastore
 
 const Note = Type.Object({ store: Type.String({ pattern: "^[a-z][a-z0-9_-]{0,31}$" }), path: Type.String({ minLength: 3 }) }, { additionalProperties: false });
 const Selector = Type.Union([
-	Type.Object({ kind: StringEnum(["path"] as const), path: Type.String() }, { additionalProperties: false }),
-	Type.Object({ kind: StringEnum(["uri"] as const), uri: Type.String() }, { additionalProperties: false }),
+	Type.Object({ kind: Type.Enum(["path"], { type: "string" }), path: Type.String() }, { additionalProperties: false }),
+	Type.Object({ kind: Type.Enum(["uri"], { type: "string" }), uri: Type.String() }, { additionalProperties: false }),
 ]);
 const ReadIdentity = { store: Type.Optional(Type.String()), note: Type.Optional(Note), uri: Type.Optional(Type.String()) };
 const Budget = { maxBytes: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum complete result-envelope UTF-8 bytes. Overrides a configured default; otherwise omission is unbounded." })), maxLines: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum logical payload lines. Overrides a configured default; otherwise omission is unbounded." })) };
@@ -41,13 +40,13 @@ const PolicySchemas = {
 	validateDestination: Type.Object({ path: Type.String({ minLength: 1 }), ...Budget }, { additionalProperties: false }),
 };
 const Schemas = {
-	search: Type.Object({ store: Type.String(), query: Type.String({ minLength: 1, maxLength: 4096 }), mode: Type.Optional(StringEnum(["lexical", "semantic", "hybrid"] as const)), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })), minScore: Type.Optional(Type.Number()), freshness: Type.Optional(StringEnum(["allow-stale", "require-current-lexical", "require-current-semantic"] as const)), includeContent: Type.Optional(Type.Boolean()), ...Budget }, { additionalProperties: false }),
-	find: Type.Object({ store: Type.String(), selectors: Type.Array(Selector, { minItems: 1, maxItems: 8 }), match: Type.Optional(StringEnum(["all", "any"] as const)), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })), continuation: Type.Optional(Type.String()), ...Budget }, { additionalProperties: false }),
+	search: Type.Object({ store: Type.String(), query: Type.String({ minLength: 1, maxLength: 4096 }), mode: Type.Optional(Type.Enum(["lexical", "semantic", "hybrid"], { type: "string" })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })), minScore: Type.Optional(Type.Number()), freshness: Type.Optional(Type.Enum(["allow-stale", "require-current-lexical", "require-current-semantic"], { type: "string" })), includeContent: Type.Optional(Type.Boolean()), ...Budget }, { additionalProperties: false }),
+	find: Type.Object({ store: Type.String(), selectors: Type.Array(Selector, { minItems: 1, maxItems: 8 }), match: Type.Optional(Type.Enum(["all", "any"], { type: "string" })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })), continuation: Type.Optional(Type.String()), ...Budget }, { additionalProperties: false }),
 	read: Type.Unsafe<ReadInput>({
 		type: "object",
 		properties: {
 			continuation: Type.String(), ...ReadIdentity,
-			view: StringEnum(["content", "section", "outline", "links", "backlinks"] as const),
+			view: Type.Enum(["content", "section", "outline", "links", "backlinks"], { type: "string" }),
 			includeFrontmatter: Type.Boolean(), excludeSections: Type.Array(Type.String(), { maxItems: 20 }),
 			headingPath: Type.Array(Type.String(), { minItems: 1, maxItems: 12 }), occurrence: Type.Integer({ minimum: 0 }), sectionHandle: Type.String(),
 			...ReadBounds,

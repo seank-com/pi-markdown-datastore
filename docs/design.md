@@ -359,7 +359,10 @@ independent of caller output budgets, not a reason to impose another result cap.
 
 ### Tool schemas and readiness
 
-All six model-facing tools use object-root parameter schemas. Conditional
+All six model-facing tools use object-root parameter schemas. String enum fields
+use plain `type: "string"` and `enum` arrays, not `anyOf`/`const` alternatives.
+TypeBox constructs these fields and owns their static input types, independently
+of the host provider library's schema helpers. Conditional
 `anyOf`/`oneOf` object branches explicitly declare their object type, including
 presence constraints inside `not`, so provider validators do not infer a
 non-object union. Refresh uses flat root alternatives for start without paths,
