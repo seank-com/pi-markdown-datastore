@@ -1,8 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { truncateHead } from "@earendil-works/pi-coding-agent";
-import { StringEnum } from "@earendil-works/pi-ai";
+
 import { Type } from "typebox";
 import {
 	MARKDOWN_DATASTORE_CONTRACT_VERSION, MARKDOWN_DATASTORE_REQUEST_EVENT,
@@ -11,62 +10,75 @@ import {
 	type MarkdownDatastoreRequest, type MarkdownDatastoreResult, type MarkdownDatastoreRpcEnvelope,
 	type ReadInput, type RefreshInput,
 } from "./contract.ts";
-import { HARD_MAX_RESULT_BYTES, HARD_MAX_RESULT_LINES, loadMarkdownDatastoreConfig, projectDatastoreConfigPath } from "./config.ts";
+import { loadMarkdownDatastoreConfig, projectDatastoreConfigPath } from "./config.ts";
 import { DatastoreError, datastoreError } from "./errors.ts";
-import { discoverQmdBinding, QmdAdapter } from "./qmd-adapter.ts";
+import { discoverQmdBinding, qmdApplicationDirectory, QmdAdapter } from "./qmd-adapter.ts";
+import { adoptLegacyApplicationJobs, MaintenanceCoordinator, sourceDefinition } from "./maintenance-coordinator.ts";
+import { acquireIndexOwnership } from "./index-ownership.ts";
+import { prepareQmdStateDirectory } from "./qmd-adapter.ts";
+import { MetadataIndex, registerMetadata } from "./metadata-index.ts";
 import { MarkdownDatastoreService } from "./service.ts";
+import { SharedIndexClient } from "./shared-client.ts";
 
 export interface MarkdownDatastoreExtensionOptions {
 	projectRoot?: string; configPath?: string;
 	createQmd?: typeof createQmd;
 }
-async function createQmd(config: Awaited<ReturnType<typeof loadMarkdownDatastoreConfig>>): Promise<QmdAdapter> { return new QmdAdapter(config, await discoverQmdBinding(config)); }
+async function createQmd(config: Awaited<ReturnType<typeof loadMarkdownDatastoreConfig>>, coordinator?: MaintenanceCoordinator): Promise<QmdAdapter> { return new QmdAdapter(config, await discoverQmdBinding(config), coordinator); }
 
 const Note = Type.Object({ store: Type.String({ pattern: "^[a-z][a-z0-9_-]{0,31}$" }), path: Type.String({ minLength: 3 }) }, { additionalProperties: false });
 const Selector = Type.Union([
-	Type.Object({ kind: StringEnum(["path"] as const), path: Type.String() }, { additionalProperties: false }),
-	Type.Object({ kind: StringEnum(["uri"] as const), uri: Type.String() }, { additionalProperties: false }),
+	Type.Object({ kind: Type.Enum(["path"], { type: "string" }), path: Type.String() }, { additionalProperties: false }),
+	Type.Object({ kind: Type.Enum(["uri"], { type: "string" }), uri: Type.String() }, { additionalProperties: false }),
 ]);
 const ReadIdentity = { store: Type.Optional(Type.String()), note: Type.Optional(Note), uri: Type.Optional(Type.String()) };
-const ReadBounds = { maxBytes: Type.Optional(Type.Integer({ minimum: 4, maximum: HARD_MAX_RESULT_BYTES })), maxLines: Type.Optional(Type.Integer({ minimum: 1, maximum: HARD_MAX_RESULT_LINES })) };
+const Budget = { maxBytes: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum complete result-envelope UTF-8 bytes. Overrides a configured default; otherwise omission is unbounded." })), maxLines: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum logical payload lines. Overrides a configured default; otherwise omission is unbounded." })) };
+const ReadBounds = Budget;
 const forbidden = (...keys: string[]) => ({ not: { type: "object", anyOf: keys.map((key) => ({ type: "object", required: [key] })) } });
 const PolicySchemas = {
-	roots: Type.Object({}, { additionalProperties: false }),
-	validateDestination: Type.Object({ path: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
+	roots: Type.Object({ ...Budget }, { additionalProperties: false }),
+	validateDestination: Type.Object({ path: Type.String({ minLength: 1 }), ...Budget }, { additionalProperties: false }),
 };
 const Schemas = {
-	search: Type.Object({ store: Type.String(), query: Type.String({ minLength: 1, maxLength: 4096 }), mode: Type.Optional(StringEnum(["lexical", "semantic", "hybrid"] as const)), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })), minScore: Type.Optional(Type.Number()), freshness: Type.Optional(StringEnum(["allow-stale", "require-current-lexical", "require-current-semantic"] as const)), includeContent: Type.Optional(Type.Boolean()) }, { additionalProperties: false }),
-	find: Type.Object({ store: Type.String(), selectors: Type.Array(Selector, { minItems: 1, maxItems: 8 }), match: Type.Optional(StringEnum(["all", "any"] as const)), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })) }, { additionalProperties: false }),
+	search: Type.Object({ store: Type.String(), query: Type.String({ minLength: 1, maxLength: 4096 }), mode: Type.Optional(Type.Enum(["lexical", "semantic", "hybrid"], { type: "string" })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })), minScore: Type.Optional(Type.Number()), freshness: Type.Optional(Type.Enum(["allow-stale", "require-current-lexical", "require-current-semantic"], { type: "string" })), includeContent: Type.Optional(Type.Boolean()), ...Budget }, { additionalProperties: false }),
+	find: Type.Object({ store: Type.String(), selectors: Type.Array(Selector, { minItems: 1, maxItems: 8 }), match: Type.Optional(Type.Enum(["all", "any"], { type: "string" })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })), continuation: Type.Optional(Type.String()), ...Budget }, { additionalProperties: false }),
 	read: Type.Unsafe<ReadInput>({
 		type: "object",
 		properties: {
 			continuation: Type.String(), ...ReadIdentity,
-			view: StringEnum(["content", "section", "outline"] as const),
+			view: Type.Enum(["content", "section", "outline", "links", "backlinks"], { type: "string" }),
 			includeFrontmatter: Type.Boolean(), excludeSections: Type.Array(Type.String(), { maxItems: 20 }),
 			headingPath: Type.Array(Type.String(), { minItems: 1, maxItems: 12 }), occurrence: Type.Integer({ minimum: 0 }), sectionHandle: Type.String(),
 			...ReadBounds,
 		},
 		additionalProperties: false,
 		anyOf: [
-			{ type: "object", required: ["continuation"], ...forbidden("store", "note", "uri", "view", "includeFrontmatter", "excludeSections", "headingPath", "occurrence", "sectionHandle", "includeSemanticRelated", "maxBytes", "maxLines") },
+			{ type: "object", required: ["continuation"], ...forbidden("store", "note", "uri", "view", "includeFrontmatter", "excludeSections", "headingPath", "occurrence", "sectionHandle", "includeSemanticRelated") },
 			{ type: "object", properties: { view: { type: "string", enum: ["content"] } }, ...forbidden("continuation", "headingPath", "occurrence", "sectionHandle", "includeSemanticRelated") },
 			{ type: "object", required: ["view"], properties: { view: { type: "string", enum: ["section"] } }, ...forbidden("continuation", "includeFrontmatter", "excludeSections", "includeSemanticRelated") },
 			{ type: "object", required: ["view"], properties: { view: { type: "string", enum: ["outline"] } }, ...forbidden("continuation", "includeFrontmatter", "excludeSections", "headingPath", "occurrence", "sectionHandle", "includeSemanticRelated") },
+			{ type: "object", required: ["view"], properties: { view: { type: "string", enum: ["links", "backlinks"] } }, ...forbidden("includeFrontmatter", "excludeSections", "headingPath", "occurrence", "sectionHandle", "includeSemanticRelated") },
 		],
 	}),
-	status: Type.Object({ store: Type.Optional(Type.String()) }, { additionalProperties: false }),
+	status: Type.Object({ store: Type.Optional(Type.String()), ...Budget }, { additionalProperties: false }),
+	tags: Type.Object({ store: Type.String(), continuation: Type.Optional(Type.String()), maxBytes: Type.Optional(Type.Integer({ minimum: 1 })), maxLines: Type.Optional(Type.Integer({ minimum: 1 })) }, { additionalProperties: false }),
 	refresh: Type.Unsafe<RefreshInput>({
 		type: "object",
 		properties: {
 			action: { type: "string", enum: ["start", "cancel"], description: "Start derived-state maintenance, or cancel one lexical or semantic job." },
 			store: { type: "string", description: "Configured store to refresh. Valid only for start; omit to refresh all stores." },
-			mode: { type: "string", enum: ["direct", "lexical", "semantic", "all"], description: "Derived state to refresh. Valid only for start." },
+			mode: { type: "string", enum: ["direct", "lexical", "semantic", "all", "metadata", "rebuild"], description: "Derived state to refresh. metadata accepts paths. rebuild rereads the store and ignores stored timestamps. Valid only for start." },
+			paths: { type: "array", minItems: 1, items: { type: "string", minLength: 1 }, description: "Relative paths changed by a publication. Valid only for metadata start. Invalid paths are rejected and do not become a rebuild." },
 			refreshId: { type: "string", pattern: "^[0-9a-f]{32}$", description: "Lexical or semantic job ID returned by a prior start. Required only for cancel." },
+			maxBytes: { type: "integer", minimum: 1, description: "Maximum complete receipt-envelope UTF-8 bytes; overrides a configured default, otherwise omission is unbounded." },
+			maxLines: { type: "integer", minimum: 1, description: "Maximum logical payload lines; overrides a configured default, otherwise omission is unbounded." },
 		},
 		additionalProperties: false,
 		anyOf: [
-			{ type: "object", properties: { action: { type: "string", enum: ["start"] } }, not: { type: "object", required: ["refreshId"] } },
-			{ type: "object", required: ["action", "refreshId"], properties: { action: { type: "string", enum: ["cancel"] } }, not: { type: "object", anyOf: [{ type: "object", required: ["store"] }, { type: "object", required: ["mode"] }] } },
+			// Keep root alternatives flat: xAI rejects the equivalent nested path choice.
+			{ type: "object", properties: { action: { type: "string", enum: ["start"] } }, ...forbidden("refreshId", "paths") },
+			{ type: "object", required: ["mode", "paths"], properties: { action: { type: "string", enum: ["start"] }, mode: { type: "string", enum: ["metadata"] } }, not: { type: "object", required: ["refreshId"] } },
+			{ type: "object", required: ["action", "refreshId"], properties: { action: { type: "string", enum: ["cancel"] } }, not: { type: "object", anyOf: [{ type: "object", required: ["store"] }, { type: "object", required: ["mode"] }, { type: "object", required: ["paths"] }] } },
 		],
 	}),
 };
@@ -100,8 +112,7 @@ function validRpcRequest(value: unknown): value is MarkdownDatastoreRequest {
 
 function toolText(result: MarkdownDatastoreResult): string {
 	const serialized = JSON.stringify(result);
-	const bounded = truncateHead(serialized, { maxBytes: HARD_MAX_RESULT_BYTES, maxLines: HARD_MAX_RESULT_LINES });
-	return bounded.truncated ? `${bounded.content}\n[RESULT_LIMIT_EXCEEDED: structured result truncated at the datastore hard ceiling]` : bounded.content;
+	return serialized;
 }
 
 export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExtensionOptions = {}) {
@@ -116,10 +127,11 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 			if (!request || request.version !== 1 || typeof request.requestId !== "string" || request.requestId.length < 1 || request.requestId.length > 128) return;
 			const ownGeneration = generation;
 			const capability: MarkdownDatastoreCapability = {
-				version: 1, contractVersion: MARKDOWN_DATASTORE_CONTRACT_VERSION, policyVersion: 1,
+				version: 1, contractVersion: MARKDOWN_DATASTORE_CONTRACT_VERSION, policyVersion: 1, resultBudgetVersion: 1 as const,
 				get instanceId() { return generation === ownGeneration ? instanceId : undefined; },
 				get ready() { return generation === ownGeneration && service !== undefined; },
 				get stores() { return generation === ownGeneration && service ? [...service.config.stores.keys()] : []; },
+				get metadata() { return generation === ownGeneration && service ? { links: true as const, backlinks: true as const, tags: true as const } : undefined; },
 			};
 			pi.events.emit(MARKDOWN_DATASTORE_CAPABILITY_REPLY, { version: 1, requestId: request.requestId, capability });
 		});
@@ -147,6 +159,7 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 				case "read": return service.read(request.input, signal);
 				case "status": return service.status(request.input, signal);
 				case "refresh": return service.refresh(request.input, signal);
+				case "tags": return service.tags(request.input, signal);
 				default: throw new DatastoreError("CAPABILITY_UNAVAILABLE");
 			}
 		};
@@ -161,11 +174,12 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 		};
 		const registerTools = (): void => {
 			if (registered) return; registered = true;
-			pi.registerTool({ name: "datastore_search", label: "Datastore search", description: "Ranked lexical, semantic, or hybrid retrieval from one configured Markdown store. Returns at most 20 directly validated hits and bounded snippets.", parameters: Schemas.search, execute: (_id, input, signal) => execute({ operation: "search", input }, signal) });
+			pi.registerTool({ name: "datastore_search", label: "Datastore search", description: "Ranked lexical, semantic, or hybrid retrieval from one configured Markdown store. Returns at most 20 directly validated hits with relevant-paragraph snippets. Optional caller budgets control output size.", parameters: Schemas.search, execute: (_id, input, signal) => execute({ operation: "search", input }, signal) });
 			pi.registerTool({ name: "datastore_find", label: "Datastore find", description: "Deterministically find Markdown notes by exact path or datastore URI. Does not perform similarity search.", parameters: Schemas.find, execute: (_id, input, signal) => execute({ operation: "find", input }, signal) });
-			pi.registerTool({ name: "datastore_read", label: "Datastore read", description: "Read a bounded direct Markdown content, section, or outline view. Truncation uses opaque continuations.", parameters: Schemas.read, execute: (_id, input, signal) => execute({ operation: "read", input }, signal) });
+			pi.registerTool({ name: "datastore_read", label: "Datastore read", description: "Read direct Markdown content, section, outline, links, or backlinks. Optional caller budgets control page size; continuations preserve selection and allow a changed budget.", parameters: Schemas.read, execute: (_id, input, signal) => execute({ operation: "read", input }, signal) });
 			pi.registerTool({ name: "datastore_status", label: "Datastore status", description: "Report configured Markdown store capabilities, protected backend readiness, freshness, counts, and permission warnings without note contents.", parameters: Schemas.status, execute: (_id, input, signal) => execute({ operation: "status", input }, signal) });
 			pi.registerTool({ name: "datastore_refresh", label: "Datastore refresh", description: "Start or cancel read-only derived datastore maintenance. Lexical, semantic, and all return prompt durable job receipts; direct performs only bounded root revalidation. Status reports progress. Never mutates source Markdown or runs source synchronization.", parameters: Schemas.refresh, executionMode: "sequential", execute: (_id, input, signal) => execute({ operation: "refresh", input }, signal) });
+			pi.registerTool({ name: "datastore_tags", label: "Datastore tags", description: "List frontmatter tag identities, display spellings, and distinct page counts for one configured store. Pages by the existing result envelope. Not a note and not a refresh.", parameters: Schemas.tags, execute: (_id, input, signal) => execute({ operation: "tags", input }, signal) });
 		};
 		registerTools();
 		const removeRpc = (): void => { rpcUnsubscribe?.(); rpcUnsubscribe = undefined; };
@@ -207,11 +221,32 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 			if (!ctx.isProjectTrusted()) { unavailable = new DatastoreError("PROJECT_UNTRUSTED"); ctx.ui.setStatus("markdown-datastore", "datastore: disabled (project untrusted)"); return; }
 			let config; try { config = await loadMarkdownDatastoreConfig(projectRoot, configPath); } catch (error) { if (generation !== ownGeneration) return; unavailable = datastoreError(error, "CONFIG_INVALID"); ctx.ui.setStatus("markdown-datastore", `datastore: disabled (${unavailable.code})`); return; }
 			if (generation !== ownGeneration) return;
+			const privateStores = [...config.stores.values()].filter((store) => !store.shared);
 			let qmd: QmdAdapter | undefined;
-			if (config.qmd.enabled) try { qmd = await (options.createQmd ?? createQmd)(config); } catch {}
-			if (generation !== ownGeneration) { await Promise.allSettled([qmd?.shutdown()].filter((operation): operation is Promise<void> => operation !== undefined)); return; }
-			service = new MarkdownDatastoreService(config, undefined, qmd);
-			if (qmd) void qmd.startupReconcile([...config.stores.values()]).catch(() => undefined);
+			const sharedClients = new Map([...config.stores.values()].filter((store) => store.shared).map((store) => [store.name, new SharedIndexClient(store.shared!)]));
+			if (generation !== ownGeneration) { await Promise.allSettled([qmd?.shutdown(), ...[...sharedClients.values()].map((client) => client.shutdown())].filter((operation): operation is Promise<void> => operation !== undefined)); return; }
+			let ownership;
+			try { await prepareQmdStateDirectory(config.stateRoot); ownership = await acquireIndexOwnership(config.stateRoot); }
+			catch (error) { if (generation !== ownGeneration) return; unavailable = datastoreError(error, "STORE_UNAVAILABLE"); ctx.ui.setStatus("markdown-datastore", `datastore: disabled (${unavailable.code})`); return; }
+			if (generation !== ownGeneration) { await ownership.release(); return; }
+			const jobsPath = join(config.stateRoot, "jobs.json");
+			const qmdConfig = { ...config, stores: new Map(privateStores.map((store) => [store.name, store])) };
+			try { await adoptLegacyApplicationJobs(config.stateRoot, jobsPath, new Set(privateStores.map((store) => store.name)), (version) => qmdApplicationDirectory(qmdConfig, version), (job, version) => sourceDefinition(job.stores.map((name) => qmdConfig.stores.get(name)!), job.mode === "metadata" ? undefined : { version })); }
+			catch (error) { await ownership.release(); if (generation !== ownGeneration) return; unavailable = datastoreError(error, "INDEX_CORRUPT"); ctx.ui.setStatus("markdown-datastore", `datastore: disabled (${unavailable.code})`); return; }
+			const coordinator = new MaintenanceCoordinator(jobsPath, () => new Set(config.stores.keys()), (job) => sourceDefinition(job.stores.map((name) => config.stores.get(name)!), job.mode === "metadata" || !qmd ? undefined : { version: qmd.binding.version }));
+			if (config.qmd.enabled && privateStores.length) try { qmd = await (options.createQmd ?? createQmd)({ ...config, stores: new Map(privateStores.map((store) => [store.name, store])) }, coordinator); } catch {}
+			const indexes = new Map(privateStores.map((store) => [store.name, new MetadataIndex(join(config.stateRoot, `metadata-${store.name}`))]));
+			if (indexes.size) registerMetadata(coordinator, indexes, config.stores);
+			const abandon = async () => { coordinator.shutdown(); await coordinator.settled(); await qmd?.shutdown(); await Promise.all([...sharedClients.values()].map((client) => client.shutdown())); await ownership.release(); };
+			try { await coordinator.ensureLoaded(); }
+			catch (error) { await abandon(); if (generation !== ownGeneration) return; unavailable = datastoreError(error, "INDEX_CORRUPT"); ctx.ui.setStatus("markdown-datastore", `datastore: disabled (${unavailable.code})`); return; }
+			if (generation !== ownGeneration) { await abandon(); return; }
+			coordinator.relaunchQueued();
+			if (generation !== ownGeneration) { await abandon(); return; }
+			service = new MarkdownDatastoreService(config, undefined, qmd, sharedClients);
+			service.bindMetadata(coordinator, indexes, ownership);
+			if (generation !== ownGeneration) { const abandoned = service; service = undefined; await abandoned.shutdown(); return; }
+			if (qmd) void qmd.startupReconcile(privateStores).catch(() => undefined);
 			ctx.ui.setStatus("markdown-datastore", "datastore: ready");
 		});
 		pi.on("session_shutdown", async (_event, ctx) => { generation += 1; removeRpc(); capabilityUnsubscribe?.(); capabilityUnsubscribe = undefined; const current = service; service = undefined; await current?.shutdown(); ctx.ui.setStatus("markdown-datastore", undefined); });

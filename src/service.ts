@@ -4,19 +4,37 @@ import type {
 	RootsInput, RootsResult, DestinationInput, DestinationResult, MarkdownDatastorePolicyV1,
 } from "./contract.ts";
 import type { MarkdownDatastoreConfig, StoreConfig } from "./config.ts";
-import { HARD_MAX_RESULT_BYTES, HARD_MAX_RESULT_LINES } from "./config.ts";
-import { assertRootIdentity, inspectDestination, ownsDestination, noteUriToRef, redactedRoot, safeOpenNote, validateRelativeNotePath } from "./containment.ts";
+import { exceedsBudget, resolveResultBudget, type ResultBudget } from "./config-common.ts";
+import { assertRootIdentity, inspectDestination, ownsDestination, noteUriToRef, redactedRoot, safeOpenNote, validateRelativeContainedPath, validateRelativeNotePath } from "./containment.ts";
 import { ContinuationRegistry, type ContinuationDescriptor } from "./continuations.ts";
 import { DatastoreError, throwIfAborted } from "./errors.ts";
 import { boundedPage, contentWithoutSections, parseMarkdown, sectionText, selectSection, type SectionDescriptor } from "./markdown.ts";
 import type { QmdAdapter, QmdCandidate } from "./qmd-adapter.ts";
+import { SharedIndexClient } from "./shared-client.ts";
+import type { MaintenanceCoordinator } from "./maintenance-coordinator.ts";
+import type { IndexOwnership } from "./index-ownership.ts";
+import { sourceDefinition } from "./maintenance-coordinator.ts";
+import { continuationOffset, continuationToken, pageRendered, readPageToken, reconcileChanged, tagCandidate, type MetadataIndex } from "./metadata-index.ts";
+import { tagIdentity } from "./wiki.ts";
 
 function elapsed(started: number): number { return Math.max(0, Date.now() - started); }
 function propagateControlError(error: unknown): void { if (error instanceof DatastoreError && (error.code === "CANCELLED" || error.code === "TIMEOUT")) throw error; }
-function lines(value: string): number { return value.length === 0 ? 0 : value.split("\n").length; }
-function boundedArrays(first: unknown[], second: unknown[], firstKey: string, secondKey: string, base: Record<string, unknown>, maximum: number, budget: { maxBytes: number; maxLines: number }): { first: unknown[]; second: unknown[]; text: string; returnedLines: number; truncated: boolean } {
+function lines(value: string): number {
+	if (!value.length) return 0;
+	let count = value.endsWith("\n") ? 0 : 1;
+	for (let offset = value.indexOf("\n"); offset >= 0; offset = value.indexOf("\n", offset + 1)) count += 1;
+	return count;
+}
+function appliedRefreshes(...receipts: unknown[]): { operationApplied: true; refreshIds: string[] } {
+	const ids = receipts.flatMap(receipt => {
+		const id = receipt && typeof receipt === "object" ? (receipt as { refreshId?: unknown }).refreshId : undefined;
+		return typeof id === "string" && /^[0-9a-f]{32}$/.test(id) ? [id] : [];
+	});
+	return { operationApplied: true, refreshIds: [...new Set(ids)] };
+}
+function boundedArrays(first: unknown[], second: unknown[], firstKey: string, secondKey: string, base: Record<string, unknown>, maximum: number, budget: ResultBudget): { first: unknown[]; second: unknown[]; text: string; returnedLines: number; truncated: boolean } {
 	const selectedFirst: unknown[] = []; const selectedSecond: unknown[] = []; let truncated = false;
-	for (const [target, items] of [[selectedFirst, first], [selectedSecond, second]] as const) for (const item of items) { const candidate = [...target, item]; const data = { ...base, [firstKey]: target === selectedFirst ? candidate : selectedFirst, [secondKey]: target === selectedSecond ? candidate : selectedSecond }; const text = JSON.stringify(data); if (selectedFirst.length + selectedSecond.length >= maximum || Buffer.byteLength(text) > budget.maxBytes || selectedFirst.length + selectedSecond.length + 1 > budget.maxLines) { truncated = true; continue; } target.push(item); }
+	for (const [target, items] of [[selectedFirst, first], [selectedSecond, second]] as const) for (const item of items) { const candidate = [...target, item]; const data = { ...base, [firstKey]: target === selectedFirst ? candidate : selectedFirst, [secondKey]: target === selectedSecond ? candidate : selectedSecond }; const text = JSON.stringify(data); if (selectedFirst.length + selectedSecond.length >= maximum || (budget.maxBytes !== null && Buffer.byteLength(text) > budget.maxBytes) || (budget.maxLines !== null && selectedFirst.length + selectedSecond.length + 1 > budget.maxLines)) { truncated = true; continue; } target.push(item); }
 	const text = JSON.stringify({ ...base, [firstKey]: selectedFirst, [secondKey]: selectedSecond }); return { first: selectedFirst, second: selectedSecond, text, returnedLines: Math.max(1, selectedFirst.length + selectedSecond.length), truncated };
 }
 
@@ -24,8 +42,12 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 	readonly config: MarkdownDatastoreConfig;
 	readonly continuations: ContinuationRegistry;
 	readonly qmd?: QmdAdapter;
+	readonly sharedClients?: ReadonlyMap<string, SharedIndexClient>;
+	metadata?: ReadonlyMap<string, MetadataIndex>;
+	maintenance?: MaintenanceCoordinator;
+	#ownership?: IndexOwnership;
 	#lifecycle = new AbortController(); #active = new Set<Promise<unknown>>(); #closed = false;
-	constructor(config: MarkdownDatastoreConfig, continuations = new ContinuationRegistry(), qmd?: QmdAdapter) { this.config = config; this.continuations = continuations; this.qmd = qmd; }
+	constructor(config: MarkdownDatastoreConfig, continuations = new ContinuationRegistry(), qmd?: QmdAdapter, sharedClients?: ReadonlyMap<string, SharedIndexClient>) { this.config = config; this.continuations = continuations; this.qmd = qmd; this.sharedClients = sharedClients; }
 	private runOperation<T>(signal: AbortSignal | undefined, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
 		if (this.#closed) return Promise.reject(new DatastoreError("CANCELLED"));
 		const deadline = new AbortController();
@@ -43,7 +65,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		return this.runOperation(signal, async activeSignal => {
 			const started = Date.now();
 			const roots = await this.policyRoots(activeSignal);
-			return this.envelope("roots", "*", { roots }, started, JSON.stringify(roots));
+			return this.envelope("roots", "*", { roots }, started, JSON.stringify(roots), false, undefined, [], [], this.budget(_input));
 		});
 	}
 	validateDestination(input: DestinationInput, signal?: AbortSignal): Promise<DestinationResult> {
@@ -54,7 +76,7 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 			const roots = await this.policyRoots(activeSignal);
 			const stores = roots.filter(root => ownsDestination(root.path, path)).map(root => root.store);
 			const data = { path, owned: stores.length > 0, stores };
-			return this.envelope("validateDestination", "*", data, started, JSON.stringify(data));
+			return this.envelope("validateDestination", "*", data, started, JSON.stringify(data), false, undefined, [], [], this.budget(input));
 		});
 	}
 	private async policyRoots(signal: AbortSignal) {
@@ -72,56 +94,85 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		if (!store) throw new DatastoreError("STORE_UNKNOWN", { store: name });
 		return store;
 	}
-	private envelope<T>(operation: ResultEnvelope<T>["operation"], store: string, data: T, started: number, text = "", truncated = false, continuation?: string, sources: ResultEnvelope<T>["provenance"]["sources"] = [], warnings: ResultEnvelope<T>["warnings"] = [], budget?: { maxBytes: number; maxLines: number }, measuredLines?: number): ResultEnvelope<T> {
-		const effectiveBudget = budget ?? { maxBytes: this.config.defaults.maxResultBytes, maxLines: this.config.defaults.maxResultLines }; const returnedBytes = Buffer.byteLength(text); const returnedLines = measuredLines ?? lines(text); if (returnedBytes > effectiveBudget.maxBytes || returnedLines > effectiveBudget.maxLines) throw new DatastoreError("RESULT_LIMIT_EXCEEDED"); const completedAt = new Date().toISOString();
-		const result: ResultEnvelope<T> = {
-			contractVersion: 1, operation, store, data,
-			provenance: { sources, startedAt: new Date(started).toISOString(), completedAt, durationMs: elapsed(started) },
-			bounds: { maxBytes: effectiveBudget.maxBytes, maxLines: effectiveBudget.maxLines, returnedBytes, returnedLines, truncated, continuation },
-			warnings,
-		};
-		const serialized = JSON.stringify(result);
-		if (Buffer.byteLength(serialized) > HARD_MAX_RESULT_BYTES || lines(serialized) > HARD_MAX_RESULT_LINES) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
+	private budget(input?: object): ResultBudget { return resolveResultBudget(input as { maxBytes?: unknown; maxLines?: unknown } | undefined, { maxBytes: this.config.defaults.maxResultBytes ?? null, maxLines: this.config.defaults.maxResultLines ?? null }); }
+	private envelope<T>(operation: ResultEnvelope<T>["operation"], store: string, data: T, started: number, text = "", truncated = false, continuation?: string, sources: ResultEnvelope<T>["provenance"]["sources"] = [], warnings: ResultEnvelope<T>["warnings"] = [], budget?: ResultBudget, measuredLines?: number, applied?: { operationApplied: true; refreshIds: string[] }): ResultEnvelope<T> {
+		const effectiveBudget = budget ?? this.budget(); const returnedLines = measuredLines ?? lines(text); const completedAt = new Date().toISOString();
+		const result: ResultEnvelope<T> = { contractVersion: 1, operation, store, data, provenance: { sources, startedAt: new Date(started).toISOString(), completedAt, durationMs: elapsed(started) }, bounds: { maxBytes: effectiveBudget.maxBytes, maxLines: effectiveBudget.maxLines, returnedBytes: 0, returnedLines, truncated, continuation }, warnings };
+		// Serialize once; only the decimal width of returnedBytes changes.
+		const baseBytes = Buffer.byteLength(JSON.stringify(result));
+		let returnedBytes = baseBytes;
+		for (;;) { const size = baseBytes - 1 + String(returnedBytes).length; if (size === returnedBytes) break; returnedBytes = size; }
+		result.bounds.returnedBytes = returnedBytes;
+		if ((effectiveBudget.maxBytes !== null && returnedBytes > effectiveBudget.maxBytes) || (effectiveBudget.maxLines !== null && returnedLines > effectiveBudget.maxLines)) {
+			const shared = (data as { shared?: unknown })?.shared;
+			const outcome = applied ? appliedRefreshes(...applied.refreshIds.map(refreshId => ({ refreshId })), ...(Array.isArray(shared) ? shared : [])) : undefined;
+			throw new DatastoreError("RESULT_LIMIT_EXCEEDED", { ...outcome, requiredBytes: returnedBytes, requiredLines: returnedLines });
+		}
 		return result;
+	}
+	private metadataEnvelope<Item, Data extends object>(operation: "read" | "tags" | "find", store: string, items: readonly Item[], started: number, budget: ResultBudget, page: {
+		revision: string; query: string; offset: number; more: boolean;
+		render: (items: Item[], more: boolean) => Data;
+		sources?: ReadResult["provenance"]["sources"]; warnings?: ReadResult["warnings"];
+	}): ResultEnvelope<Data> {
+		const selected = [...items];
+		for (;;) {
+			const more = page.more || selected.length < items.length;
+			if (!selected.length && more) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
+			const continuation = more ? continuationToken(store, page.revision, page.query, page.offset + selected.length, budget) : undefined;
+			try { return this.envelope(operation, store, page.render(selected, more), started, "", more, continuation, page.sources ?? [], page.warnings ?? [], budget, 1); }
+			catch (error) { if (!(error instanceof DatastoreError) || error.code !== "RESULT_LIMIT_EXCEEDED" || !selected.length) throw error; selected.pop(); }
+		}
 	}
 	private async searchInner(input: SearchInput, signal: AbortSignal): Promise<SearchResult> {
 		const started = Date.now(); throwIfAborted(signal); const store = this.store(input.store);
-		if (!this.qmd) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
+		const shared = store.shared ? this.sharedClients?.get(store.name) : undefined;
+		if (store.shared && !shared) throw new DatastoreError("STORE_UNAVAILABLE");
+		const qmd = this.qmd;
+		if (!shared && !qmd) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
 		if (typeof input.query !== "string" || !input.query.trim() || Buffer.byteLength(input.query) > 4096) throw new DatastoreError("BACKEND_OUTPUT_INVALID");
 		const mode = input.mode ?? store.search.defaultMode; const limit = input.limit ?? 5;
 		if (input.minScore !== undefined && !Number.isFinite(input.minScore)) throw new DatastoreError("INVALID_NOTE_REF");
 		if (!Number.isInteger(limit) || limit < 1 || limit > 20 || !["lexical", "semantic", "hybrid"].includes(mode)) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
 		const freshness = input.freshness ?? "allow-stale";
-		if (mode === "semantic" && this.qmd.activity?.().embeddingActive) throw new DatastoreError("SEMANTIC_UNAVAILABLE", { retryable: true, requestedMode: mode });
-		if (freshness !== "allow-stale" && !this.qmd.isLexicallyCurrent(store.name)) throw new DatastoreError("STALE_INDEX");
+		const embeddingActive = shared ? (await shared.activity(signal)).embeddingActive : Boolean(qmd!.activity?.().embeddingActive);
+		const current = () => shared ? shared.isLexicallyCurrent(signal) : Promise.resolve(qmd!.isLexicallyCurrent(store.name));
+		if (mode === "semantic" && embeddingActive) throw new DatastoreError("SEMANTIC_UNAVAILABLE", { retryable: true, requestedMode: mode });
+		if (freshness !== "allow-stale" && !await current()) throw new DatastoreError("STALE_INDEX");
+		const manifestName = store.shared?.store ?? store.name;
+		const backendVersion = shared ? shared.version : qmd!.binding.version;
 		{
-			const backend = await this.qmd.search(store, input.query, mode, Math.min(500, Math.max(limit * 4, limit)), input.minScore, signal);
+			const backend = shared ? await shared.search(input.query, mode, Math.min(500, Math.max(limit * 4, limit)), input.minScore, signal) : await qmd!.search(store, input.query, mode, Math.min(500, Math.max(limit * 4, limit)), input.minScore, signal);
 			if ((backend.effectiveMode === "semantic" || backend.effectiveMode === "hybrid") && (!backend.manifest.semanticAt || backend.manifest.pendingEmbeddings !== 0 || !backend.manifest.hasVectorIndex)) throw new DatastoreError("STALE_INDEX");
 			if (backend.effectiveMode === "lexical" && freshness === "require-current-semantic") throw new DatastoreError("STALE_INDEX");
 			const hits: SearchHit[] = []; let dropped = backend.rejectedCandidates ?? 0; let stale = dropped > 0;
 			for (const candidate of backend.candidates) {
 				if (hits.length >= limit) break;
-				const indexed = backend.manifest.stores[store.name]?.[candidate.path];
+				const indexed = backend.manifest.stores[manifestName]?.[candidate.path];
 				if (!indexed) { stale = true; dropped += 1; continue; }
 				try {
 					const source = await safeOpenNote(store, candidate.path, signal);
 					if (source.fullRevision !== indexed.revision) { stale = true; dropped += 1; continue; }
 					const parsed = parseMarkdown(source);
 					const excerpt = input.includeContent ? this.excerpt(source.text, parsed, input.query, candidate) : undefined;
-					hits.push({ note: source.note, uri: source.uri, path: source.note.path, title: parsed.title, snippet: excerpt?.content, rank: hits.length + 1, backendRank: candidate.backendRank, backend: "qmd" as const, mode: backend.effectiveMode, score: candidate.score, sourceRevision: source.revision, indexedRevision: source.revision, sourceMtime: source.mtime, indexFreshness: this.qmd.isLexicallyCurrent(store.name) ? "current" as const : "stale" as const, truncated: excerpt?.truncated ?? false });
+					hits.push({ note: source.note, uri: source.uri, path: source.note.path, title: parsed.title, snippet: excerpt?.content, rank: hits.length + 1, backendRank: candidate.backendRank, backend: "qmd" as const, mode: backend.effectiveMode, score: candidate.score, sourceRevision: source.revision, indexedRevision: source.revision, sourceMtime: source.mtime, indexFreshness: await current() ? "current" as const : "stale" as const, truncated: excerpt?.truncated ?? false });
 				} catch (error) {
 					if (error instanceof DatastoreError && (error.code === "CANCELLED" || error.code === "TIMEOUT")) throw error;
 					stale = true; dropped += 1;
 				}
 			}
 			if (stale && freshness !== "allow-stale") throw new DatastoreError("STALE_INDEX");
-			const indexCurrent = this.qmd.isLexicallyCurrent(store.name);
+			const indexCurrent = await current();
 			if (!indexCurrent && freshness !== "allow-stale") throw new DatastoreError("STALE_INDEX");
-			const aggregateLines = (): number => Math.max(1, hits.reduce((count, hit) => count + (typeof hit.snippet === "string" ? lines(hit.snippet) : 1), 0)); let budgetTruncated = false; while (hits.length && (Buffer.byteLength(JSON.stringify(hits)) > this.config.defaults.maxResultBytes || aggregateLines() > this.config.defaults.maxResultLines)) { hits.pop(); budgetTruncated = true; }
-			const text = JSON.stringify(hits); const returnedLines = aggregateLines(); if (Buffer.byteLength(text) > this.config.defaults.maxResultBytes || returnedLines > this.config.defaults.maxResultLines) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
+			const budget = this.budget(input); const aggregateLines = (): number => Math.max(1, hits.reduce((count, hit) => count + (typeof hit.snippet === "string" ? lines(hit.snippet) : 1), 0)); let budgetTruncated = false; while (hits.length && exceedsBudget(JSON.stringify(hits), budget, aggregateLines())) { hits.pop(); budgetTruncated = true; }
+			const text = JSON.stringify(hits); const returnedLines = aggregateLines(); if (exceedsBudget(text, budget, returnedLines)) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
 			const staleMessage = "Serving indexed results while source reconciliation is pending; new notes may be absent.";
 			const warnings = [...(backend.requestedMode !== backend.effectiveMode ? [{ code: "SEMANTIC_UNAVAILABLE" as const, message: "Embedding underway; semantic retrieval is temporarily unavailable. Hybrid request served with lexical search." }] : []), ...(!indexCurrent ? [{ code: "STALE_INDEX" as const, message: staleMessage }] : []), ...(dropped ? [{ code: "STALE_CANDIDATE_DROPPED" as const, message: "One or more backend candidates failed current direct validation." }] : []), ...(budgetTruncated ? [{ code: "RESULT_LIMIT_EXCEEDED" as const, message: "Search hits were truncated at the configured aggregate result budget." }] : [])];
-			return this.envelope("search", store.name, { hits, examined: backend.candidates.length + (backend.rejectedCandidates ?? 0), dropped, returned: hits.length, requestedMode: backend.requestedMode, effectiveMode: backend.effectiveMode, queueMs: backend.queueMs, operationMs: backend.operationMs, workerId: backend.workerId }, started, text, budgetTruncated, undefined, [{ kind: "qmd", backendVersion: this.qmd.binding.version, observationId: backend.generation, observedAt: new Date().toISOString(), freshness: indexCurrent ? "current" : "stale" }, { kind: "filesystem", observedAt: new Date().toISOString(), freshness: "current" }], warnings, undefined, returnedLines) as SearchResult;
+			for (;;) {
+				const pageText = JSON.stringify(hits); const pageLines = aggregateLines();
+				try { return this.envelope("search", store.name, { hits, examined: backend.candidates.length + (backend.rejectedCandidates ?? 0), dropped, returned: hits.length, requestedMode: backend.requestedMode, effectiveMode: backend.effectiveMode, queueMs: backend.queueMs, operationMs: backend.operationMs, workerId: backend.workerId }, started, pageText, budgetTruncated, undefined, [{ kind: "qmd", backendVersion, observationId: backend.generation, observedAt: new Date().toISOString(), freshness: indexCurrent ? "current" : "stale" }, { kind: "filesystem", observedAt: new Date().toISOString(), freshness: "current" }], warnings, this.budget(input), pageLines) as SearchResult; }
+				catch (error) { if (!(error instanceof DatastoreError) || error.code !== "RESULT_LIMIT_EXCEEDED" || hits.length === 0) throw error; hits.pop(); if (!budgetTruncated) warnings.push({ code: "RESULT_LIMIT_EXCEEDED", message: "Search hits were truncated at the caller's aggregate result budget." }); budgetTruncated = true; }
+			}
 		}
 	}
 
@@ -135,8 +186,8 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 			const blocks = body.split(/\n{2,}/); selected = blocks.find((block) => terms.some((term) => block.toLocaleLowerCase("en-US").includes(term))) ?? blocks.find((block) => block.trim().length > 0) ?? "";
 		}
 		if (!selected) return { content: "", truncated: false };
-		const page = boundedPage(selected, 0, Math.min(1024, this.config.defaults.maxResultBytes), Math.min(30, this.config.defaults.maxResultLines));
-		return { content: page.content, truncated: page.truncated };
+		// Paragraph selection is the excerpt; only the caller's aggregate result budget clips output.
+		return { content: selected, truncated: false };
 	}
 
 	private async findInner(input: FindInput, signal: AbortSignal): Promise<FindResult> {
@@ -144,27 +195,66 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
  if(!Array.isArray(input.selectors)||!input.selectors.length||input.selectors.length>8)throw new DatastoreError("INVALID_NOTE_REF");
  const limit=input.limit??20;if(!Number.isInteger(limit)||limit<1||limit>20)throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
  const match=input.match??"all";if(!["all","any"].includes(match))throw new DatastoreError("INVALID_NOTE_REF");
+ if (input.selectors.length === 1 && input.selectors[0].kind === "tag") {
+  const query = tagIdentity(input.selectors[0].value);
+  const budget = this.budget(input);
+  const token = (input as { continuation?: string }).continuation;
+  if (store.shared) {
+   const client = this.sharedClients?.get(store.name); if (!client) throw new DatastoreError("STORE_UNAVAILABLE");
+   const page = await client.tagPages(query, { continuation: token, limit, ...budget, responseStore: store.name }, signal);
+   return this.metadataEnvelope("find", store.name, page.candidates, started, budget, { revision: page.revision, query, offset: continuationOffset(token, store.name, page.revision, query), more: page.continuation !== undefined, render: (items, more) => ({ candidates: items, examined: page.examined, partial: more }), sources: [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: page.complete ? "current" : "stale", indexRevision: page.revision }] }) as FindResult;
+  }
+  const index = this.metadata?.get(store.name); if (!index) throw new DatastoreError("STALE_INDEX");
+  const snapshot = await index.requireSnapshot();
+  const pages = await index.tagPages(query);
+  const offset = continuationOffset(token, store.name, snapshot.revision, query);
+  const revisionOf = (path: string) => index.fileRevision(path, snapshot);
+  if (pages.some((path) => !revisionOf(path))) throw new DatastoreError("STALE_INDEX");
+  const selected = pageRendered(pages.slice(0, offset + limit), offset, budget, (page) => ({ candidates: page.map((path) => tagCandidate(store.name, path, revisionOf(path)!)), examined: pages.length, partial: offset + page.length < pages.length }));
+  const bounded = selected.items.slice(0, limit);
+  const admitted = await index.admit(store, bounded.map((path) => ({ path, kind: "note" as const })), signal);
+  const next = offset + bounded.length < pages.length ? offset + bounded.length : undefined;
+  const warnings = admitted.diagnostics.map((message) => ({ code: "STALE_INDEX" as const, message }));
+  return this.metadataEnvelope("find", store.name, bounded, started, budget, { revision: snapshot.revision, query, offset, more: next !== undefined, render: (items, more) => ({ candidates: items.map(path => tagCandidate(store.name, path, revisionOf(path)!)), examined: pages.length, partial: more }), sources: [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: admitted.current ? "current" : "stale", indexRevision: snapshot.revision }], warnings }) as FindResult;
+ }
  const notes=input.selectors.map(s=>{if(s.kind!=="uri" && (s.kind!=="path" || !s.path.endsWith(".md")))throw new DatastoreError("CAPABILITY_UNAVAILABLE");const note=s.kind==="uri"?noteUriToRef(s.uri):{store:store.name,path:validateRelativeNotePath(s.path)};if(note.store!==store.name)throw new DatastoreError("INVALID_NOTE_REF");return note;});
  const paths=[...new Set(notes.map(n=>n.path))];const candidates=[];
  for(const path of paths){if(match==="all" && paths.length>1)break;try{const source=await safeOpenNote(store,path,signal);candidates.push({note:source.note,uri:source.uri,title:parseMarkdown(source).title,revision:source.revision});}catch(error){propagateControlError(error);if(!(error instanceof DatastoreError)||error.code!=="NOTE_NOT_FOUND")throw error;}}
  const returned=candidates.slice(0,limit);let partial=candidates.length>limit;
- while(returned.length && Buffer.byteLength(JSON.stringify({candidates:returned,examined:paths.length,partial}))>this.config.defaults.maxResultBytes){returned.pop();partial=true;}
- const data={candidates:returned,examined:paths.length,partial};return this.envelope("find",store.name,data,started,JSON.stringify(data),partial,undefined,[{kind:"filesystem",observedAt:new Date().toISOString(),freshness:"current"}],[],undefined,Math.max(1,returned.length)) as FindResult;
+ while(returned.length && exceedsBudget(JSON.stringify({candidates:returned,examined:paths.length,partial}), this.budget(input))){returned.pop();partial=true;}
+ const data={candidates:returned,examined:paths.length,partial};return this.envelope("find",store.name,data,started,JSON.stringify(data),partial,undefined,[{kind:"filesystem",observedAt:new Date().toISOString(),freshness:"current"}],[],this.budget(input),Math.max(1,returned.length)) as FindResult;
  }
 
 	private readDescriptor(input: ReadInput): { store: StoreConfig; descriptor: Omit<ContinuationDescriptor, "kind" | "revision" | "cursor" | "createdAt" | "expiresAt">; expectedRevision?: string; cursor: number } {
+		if (input.continuation && Object.keys(input).every((key) => key === "continuation" || key === "maxBytes" || key === "maxLines")) {
+			try {
+				const existing = this.continuations.getRead(input.continuation);
+				return { store: this.store(existing.note.store), descriptor: { ...existing, ...resolveResultBudget(input, existing) }, expectedRevision: existing.revision, cursor: existing.cursor };
+			} catch (error) {
+				if (!(error instanceof DatastoreError)) throw error;
+				let parsed; try { parsed = readPageToken(input.continuation); } catch (decode) { if (/^[0-9a-f]{32}$/.test(input.continuation)) throw error; throw decode instanceof DatastoreError ? decode : new DatastoreError("STALE_CONTINUATION"); }
+				const view = parsed.query.startsWith("links:") ? "links" : parsed.query.startsWith("backlinks:") ? "backlinks" : undefined;
+				if (!view) throw new DatastoreError("STALE_CONTINUATION");
+				let store; try { store = this.store(parsed.store); } catch (lookup) { if (lookup instanceof DatastoreError && lookup.code === "STORE_UNKNOWN") throw new DatastoreError("STALE_CONTINUATION"); throw lookup; }
+				const budget = resolveResultBudget(input, resolveResultBudget(parsed, this.budget()));
+				return { store, descriptor: { note: { store: store.name, path: parsed.query.slice(view.length + 1) }, view, includeFrontmatter: false, excludeSections: [], includeSemanticRelated: false, ...budget }, cursor: 0 };
+			}
+		}
+		if (input.continuation && (input.view === "links" || input.view === "backlinks")) {
+			if (!input.note) throw new DatastoreError("INVALID_NOTE_REF");
+			const budget = this.budget(input); return { store: this.store(input.note.store), descriptor: { note: input.note, view: input.view, includeFrontmatter: false, excludeSections: [], includeSemanticRelated: false, maxBytes: budget.maxBytes, maxLines: budget.maxLines }, cursor: 0 };
+		}
 		if (input.continuation) {
 			const existing = this.continuations.getRead(input.continuation);
-			if (Object.keys(input).some((key) => key !== "continuation")) throw new DatastoreError("INVALID_NOTE_REF");
-			return { store: this.store(existing.note.store), descriptor: existing, expectedRevision: existing.revision, cursor: existing.cursor };
+			if (Object.keys(input).some((key) => key !== "continuation" && key !== "maxBytes" && key !== "maxLines")) throw new DatastoreError("INVALID_NOTE_REF");
+			const budget = this.budget({ maxBytes: input.maxBytes ?? existing.maxBytes, maxLines: input.maxLines ?? existing.maxLines });
+			return { store: this.store(existing.note.store), descriptor: { ...existing, ...budget }, expectedRevision: existing.revision, cursor: existing.cursor };
 		}
 		if ((input.note === undefined) === (input.uri === undefined)) throw new DatastoreError("INVALID_NOTE_REF");
 		const note = input.note ?? noteUriToRef(input.uri!);
 		if (input.store && input.store !== note.store) throw new DatastoreError("INVALID_NOTE_REF");
 		const store = this.store(note.store);
-		const maxBytes = Math.min(input.maxBytes ?? this.config.defaults.maxResultBytes, HARD_MAX_RESULT_BYTES);
-		const maxLines = Math.min(input.maxLines ?? this.config.defaults.maxResultLines, HARD_MAX_RESULT_LINES);
-		if (!Number.isInteger(maxBytes) || maxBytes < 4 || !Number.isInteger(maxLines) || maxLines < 1) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
+		const { maxBytes, maxLines } = this.budget(input);
 		const view = input.view ?? "content"; const hasHeading = input.headingPath !== undefined; const hasOccurrence = input.occurrence !== undefined; const hasSectionHandle = input.sectionHandle !== undefined; const hasExclusions = input.excludeSections !== undefined;
 		const invalidOption = (option: "includeFrontmatter" | "headingPath" | "occurrence" | "sectionHandle" | "excludeSections" | "includeSemanticRelated"): never => { throw new DatastoreError("INVALID_NOTE_REF", { reason: "OPTION_NOT_ALLOWED", view, option }); };
 		if (view === "section") {
@@ -181,10 +271,11 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 	private async readInner(input: ReadInput, signal: AbortSignal): Promise<ReadResult> {
 		const started = Date.now(); throwIfAborted(signal);
 		const { store, descriptor, expectedRevision, cursor } = this.readDescriptor(input);
+		if (descriptor.view === "links" || descriptor.view === "backlinks") return this.metadataRead(store, descriptor.view, descriptor.note.path, started, signal, input.continuation, { maxBytes: descriptor.maxBytes, maxLines: descriptor.maxLines });
 		const source = await safeOpenNote(store, descriptor.note.path, signal);
 		if (expectedRevision && expectedRevision !== source.fullRevision) throw new DatastoreError("STALE_CONTINUATION", { note: source.note });
 		const parsed = parseMarkdown(source);
-		if (["metadata","links","backlinks","related"].includes(descriptor.view)) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
+		if (["metadata","related"].includes(descriptor.view)) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
  if(descriptor.view === "outline") {
  const outline=parsed.outline.slice(0,100).map(section=>({...section,handle:this.continuations.create({kind:"section",note:source.note,revision:source.fullRevision,headingPath:section.headingPath,occurrence:section.occurrence,startLine:section.startLine,endLine:section.endLine})}));
  const base={note:source.note,uri:source.uri,revision:source.revision,title:parsed.title};
@@ -212,12 +303,32 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 			if (!descriptor.includeFrontmatter && parsed.frontmatter.present && parsed.frontmatter.endLine) selected = selected.split("\n").slice(parsed.frontmatter.endLine).join("\n");
 		}
 		throwIfAborted(signal);
-		const page = boundedPage(selected, cursor, descriptor.maxBytes, descriptor.maxLines);
-		const continuation = page.nextCursor === undefined ? undefined : this.continuations.create({ kind: "read", ...descriptor, revision: source.fullRevision, cursor: page.nextCursor });
-		const data: Record<string, unknown> = { note: source.note, uri: source.uri, revision: source.revision, mtime: source.mtime, title: parsed.title, view: descriptor.view, content: page.content };
-		if (section) data.section = section;
-		if (parsed.frontmatter.error) data.diagnostics = [parsed.frontmatter.error];
-		return this.envelope("read", store.name, data, started, page.content, page.truncated, continuation, [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: "current" }], [], descriptor) as ReadResult;
+		let byteCap = descriptor.maxBytes;
+		for (;;) {
+			const page = boundedPage(selected, cursor, byteCap, descriptor.maxLines);
+			// Trial pages own no registry state. An issued token has this same width.
+			const continuation = page.nextCursor === undefined ? undefined : "0".repeat(32);
+			const data: Record<string, unknown> = { note: source.note, uri: source.uri, revision: source.revision, mtime: source.mtime, title: parsed.title, view: descriptor.view, content: page.content };
+			if (section) data.section = section;
+			if (parsed.frontmatter.error) data.diagnostics = [parsed.frontmatter.error];
+			try {
+				const result = this.envelope("read", store.name, data, started, page.content, page.truncated, continuation, [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: "current" }], [], descriptor) as ReadResult;
+				if (page.nextCursor !== undefined) result.bounds.continuation = this.continuations.create({ kind: "read", ...descriptor, revision: source.fullRevision, cursor: page.nextCursor });
+				return result;
+			} catch (error) {
+				if (!(error instanceof DatastoreError) || error.code !== "RESULT_LIMIT_EXCEEDED" || byteCap === null || !page.content.length) throw error;
+				const excess = Number(error.details?.requiredBytes) - descriptor.maxBytes!;
+				const next = Buffer.byteLength(page.content) - excess;
+				if (!(excess > 0) || next < 1 || next >= byteCap) throw error;
+				byteCap = next;
+			}
+		}
+	}
+
+	private localReceipt<T extends object>(value: T, store: StoreConfig): T {
+		const stores = "stores" in value ? value.stores : undefined;
+		if (!store.shared || !Array.isArray(stores)) return value;
+		return { ...value, stores: stores.map(name => name === store.shared!.store ? store.name : name) };
 	}
 
 	private async statusInner(input: StatusInput, signal: AbortSignal): Promise<StatusResult> {
@@ -225,35 +336,157 @@ export class MarkdownDatastoreService implements MarkdownDatastoreServiceV1, Mar
 		const stores = input.store ? [this.store(input.store)] : [...this.config.stores.values()];
 		const statuses = []; let qmdStatus: Record<string, unknown> | undefined;
 		if (this.qmd) { try { qmdStatus = await this.qmd.status(signal); } catch (error) { propagateControlError(error); qmdStatus = { state: "degraded", reasonCode: error instanceof DatastoreError ? error.code : "BACKEND_FAILED" }; } }
-		const qmdActivity = this.qmd?.activity?.() ?? (qmdStatus?.reconciliation as ReturnType<QmdAdapter["activity"]> | undefined); const qmdJobs = qmdActivity?.jobs ?? [];
-		const qmdSummary = qmdStatus ? Object.fromEntries(Object.entries(qmdStatus).filter(([key]) => !["stores", "refresh", "reconciliation"].includes(key))) : undefined;
-		if (qmdSummary && qmdActivity) qmdSummary.refresh = { state: qmdActivity.state, active: qmdActivity.active, queued: qmdActivity.queued };
 		for (const store of stores) {
-			const cachedStore = qmdStatus?.stores && typeof qmdStatus.stores === "object" ? (qmdStatus.stores as Record<string, Record<string, unknown>>)[store.name] : undefined; const fileCount = typeof cachedStore?.documentCount === "number" ? cachedStore.documentCount : undefined; const directState = "ready" as const; const reasonCode = undefined;
-			const runtimeCurrent = cachedStore?.runtimeLexicalCurrent === true; const qmdState = !this.config.qmd.enabled ? { state: "disabled" as const } : !this.qmd ? { state: "unavailable" as const, reasonCode: "BACKEND_MISSING" } : qmdStatus?.state === "ready" ? { state: "ready" as const, backend: "qmd" as const, version: this.qmd.binding.version, freshness: { state: runtimeCurrent ? "current" as const : "stale" as const } } : { state: "degraded" as const, backend: "qmd" as const, version: this.qmd.binding.version, reasonCode: String(qmdStatus?.reasonCode ?? "STALE_INDEX") };
-			const semanticState = qmdState.state === "ready" && typeof qmdStatus?.semanticAt !== "string" ? { ...qmdState, state: "degraded" as const, reasonCode: "STALE_INDEX" } : qmdState;
+			let backendStatus = qmdStatus;
+			let qmdActivity = this.qmd?.activity?.() ?? (qmdStatus?.reconciliation as ReturnType<QmdAdapter["activity"]> | undefined);
+			let enabled = this.config.qmd.enabled, available = Boolean(this.qmd), version = this.qmd?.binding.version, canonicalName = store.name;
+			if (store.shared) {
+				const client = this.sharedClients?.get(store.name);
+				enabled = true; available = Boolean(client); canonicalName = store.shared.store;
+				if (!client) backendStatus = { state: "unavailable", reasonCode: "STORE_UNAVAILABLE" };
+				else { try { backendStatus = await client.status(signal); } catch (error) { propagateControlError(error); backendStatus = { state: "unavailable", reasonCode: error instanceof DatastoreError ? error.code : "STORE_UNAVAILABLE" }; } }
+				version = client?.version;
+				qmdActivity = backendStatus?.refresh as ReturnType<QmdAdapter["activity"]> | undefined;
+			}
+			const qmdJobs = (qmdActivity?.jobs ?? []).map(job => this.localReceipt(job, store));
+			const qmdSummary = backendStatus ? Object.fromEntries(Object.entries(backendStatus).filter(([key]) => !["stores", "refresh", "reconciliation"].includes(key))) : undefined;
+			if (qmdSummary && qmdActivity) qmdSummary.refresh = { state: qmdActivity.state, active: qmdActivity.active, queued: qmdActivity.queued };
+			const cachedStore = backendStatus?.stores && typeof backendStatus.stores === "object" ? (backendStatus.stores as Record<string, Record<string, unknown>>)[canonicalName] : undefined; const fileCount = typeof cachedStore?.documentCount === "number" ? cachedStore.documentCount : undefined; const directState = "ready" as const; const reasonCode = undefined;
+			const qmdState = !enabled ? { state: "disabled" as const } : !available || backendStatus?.state === "unavailable" ? { state: "unavailable" as const, reasonCode: String(backendStatus?.reasonCode ?? (store.shared ? "STORE_UNAVAILABLE" : "BACKEND_MISSING")) } : backendStatus?.state === "ready" ? { state: "ready" as const, backend: "qmd" as const, version, freshness: { state: cachedStore?.runtimeLexicalCurrent === true ? "current" as const : "stale" as const } } : { state: "degraded" as const, backend: "qmd" as const, version, reasonCode: String(backendStatus?.reasonCode ?? "STALE_INDEX") };
+			const runtimeCurrent = cachedStore?.runtimeLexicalCurrent === true;
+			const semanticState = qmdState.state === "ready" && typeof backendStatus?.semanticAt !== "string" ? { ...qmdState, state: "degraded" as const, reasonCode: "STALE_INDEX" } : qmdState;
+			const localSnapshot = store.shared ? undefined : await this.metadata?.get(store.name)?.snapshot();
+			await this.maintenance?.ensureLoaded();
+			const metadataJobs = (this.maintenance?.jobs() ?? []).filter((job) => job.mode === "metadata" && job.stores.includes(store.name));
+			const metadataRunning = metadataJobs.find((job) => job.state === "running");
+			const metadataQueued = metadataJobs.find((job) => job.state === "queued");
+			const sharedMetadata = backendStatus?.metadata as { state?: string; revision?: string; complete?: boolean; progress?: { state: string; active: boolean; queued: boolean; job?: unknown } } | undefined;
+			const metadata = store.shared ? sharedMetadata ?? { state: "unavailable", complete: false, progress: { state: "idle", active: false, queued: false } } : { state: !localSnapshot ? "unavailable" : localSnapshot.complete ? "ready" : "stale", revision: localSnapshot?.revision, complete: localSnapshot?.complete ?? false, progress: { state: metadataRunning ? "running" : metadataQueued ? "queued" : "idle", active: Boolean(metadataRunning), queued: Boolean(metadataQueued), job: metadataRunning ?? metadataQueued ?? metadataJobs[0] } };
 			const permissionWarnings: string[] = []; const relevantJobs = qmdJobs.filter((job) => job.stores.includes(store.name)); const latest = relevantJobs[0]; const running = relevantJobs.find((job) => job.state === "running"); const queued = relevantJobs.find((job) => job.state === "queued"); const reconciliationState = runtimeCurrent ? "succeeded" : running ? "running" : queued ? "queued" : latest?.state === "failed" ? "failed" : latest?.state === "cancelled" ? "cancelled" : "pending";
 			const reconciliation = { state: reconciliationState, additionsMayBeAbsent: !runtimeCurrent, sourceTraversalPerformed: false, job: running ?? queued ?? latest };
-			statuses.push({ store: store.name, root: redactedRoot(store, this.config.projectRoot), rootWasSymlink: store.rootWasSymlink, fileCount, fileCountSource: fileCount === undefined ? "unavailable" : "backend-reported-count", permissionWarnings, sourceReconciliation: reconciliation, qmd: qmdSummary, capabilities: { direct: { state: directState, backend: "direct", exactPath: true, boundedContent: true, boundedSection: true, currentFileValidation: true, singleNoteFallbackLinks: false, reasonCode }, search: { lexical: qmdState, semantic: semanticState, hybrid: semanticState }, outline: {state:"ready",backend:"direct"}, mutations: { supported: false } } });
+			statuses.push({ store: store.name, root: redactedRoot(store, this.config.projectRoot), rootWasSymlink: store.rootWasSymlink, fileCount, fileCountSource: fileCount === undefined ? "unavailable" : "backend-reported-count", permissionWarnings, sourceReconciliation: reconciliation, qmd: qmdSummary, capabilities: { direct: { state: directState, backend: "direct", exactPath: true, boundedContent: true, boundedSection: true, currentFileValidation: true, singleNoteFallbackLinks: false, reasonCode }, search: { lexical: qmdState, semantic: semanticState, hybrid: semanticState }, outline: {state:"ready",backend:"direct"}, metadata, mutations: { supported: false } } });
 		}
-		const data = { stores: statuses, enabled: true }; return this.envelope("status", input.store ?? "*", data, started, JSON.stringify(data), false, undefined, [], [], undefined, Math.max(1, statuses.length)) as StatusResult;
+		const data = { stores: statuses, enabled: true }; return this.envelope("status", input.store ?? "*", data, started, JSON.stringify(data), false, undefined, [], [], this.budget(input), Math.max(1, statuses.length)) as StatusResult;
 	}
 
 	private async refreshInner(input: RefreshInput, signal: AbortSignal): Promise<RefreshResult> {
+		this.budget(input); // Validate before durable admission or cancellation.
+		if (Object.hasOwn(input, "paths") && (input.action === "cancel" || input.mode !== "metadata")) throw new DatastoreError("INVALID_NOTE_REF");
 		const started = Date.now(); throwIfAborted(signal);
 		if (input.action === "cancel") {
-			if (!this.qmd) throw new DatastoreError("CAPABILITY_UNAVAILABLE"); const qmd = await this.qmd.cancelRefresh(input.refreshId); const data = { action: "cancel", qmd, durationMs: elapsed(started) }; return this.envelope("refresh", "*", data, started, JSON.stringify(data), false, undefined, [], [], undefined, 1) as RefreshResult;
+			const qmd = await this.cancelRefresh(input.refreshId, signal); const data = { action: "cancel", qmd, durationMs: elapsed(started) }; return this.envelope("refresh", "*", data, started, JSON.stringify(data), false, undefined, [], [], this.budget(input), 1, { operationApplied: true, refreshIds: [String((data as { qmd?: { refreshId?: string } }).qmd?.refreshId ?? "")] }) as RefreshResult;
 		}
 		const mode = input.mode ?? "direct"; const stores = input.store ? [this.store(input.store)] : [...this.config.stores.values()];
-		if (mode === "semantic" || mode === "all") {
-			if (!this.qmd) throw new DatastoreError("CAPABILITY_UNAVAILABLE"); const qmd = await this.qmd.startSemanticRefresh(stores); const data = { action: "start", mode, qmd, backgroundOwnership: "explicit-maintenance", durationMs: elapsed(started) }; return this.envelope("refresh", input.store ?? "*", data, started, JSON.stringify(data), false, undefined, [], [], undefined, 1) as RefreshResult;
+		if (mode === "metadata" || mode === "rebuild") {
+			if (input.paths !== undefined && mode !== "metadata") throw new DatastoreError("INVALID_NOTE_REF");
+			if (mode === "metadata" && input.paths !== undefined) { if (!Array.isArray(input.paths) || input.paths.length === 0) throw new DatastoreError("INVALID_NOTE_REF"); for (const path of input.paths) validateRelativeContainedPath(path); }
+			const local = stores.filter((store) => !store.shared).map((store) => store.name);
+			if (mode === "metadata" && input.paths?.length) for (const name of local) this.maintenance?.notePaths(name, input.paths);
+			const shared = stores.filter((store) => store.shared);
+			if (!local.length && !shared.length) throw new DatastoreError("STORE_UNKNOWN");
+			const receipt = local.length ? await this.maintenance?.enqueue("metadata", local, "explicit-maintenance", sourceDefinition(local.map((name) => this.store(name))), mode === "rebuild" || input.paths === undefined ? "rebuild" : undefined) : undefined;
+			if (local.length && !receipt) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
+			const sharedReceipts = [];
+			for (const store of shared) {
+				const client = this.sharedClients?.get(store.name);
+				if (!client) throw new DatastoreError("STORE_UNAVAILABLE");
+				sharedReceipts.push(await client.startMetadata(signal, mode === "metadata" ? input.paths : undefined, mode === "rebuild" || input.paths === undefined));
+			}
+			const data = { action: "start", mode, qmd: receipt ?? sharedReceipts[0], shared: sharedReceipts, backgroundOwnership: "explicit-maintenance", durationMs: elapsed(started) };
+			const refreshIds = [receipt, ...sharedReceipts].map((item) => (item as { refreshId?: string } | undefined)?.refreshId).filter((id): id is string => typeof id === "string");
+			return this.envelope("refresh", input.store ?? "*", data, started, JSON.stringify(data), false, undefined, [], [], this.budget(input), 1, { operationApplied: true, refreshIds }) as RefreshResult;
 		}
-		if (mode === "lexical") { if (!this.qmd) throw new DatastoreError("CAPABILITY_UNAVAILABLE"); const qmd = await this.qmd.startLexicalRefresh(stores); const data = { action: "start", mode, qmd, backgroundOwnership: "explicit-maintenance", durationMs: elapsed(started) }; return this.envelope("refresh", input.store ?? "*", data, started, JSON.stringify(data), false, undefined, [], [], undefined, 1) as RefreshResult; }
+		const sharedStores = stores.filter((store) => store.shared);
+		if (sharedStores.length && (mode === "lexical" || mode === "semantic" || mode === "all")) {
+			const receipts = [];
+			for (const store of sharedStores) {
+				const client = this.sharedClients?.get(store.name);
+				if (!client) throw new DatastoreError("STORE_UNAVAILABLE");
+				receipts.push(this.localReceipt(mode === "lexical" ? await client.startLexical(signal) : await client.startSemantic(signal), store));
+			}
+				if (sharedStores.length === stores.length) {
+				const data = { action: "start", mode, qmd: receipts[0], shared: receipts, backgroundOwnership: "explicit-maintenance", durationMs: elapsed(started) };
+				return this.envelope("refresh", input.store ?? "*", data, started, JSON.stringify(data), false, undefined, [], [], this.budget(input), 1, { operationApplied: true, refreshIds: [String((data as { qmd?: { refreshId?: string } }).qmd?.refreshId ?? "")] }) as RefreshResult;
+			}
+			const privateStores = stores.filter((store) => !store.shared);
+			if (!this.qmd) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
+			const qmd = mode === "lexical" ? await this.qmd.startLexicalRefresh(privateStores) : await this.qmd.startSemanticRefresh(privateStores);
+			const data = { action: "start", mode, qmd, shared: receipts, backgroundOwnership: "explicit-maintenance", durationMs: elapsed(started) };
+			return this.envelope("refresh", input.store ?? "*", data, started, JSON.stringify(data), false, undefined, [], [], this.budget(input), 1, { operationApplied: true, refreshIds: [String((data as { qmd?: { refreshId?: string } }).qmd?.refreshId ?? "")] }) as RefreshResult;
+		}
+		if (mode === "semantic" || mode === "all") {
+			if (!this.qmd) throw new DatastoreError("CAPABILITY_UNAVAILABLE"); const qmd = await this.qmd.startSemanticRefresh(stores); const data = { action: "start", mode, qmd, backgroundOwnership: "explicit-maintenance", durationMs: elapsed(started) }; return this.envelope("refresh", input.store ?? "*", data, started, JSON.stringify(data), false, undefined, [], [], this.budget(input), 1, { operationApplied: true, refreshIds: [String((data as { qmd?: { refreshId?: string } }).qmd?.refreshId ?? "")] }) as RefreshResult;
+		}
+		if (mode === "lexical") { if (!this.qmd) throw new DatastoreError("CAPABILITY_UNAVAILABLE"); const qmd = await this.qmd.startLexicalRefresh(stores); const data = { action: "start", mode, qmd, backgroundOwnership: "explicit-maintenance", durationMs: elapsed(started) }; return this.envelope("refresh", input.store ?? "*", data, started, JSON.stringify(data), false, undefined, [], [], this.budget(input), 1, { operationApplied: true, refreshIds: [String((data as { qmd?: { refreshId?: string } }).qmd?.refreshId ?? "")] }) as RefreshResult; }
 		const roots: Record<string, string> = {}; for (const store of stores) { await assertRootIdentity(store); roots[store.name] = "available"; }
-		const data = { action: "start", mode, roots, semantics: "bounded-root-revalidation-only", durationMs: elapsed(started) }; return this.envelope("refresh", input.store ?? "*", data, started, JSON.stringify(data), false, undefined, [], [], undefined, Math.max(1, Object.keys(roots).length)) as RefreshResult;
+		const data = { action: "start", mode, roots, semantics: "bounded-root-revalidation-only", durationMs: elapsed(started) }; return this.envelope("refresh", input.store ?? "*", data, started, JSON.stringify(data), false, undefined, [], [], this.budget(input), Math.max(1, Object.keys(roots).length)) as RefreshResult;
+	}
+	private async cancelRefresh(refreshId: string, signal: AbortSignal): Promise<Record<string, unknown>> {
+		if (this.qmd) {
+			try { return await this.qmd.cancelRefresh(refreshId); } catch (error) { if (!(error instanceof DatastoreError) || error.code !== "INVALID_NOTE_REF") throw error; }
+		}
+		for (const [name, client] of this.sharedClients?.entries() ?? []) {
+			try { return this.localReceipt(await client.cancel(refreshId, signal), this.store(name)); } catch (error) { if (!(error instanceof DatastoreError) || error.code !== "INVALID_NOTE_REF") throw error; }
+		}
+		if (this.maintenance) {
+			try { return await this.maintenance.cancel(refreshId); } catch (error) { if (!(error instanceof DatastoreError) || error.code !== "INVALID_NOTE_REF") throw error; }
+		}
+		throw new DatastoreError(this.qmd || this.sharedClients?.size || this.maintenance ? "INVALID_NOTE_REF" : "CAPABILITY_UNAVAILABLE");
+	}
+	bindMetadata(coordinator: MaintenanceCoordinator, indexes: Map<string, MetadataIndex>, ownership?: IndexOwnership): void { this.maintenance = coordinator; this.metadata = indexes; this.#ownership = ownership; coordinator.startCycle(() => reconcileChanged(coordinator, indexes, this.config.stores)); }
+	private async metadataRead(store: StoreConfig, view: "links" | "backlinks", path: string, started: number, signal: AbortSignal, token?: string, budget = this.budget()): Promise<ReadResult> {
+		throwIfAborted(signal);
+		if (store.shared) {
+			const client = this.sharedClients?.get(store.name);
+			if (!client) throw new DatastoreError("STORE_UNAVAILABLE");
+			const page = view === "links" ? await client.links(path, { continuation: token, ...budget, responseStore: store.name }, signal) : await client.backlinks(path, { continuation: token, ...budget, responseStore: store.name }, signal);
+			const query = `${view}:${path}`;
+			const warnings = (page.diagnostics ?? []).map((message) => ({ code: "STALE_INDEX" as const, message }));
+			return this.metadataEnvelope("read", store.name, page.edges, started, budget, { revision: page.revision, query, offset: continuationOffset(token, store.name, page.revision, query), more: page.continuation !== undefined, render: items => ({ note: { store: store.name, path }, view, edges: items, pageCount: page.pageCount, occurrenceCount: page.occurrenceCount, returned: items.length, complete: page.complete, revision: page.revision }), sources: [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: page.complete ? "current" : "stale" }], warnings });
+		}
+		const index = this.metadata?.get(store.name);
+		if (!index) throw new DatastoreError("STALE_INDEX");
+		const snapshot = await index.requireSnapshot();
+		const query = `${view}:${path}`;
+		const edges = view === "links" ? await index.links(path) : await index.backlinks(path);
+		const offset = continuationOffset(token, store.name, snapshot.revision, query);
+		const pageCount = new Set(edges.map((edge) => view === "links" ? edge.target : edge.source)).size;
+		const render = (items: typeof edges) => ({ note: { store: store.name, path }, view, edges: items, pageCount, occurrenceCount: edges.length, returned: items.length, complete: snapshot.complete, revision: snapshot.revision });
+		const page = pageRendered(edges, offset, budget, render);
+		const subject = { path, kind: view === "backlinks" && !path.endsWith(".md") ? "attachment" as const : "note" as const };
+		const admitted = await index.admit(store, [subject, ...page.items.flatMap((edge) => [{ path: edge.source, kind: "note" as const }, ...(edge.targetKind === "note" || edge.targetKind === "attachment" ? [{ path: edge.target, kind: edge.targetKind }] : [])])], signal);
+		const warnings = admitted.diagnostics.map((message) => ({ code: "STALE_INDEX" as const, message }));
+		return this.metadataEnvelope("read", store.name, page.items, started, budget, { revision: snapshot.revision, query, offset, more: page.next !== undefined, render: items => ({ ...render(items), complete: admitted.current }), sources: [{ kind: "filesystem", observedAt: new Date().toISOString(), freshness: admitted.current ? "current" : "stale" }], warnings });
+	}
+	async tags(input: { store: string; continuation?: string; maxBytes?: number; maxLines?: number }, signal?: AbortSignal): Promise<RefreshResult> {
+		return this.runOperation(signal, async (active) => {
+			throwIfAborted(active);
+			const started = Date.now();
+			const store = this.store(input.store);
+			const budget = this.budget(input);
+
+			const query = "catalog";
+			if (store.shared) {
+				const client = this.sharedClients?.get(store.name); if (!client) throw new DatastoreError("STORE_UNAVAILABLE");
+				const page = await client.tags({ continuation: input.continuation, ...budget, responseStore: store.name }, signal);
+				return this.metadataEnvelope("tags", store.name, page.tags, started, budget, { revision: page.revision, query, offset: continuationOffset(input.continuation, store.name, page.revision, query), more: page.continuation !== undefined, render: items => ({ tags: items, revision: page.revision, returned: items.length, total: page.total }) });
+			}
+			const index = this.metadata?.get(store.name);
+			if (!index) throw new DatastoreError("STALE_INDEX");
+			const snapshot = await index.requireSnapshot();
+			const offset = continuationOffset(input.continuation, store.name, snapshot.revision, query);
+			const catalog = await index.catalog();
+			const render = (items: typeof catalog) => ({ tags: items.map((tag) => ({ identity: tag.identity, spelling: tag.spelling, pageCount: tag.pages.length })), revision: snapshot.revision, returned: items.length, total: catalog.length });
+			const page = pageRendered(catalog, offset, budget, render);
+			const admitted = await index.admit(store, [], active);
+			const warnings = admitted.diagnostics.map((message) => ({ code: "STALE_INDEX" as const, message }));
+			return this.metadataEnvelope("tags", store.name, page.items, started, budget, { revision: snapshot.revision, query, offset, more: page.next !== undefined, render: items => render(items), warnings });
+		});
 	}
 	async shutdown(): Promise<void> {
 		if (this.#closed) return; this.#closed = true; this.continuations.clear(); this.#lifecycle.abort(new DatastoreError("CANCELLED"));
-		await Promise.allSettled([...this.#active, ...[this.qmd?.shutdown()].filter((operation): operation is Promise<void> => operation !== undefined)]);
+		this.maintenance?.shutdown();
+		await Promise.allSettled([...this.#active, this.maintenance?.settled(), ...[this.qmd?.shutdown(), ...[...this.sharedClients?.values() ?? []].map((client) => client.shutdown())].filter((operation): operation is Promise<void> => operation !== undefined)]);
+		await this.#ownership?.release();
 	}
 }

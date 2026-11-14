@@ -5,7 +5,7 @@ import { DatastoreError } from "./errors.ts";
 export interface ContinuationDescriptor {
 	kind: "read"; note: NoteRef; revision: string; cursor: number; view: ReadView;
 	includeFrontmatter: boolean; headingPath?: string[]; occurrence?: number; sectionHandle?: string;
-	excludeSections: string[]; includeSemanticRelated: boolean; maxBytes: number; maxLines: number; createdAt: number; expiresAt: number;
+	excludeSections: string[]; includeSemanticRelated: boolean; maxBytes: number | null; maxLines: number | null; createdAt: number; expiresAt: number;
 }
 export interface SectionHandleDescriptor {
 	kind: "section"; note: NoteRef; revision: string; headingPath: string[]; occurrence: number;

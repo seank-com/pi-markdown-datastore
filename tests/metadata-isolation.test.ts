@@ -1,0 +1,392 @@
+import assert from "node:assert/strict";
+import { chmod, mkdir, mkdtemp, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test, { type TestContext } from "node:test";
+
+function cleanup(t: TestContext) {
+	const clients: { shutdown(): Promise<void> }[] = [];
+	const hosts: { close(): Promise<void> }[] = [];
+	const paths: string[] = [];
+	t.after(async () => {
+		for (const client of clients) await client.shutdown();
+		for (const host of hosts) await host.close();
+		for (const path of paths) await rm(path, { recursive: true, force: true });
+	});
+	return {
+		client(client: { shutdown(): Promise<void> }) { clients.push(client); },
+		host(host: { close(): Promise<void> }) { hosts.push(host); },
+		remove(...entries: string[]) { paths.push(...entries); },
+	};
+}
+import { loadMarkdownDatastoreConfig } from "../src/config.ts";
+import { MaintenanceCoordinator } from "../src/maintenance-coordinator.ts";
+import { MetadataIndex, registerMetadata } from "../src/metadata-index.ts";
+import { MarkdownDatastoreService } from "../src/service.ts";
+import { startSharedHost } from "../src/shared-host.ts";
+import { SharedIndexClient } from "../src/shared-client.ts";
+
+async function projectConfig(root: string, stores: Record<string, string>) {
+	const dir = join(root, ".pi", "markdown-datastore");
+	await mkdir(dir, { recursive: true, mode: 0o700 });
+	await chmod(dir, 0o700);
+	const body: Record<string, unknown> = {};
+	for (const [name, path] of Object.entries(stores)) {
+		await mkdir(path, { recursive: true });
+		body[name] = { root: path, include: ["**/*.md"], exclude: [], maxFileBytes: 4096, search: { defaultMode: "lexical", qmdCollection: name } };
+	}
+	const configPath = join(dir, "config.json");
+	await writeFile(configPath, JSON.stringify({ schemaVersion: 1, defaults: { maxResultBytes: 8192, maxResultLines: 100, operationTimeoutMs: 3000 }, qmd: { enabled: false, installation: { executable: "qmd" }, minimumVersion: "2.8.3" }, stores: body }), { mode: 0o600 });
+	return loadMarkdownDatastoreConfig(root, configPath);
+}
+
+test("two stores keep separate metadata snapshots after reopen", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-iso-")));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const notes = join(root, "notes");
+	const archive = join(root, "archive");
+	await mkdir(notes); await mkdir(archive);
+	await writeFile(join(notes, "alpha.md"), "See [[beta]].\n");
+	await writeFile(join(notes, "beta.md"), "Note.\n");
+	await writeFile(join(archive, "only.md"), "Archive.\n");
+	const config = await projectConfig(root, { notes, archive });
+	const indexes = new Map([["notes", new MetadataIndex(join(root, "state", "metadata-notes"))], ["archive", new MetadataIndex(join(root, "state", "metadata-archive"))]]);
+	const coordinator = new MaintenanceCoordinator(join(root, "state", "jobs.json"), () => new Set(config.stores.keys()));
+	registerMetadata(coordinator, indexes, config.stores);
+	await coordinator.enqueue("metadata", ["notes", "archive"], "explicit-maintenance");
+	await coordinator.settled();
+	const reopened = new MetadataIndex(join(root, "state", "metadata-notes"));
+	const links = await reopened.links("alpha.md");
+	assert.equal(links[0]?.target, "beta.md");
+	const archiveIndex = new MetadataIndex(join(root, "state", "metadata-archive"));
+	assert.equal((await archiveIndex.links("alpha.md")).length, 0);
+});
+
+test("incomplete metadata is not reported current and tag find continues past twenty", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-page-")));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const notes = join(root, "notes");
+	await mkdir(notes, { recursive: true });
+	await writeFile(join(notes, "bad.md"), "---\ntags: [Travel\n---\n[[missing]]\n");
+	for (let index = 0; index < 21; index += 1) await writeFile(join(notes, `p${index}.md`), "---\ntags: travel\n---\nPage.\n");
+	const config = await projectConfig(root, { notes });
+	const indexes = new Map([["notes", new MetadataIndex(join(root, "state", "metadata-notes"))]]);
+	const coordinator = new MaintenanceCoordinator(join(root, "state", "jobs.json"), () => new Set(["notes"]));
+	registerMetadata(coordinator, indexes, config.stores);
+	const service = new MarkdownDatastoreService(config);
+	service.bindMetadata(coordinator, indexes);
+	await service.refresh({ store: "notes", mode: "metadata" });
+	await coordinator.settled();
+	const links = await service.read({ store: "notes", note: { store: "notes", path: "bad.md" }, view: "links" });
+	assert.equal(links.provenance.sources[0].freshness, "stale");
+	const first = await service.find({ store: "notes", selectors: [{ kind: "tag", value: "travel" }], limit: 20 });
+	assert.equal(first.data.candidates.length, 20);
+	assert.equal(first.bounds.truncated, true);
+	const second = await service.find({ store: "notes", selectors: [{ kind: "tag", value: "travel" }], limit: 20, continuation: first.bounds.continuation } as never);
+	assert.equal(second.data.candidates.length, 1);
+	const revision = (await indexes.get("notes")!.requireSnapshot()).revision;
+	const token = (fields: Record<string, string>) => Buffer.from(JSON.stringify({ store: "notes", revision, query: "travel", offset: 0, ...fields })).toString("base64url");
+	await assert.rejects(service.find({ store: "notes", selectors: [{ kind: "tag", value: "travel" }], continuation: token({ query: "other" }) } as never), { code: "STALE_CONTINUATION" });
+	await assert.rejects(service.find({ store: "notes", selectors: [{ kind: "tag", value: "travel" }], continuation: token({ revision: "meta-" + "0".repeat(32) }) } as never), { code: "STALE_CONTINUATION" });
+	await assert.rejects(service.find({ store: "notes", selectors: [{ kind: "tag", value: "travel" }], continuation: token({ store: "archive" }) } as never), { code: "STALE_CONTINUATION" });
+});
+
+test("graph-only shared host refreshes metadata without qmd", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-shared-meta-")));
+	const socketDir = `/tmp/dsm${process.pid}`;
+	await mkdir(socketDir, { mode: 0o700 });
+	await chmod(socketDir, 0o700);
+	const done = cleanup(t);
+	done.remove(socketDir, root);
+	const notes = join(root, "notes");
+	await mkdir(notes, { recursive: true });
+	await writeFile(join(notes, "alpha.md"), "See [[beta]].\n");
+	await writeFile(join(notes, "beta.md"), "Target.\n");
+	const state = join(root, "state");
+	await mkdir(state, { mode: 0o700 });
+	const catalogPath = join(root, "catalog.json");
+	await writeFile(catalogPath, JSON.stringify({ schemaVersion: 1, socketPath: join(socketDir, "s.sock"), stateRoot: state, defaults: { maxResultBytes: 8192, maxResultLines: 100, operationTimeoutMs: 3000 }, qmd: { enabled: false, installation: { executable: "qmd" }, minimumVersion: "2.8.3" }, stores: { notebook: { root: notes, include: ["**/*.md"], exclude: [], maxFileBytes: 4096, search: { defaultMode: "lexical", qmdCollection: "notebook" } } } }), { mode: 0o600 });
+	const host = await startSharedHost(catalogPath);
+	done.host(host);
+	const catalog = await import("../src/shared-catalog.ts").then((mod) => mod.loadSharedCatalog(catalogPath));
+	const defined = catalog.stores.get("notebook")!;
+	const client = new SharedIndexClient({ socketPath: join(socketDir, "s.sock"), store: "notebook", definitionRevision: defined.definitionRevision });
+	done.client(client);
+	const receipt = await client.startMetadata();
+	assert.equal(receipt.coalesced, false);
+	await host.coordinators.get("notebook")?.settled();
+	const edges = await client.links("alpha.md");
+	assert.equal((edges.edges[0] as { target?: string })?.target, "beta.md");
+	assert.equal(typeof edges.revision, "string");
+});
+
+test("a second graph-only endpoint cannot own the same index, and close waits for the job", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-own-meta-")));
+	const socketA = `/tmp/dsma${process.pid}`;
+	const socketB = `/tmp/dsmb${process.pid}`;
+	await mkdir(socketA, { mode: 0o700 });
+	await mkdir(socketB, { mode: 0o700 });
+	await chmod(socketA, 0o700);
+	await chmod(socketB, 0o700);
+	const done = cleanup(t);
+	done.remove(socketA, socketB, root);
+	const notes = join(root, "notes");
+	await mkdir(notes, { recursive: true });
+	await writeFile(join(notes, "alpha.md"), "See [[beta]].\n");
+	await writeFile(join(notes, "beta.md"), "Target.\n");
+	const state = join(root, "state");
+	await mkdir(state, { mode: 0o700 });
+	const writeCatalog = (path: string, socketDir: string) => writeFile(path, JSON.stringify({ schemaVersion: 1, socketPath: join(socketDir, "s.sock"), stateRoot: state, defaults: { maxResultBytes: 8192, maxResultLines: 100, operationTimeoutMs: 3000 }, qmd: { enabled: false, installation: { executable: "qmd" }, minimumVersion: "2.8.3" }, stores: { notebook: { root: notes, include: ["**/*.md"], exclude: [], maxFileBytes: 4096, search: { defaultMode: "lexical", qmdCollection: "notebook" } } } }), { mode: 0o600 });
+	const firstPath = join(root, "a.json");
+	const secondPath = join(root, "b.json");
+	await writeCatalog(firstPath, socketA);
+	await writeCatalog(secondPath, socketB);
+	const first = await startSharedHost(firstPath);
+	done.host(first);
+	await assert.rejects(startSharedHost(secondPath), { code: "STORE_UNAVAILABLE" });
+	let started!: () => void;
+	const holding = new Promise<void>((resolve) => { started = resolve; });
+	const coordinator = first.coordinators.get("notebook")!;
+	coordinator.register("metadata", async (_job, signal) => { started(); await new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason))); return { generation: "meta-" + "ab".repeat(16) }; });
+	const job = await coordinator.enqueue("metadata", ["notebook"], "explicit-maintenance");
+	await holding;
+	await first.close();
+	assert.notEqual(coordinator.get(String(job.refreshId))?.state, "running");
+});
+
+test("a replaced source root or unsafe target is not a current graph result", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-root-meta-")));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const notes = join(root, "notes");
+	await mkdir(notes);
+	await writeFile(join(notes, "alpha.md"), "See [[beta]] and ![[map.png]].\n");
+	await writeFile(join(notes, "beta.md"), "Target.\n");
+	await writeFile(join(notes, "map.png"), "png");
+	const outside = join(root, "outside.md");
+	await writeFile(outside, "outside\n");
+	const config = await projectConfig(root, { notes });
+	const index = new MetadataIndex(join(root, "state", "metadata-notes"));
+	const coordinator = new MaintenanceCoordinator(join(root, "state", "jobs.json"), () => new Set(["notes"]));
+	registerMetadata(coordinator, new Map([["notes", index]]), config.stores);
+	const service = new MarkdownDatastoreService(config);
+	service.bindMetadata(coordinator, new Map([["notes", index]]));
+	await service.refresh({ store: "notes", mode: "metadata" });
+	await coordinator.settled();
+	const current = await service.read({ store: "notes", note: { store: "notes", path: "alpha.md" }, view: "links" });
+	assert.equal(current.provenance.sources[0].freshness, "current");
+	await rm(join(notes, "beta.md"));
+	await symlink(outside, join(notes, "beta.md"));
+	const unsafe = await service.read({ store: "notes", note: { store: "notes", path: "alpha.md" }, view: "links" });
+	assert.equal(unsafe.provenance.sources[0].freshness, "stale");
+	assert.match(unsafe.warnings.map((warning) => warning.message).join("\n"), new RegExp(String(current.data.revision)));
+	const original = await stat(notes);
+	// Keep the original inode allocated: remove/mkdir may recycle it on Linux.
+	await rename(notes, join(root, "retired-notes"));
+	await mkdir(notes);
+	const replacement = await stat(notes);
+	assert.notDeepEqual({ dev: replacement.dev, ino: replacement.ino }, { dev: original.dev, ino: original.ino });
+	await writeFile(join(notes, "alpha.md"), "Replacement.\n");
+	await assert.rejects(service.read({ store: "notes", note: { store: "notes", path: "alpha.md" }, view: "links" }), { code: "STORE_UNAVAILABLE" });
+});
+
+test("tag find pages the rendered candidate, not the path string", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-tag-budget-")));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const notes = join(root, "notes");
+	await mkdir(notes);
+	const long = "n".repeat(80);
+	await writeFile(join(notes, `${long}-a.md`), "---\ntags: [Travel]\n---\nOne.\n");
+	await writeFile(join(notes, `${long}-b.md`), "---\ntags: [Travel]\n---\nTwo.\n");
+	const dir = join(root, ".pi", "markdown-datastore");
+	await mkdir(dir, { recursive: true, mode: 0o700 });
+	await chmod(dir, 0o700);
+	await writeFile(join(dir, "config.json"), JSON.stringify({ schemaVersion: 1, defaults: { operationTimeoutMs: 3000 }, qmd: { enabled: false, installation: { executable: "qmd" }, minimumVersion: "2.8.3" }, stores: { notes: { root: "notes", include: ["**/*.md"], exclude: [], maxFileBytes: 20000, search: { defaultMode: "lexical", qmdCollection: "notes" } } } }), { mode: 0o600 });
+	const config = await loadMarkdownDatastoreConfig(root);
+	const index = new MetadataIndex(join(root, "state", "metadata-notes"));
+	const coordinator = new MaintenanceCoordinator(join(root, "state", "jobs.json"), () => new Set(["notes"]));
+	registerMetadata(coordinator, new Map([["notes", index]]), config.stores);
+	const service = new MarkdownDatastoreService(config);
+	service.bindMetadata(coordinator, new Map([["notes", index]]));
+	await service.refresh({ store: "notes", mode: "metadata" });
+	await coordinator.settled();
+	await assert.rejects(service.find({ store: "notes", selectors: [{ kind: "tag", value: "travel" }], limit: 20, maxBytes: 400, maxLines: 20 } as never), { code: "RESULT_LIMIT_EXCEEDED" });
+	const found = await service.find({ store: "notes", selectors: [{ kind: "tag", value: "travel" }], limit: 20, maxBytes: 4000, maxLines: 20 } as never);
+	assert.equal(Buffer.byteLength(JSON.stringify(found)) <= 4000, true);
+	assert.equal(found.data.candidates.length, 2);
+	assert.equal(found.bounds.truncated, false);
+	assert.equal(found.data.candidates[0].uri.startsWith("datastore://notes/"), true);
+	assert.notEqual(found.data.candidates[0].revision, found.provenance.sources[0].indexRevision);
+});
+
+test("an in-place note edit is not current membership", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-edit-meta-")));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const notes = join(root, "notes");
+	await mkdir(notes);
+	const file = join(notes, "alpha.md");
+	await writeFile(file, "---\ntags: [travel]\n---\nSee [[old]].\n");
+	const config = await projectConfig(root, { notes });
+	const index = new MetadataIndex(join(root, "state", "metadata-notes"));
+	const coordinator = new MaintenanceCoordinator(join(root, "state", "jobs.json"), () => new Set(["notes"]));
+	registerMetadata(coordinator, new Map([["notes", index]]), config.stores);
+	const service = new MarkdownDatastoreService(config);
+	service.bindMetadata(coordinator, new Map([["notes", index]]));
+	await service.refresh({ store: "notes", mode: "metadata" });
+	await coordinator.settled();
+	const before = await service.read({ store: "notes", note: { store: "notes", path: "alpha.md" }, view: "links" });
+	assert.equal(before.provenance.sources[0].freshness, "current");
+	assert.equal(before.data.edges[0].target, "old");
+	const info = await stat(file);
+	await writeFile(file, "---\ntags: [worked]\n---\nSee [[new]].\n");
+	await utimes(file, info.atime, info.mtime);
+	const after = await service.read({ store: "notes", note: { store: "notes", path: "alpha.md" }, view: "links" });
+	assert.equal(after.provenance.sources[0].freshness, "stale");
+	assert.match(after.warnings.map((warning) => warning.message).join("\n"), new RegExp(String(before.data.revision)));
+	const tagged = await service.find({ store: "notes", selectors: [{ kind: "tag", value: "travel" }] });
+	assert.equal(tagged.provenance.sources[0].freshness, "stale");
+});
+
+test("metadata status is ready without qmd and stays at the state root", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-meta-status-")));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const notes = join(root, "notes");
+	await mkdir(notes);
+	await writeFile(join(notes, "alpha.md"), "---\ntags: [Travel]\n---\nSee [[beta]].\n");
+	await writeFile(join(notes, "beta.md"), "Target.\n");
+	const config = await projectConfig(root, { notes });
+	const index = new MetadataIndex(join(config.stateRoot, "metadata-notes"));
+	const coordinator = new MaintenanceCoordinator(join(config.stateRoot, "jobs.json"), () => new Set(["notes"]));
+	registerMetadata(coordinator, new Map([["notes", index]]), config.stores);
+	const service = new MarkdownDatastoreService(config);
+	service.bindMetadata(coordinator, new Map([["notes", index]]));
+	await service.refresh({ store: "notes", mode: "metadata" });
+	await coordinator.settled();
+	const status = await service.status({ store: "notes" });
+	const metadata = status.data.stores[0].capabilities.metadata;
+	assert.equal(metadata.state, "ready");
+	assert.equal(metadata.complete, true);
+	assert.match(metadata.revision, /^meta-/);
+	assert.equal(metadata.progress.state, "idle");
+});
+
+test("shared metadata status works when enabled qmd is unavailable", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-qmd-missing-")));
+	const socketDir = join(root, "sock");
+	await mkdir(socketDir, { recursive: true, mode: 0o700 });
+	await chmod(socketDir, 0o700);
+	const done = cleanup(t);
+	done.remove(root);
+	const notes = join(root, "notes");
+	await mkdir(notes);
+	await writeFile(join(notes, "alpha.md"), "See [[beta]].\n");
+	await writeFile(join(notes, "beta.md"), "Target.\n");
+	const state = join(root, "state");
+	await mkdir(state, { mode: 0o700 });
+	const catalogPath = join(root, "catalog.json");
+	await writeFile(catalogPath, JSON.stringify({ schemaVersion: 1, socketPath: join(socketDir, "s.sock"), stateRoot: state, defaults: { maxResultBytes: 8192, maxResultLines: 100, operationTimeoutMs: 3000 }, qmd: { enabled: true, installation: { executable: "qmd-not-installed" }, minimumVersion: "2.8.3" }, stores: { notebook: { root: notes, include: ["**/*.md"], exclude: [], maxFileBytes: 4096, search: { defaultMode: "lexical", qmdCollection: "notebook" } } } }), { mode: 0o600 });
+	const host = await startSharedHost(catalogPath);
+	done.host(host);
+	const defined = (await import("../src/shared-catalog.ts")).loadSharedCatalog;
+	const catalog = await defined(catalogPath);
+	const client = new SharedIndexClient({ socketPath: join(socketDir, "s.sock"), store: "notebook", definitionRevision: catalog.stores.get("notebook")!.definitionRevision });
+	done.client(client);
+	await client.startMetadata();
+	await host.coordinators.get("notebook")?.settled();
+	const status = await client.status() as { metadata?: { state?: string; revision?: string; complete?: boolean; progress?: { state?: string } } };
+	assert.equal(status.metadata?.state, "ready");
+	assert.equal(status.metadata?.complete, true);
+	assert.match(String(status.metadata?.revision), /^meta-/);
+	assert.equal(status.metadata?.progress?.state, "idle");
+	const activity = await client.activity();
+	assert.equal(activity.embeddingActive, false);
+});
+
+test("a backslash wikilink is unresolved and a second hash stays in the tag", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-syntax-")));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const notes = join(root, "notes");
+	await mkdir(join(notes, "folder"), { recursive: true });
+	await writeFile(join(notes, "folder", "page.md"), "Page.\n");
+	await writeFile(join(notes, "alpha.md"), "---\ntags: ['##Travel']\n---\nSee [[folder\\page]].\n");
+	const config = await projectConfig(root, { notes });
+	const index = new MetadataIndex(join(config.stateRoot, "metadata-notes"));
+	const coordinator = new MaintenanceCoordinator(join(config.stateRoot, "jobs.json"), () => new Set(["notes"]));
+	registerMetadata(coordinator, new Map([["notes", index]]), config.stores);
+	const service = new MarkdownDatastoreService(config);
+	service.bindMetadata(coordinator, new Map([["notes", index]]));
+	await service.refresh({ store: "notes", mode: "metadata" });
+	await coordinator.settled();
+	const links = await service.read({ store: "notes", note: { store: "notes", path: "alpha.md" }, view: "links" });
+	assert.equal(links.data.edges[0].target, "folder\\page");
+	assert.equal(links.data.edges[0].targetKind, "unresolved");
+	const found = await service.find({ store: "notes", selectors: [{ kind: "tag", value: "##travel" }] });
+	assert.equal(found.data.candidates[0].note.path, "alpha.md");
+});
+
+test("attachment backlinks stay current and an edited referrer does not", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-backlink-")));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const notes = join(root, "notes");
+	await mkdir(notes);
+	await writeFile(join(notes, "alpha.md"), "See [[beta]] and ![[map.png]].\n");
+	await writeFile(join(notes, "beta.md"), "Target.\n");
+	await writeFile(join(notes, "map.png"), Buffer.from([0, 1, 2, 0]));
+	const config = await projectConfig(root, { notes });
+	const index = new MetadataIndex(join(config.stateRoot, "metadata-notes"));
+	const coordinator = new MaintenanceCoordinator(join(config.stateRoot, "jobs.json"), () => new Set(["notes"]));
+	registerMetadata(coordinator, new Map([["notes", index]]), config.stores);
+	const service = new MarkdownDatastoreService(config);
+	service.bindMetadata(coordinator, new Map([["notes", index]]));
+	await service.refresh({ store: "notes", mode: "metadata" });
+	await coordinator.settled();
+	const image = await service.read({ store: "notes", note: { store: "notes", path: "map.png" }, view: "backlinks" });
+	assert.equal(image.provenance.sources[0].freshness, "current");
+	assert.equal(image.data.edges[0].source, "alpha.md");
+	await writeFile(join(notes, "alpha.md"), "No link.\n");
+	const stale = await service.read({ store: "notes", note: { store: "notes", path: "beta.md" }, view: "backlinks" });
+	assert.equal(stale.provenance.sources[0].freshness, "stale");
+	assert.match(stale.warnings.map((warning) => warning.message).join("\n"), new RegExp(String(image.data.revision)));
+	const token = Buffer.from(JSON.stringify({ store: "notes", revision: image.data.revision, query: "backlinks:map.png", offset: 0, maxBytes: "bad" })).toString("base64url");
+	await assert.rejects(service.read({ continuation: token }), { code: "RESULT_LIMIT_EXCEEDED" });
+	await assert.rejects(service.read({ continuation: "not-a-page-token" }), { code: "STALE_CONTINUATION" });
+	await assert.rejects(service.read({ continuation: Buffer.from("null").toString("base64url") }), { code: "STALE_CONTINUATION" });
+	await assert.rejects(service.read({ continuation: Buffer.from("[]").toString("base64url") }), { code: "STALE_CONTINUATION" });
+	await assert.rejects(service.read({ continuation: Buffer.from("1").toString("base64url") }), { code: "STALE_CONTINUATION" });
+	await assert.rejects(service.read({ continuation: "ab".repeat(16) }), { code: "EXPIRED_CONTINUATION" });
+	const huge = Buffer.from(JSON.stringify({ store: "notes", revision: image.data.revision, query: "backlinks:map.png", offset: 0, maxBytes: 10_000_000, maxLines: 1 })).toString("base64url");
+	const explicit = await service.read({ continuation: huge });
+	assert.equal(explicit.bounds.maxBytes, 10_000_000);
+	assert.equal(explicit.bounds.returnedBytes, Buffer.byteLength(JSON.stringify(explicit)));
+});
+
+test("shared attachment backlink stays current until the referrer changes", async (t) => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-shared-backlink-")));
+	const socketDir = join(root, "sock");
+	await mkdir(socketDir, { recursive: true, mode: 0o700 });
+	await chmod(socketDir, 0o700);
+	const done = cleanup(t);
+	done.remove(root);
+	const notes = join(root, "notes");
+	await mkdir(notes);
+	await writeFile(join(notes, "alpha.md"), "See [[beta]] and ![[map.png]].\n");
+	await writeFile(join(notes, "beta.md"), "Target.\n");
+	await writeFile(join(notes, "map.png"), Buffer.from([0, 1, 2, 0]));
+	const state = join(root, "state");
+	await mkdir(state, { mode: 0o700 });
+	const catalogPath = join(root, "catalog.json");
+	await writeFile(catalogPath, JSON.stringify({ schemaVersion: 1, socketPath: join(socketDir, "s.sock"), stateRoot: state, defaults: { maxResultBytes: 8192, maxResultLines: 100, operationTimeoutMs: 3000 }, qmd: { enabled: false, installation: { executable: "qmd" }, minimumVersion: "2.8.3" }, stores: { notebook: { root: notes, include: ["**/*.md"], exclude: [], maxFileBytes: 4096, search: { defaultMode: "lexical", qmdCollection: "notebook" } } } }), { mode: 0o600 });
+	const host = await startSharedHost(catalogPath);
+	done.host(host);
+	const catalog = await (await import("../src/shared-catalog.ts")).loadSharedCatalog(catalogPath);
+	const client = new SharedIndexClient({ socketPath: join(socketDir, "s.sock"), store: "notebook", definitionRevision: catalog.stores.get("notebook")!.definitionRevision });
+	done.client(client);
+	await client.startMetadata();
+	await host.coordinators.get("notebook")?.settled();
+	const image = await client.backlinks("map.png");
+	assert.equal(image.complete, true);
+	assert.equal((image.edges[0] as { source?: string }).source, "alpha.md");
+	await writeFile(join(notes, "alpha.md"), "No link.\n");
+	const stale = await client.backlinks("beta.md");
+	assert.equal(stale.complete, false);
+	assert.match((stale.diagnostics ?? []).join("\n"), new RegExp(image.revision));
+});

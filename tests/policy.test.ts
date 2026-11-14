@@ -44,8 +44,8 @@ async function snapshot(path: string): Promise<unknown> {
 }
 
 test("policy enumerates effective canonical roots and checks actual destinations without writes or qmd", async t => {
-  const f = await fixture(t); const before = await snapshot(f.base);
-  await f.fire("session_start"); const client = f.client();
+  const f = await fixture(t);
+  await f.fire("session_start"); const before = await snapshot(f.base); const client = f.client();
   const roots = (await client.roots({})).data.roots;
   assert.deepEqual(roots.map(root => [root.store, root.path]), [["notes", f.notes], ["shared", f.shared]]);
   for (const root of roots) { const info = await lstat(root.path); assert.equal(root.device, info.dev); assert.equal(root.inode, info.ino); }

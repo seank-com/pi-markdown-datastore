@@ -189,6 +189,30 @@ async function walkSafePaths(store: StoreConfig, visitor: (path: string, metadat
 	await walk(store.root, "");
 }
 
+function excluded(store: StoreConfig, path: string): boolean {
+	return store.exclude.some((pattern) => globRegex(pattern).test(path));
+}
+
+/** Non-Markdown files that are not excluded. Include patterns select notes; applying them here would drop every attachment under the normal `**\/*.md` include. */
+export async function walkSafeAttachmentPaths(store: StoreConfig, visitor: (path: string) => void | Promise<void>, signal?: AbortSignal): Promise<void> {
+	await assertRootIdentity(store);
+	const walk = async (directory: string, prefix: string): Promise<void> => {
+		throwIfAborted(signal);
+		const entries = await readdir(directory, { withFileTypes: true });
+		for (const entry of entries) {
+			throwIfAborted(signal);
+			const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+			const absolute = resolve(directory, entry.name);
+			const metadata = await lstat(absolute).catch(() => { throw new DatastoreError("STORE_UNAVAILABLE"); });
+			if (metadata.isSymbolicLink()) continue;
+			if (metadata.isDirectory()) { await walk(absolute, path); continue; }
+			if (!metadata.isFile() || path.endsWith(".md") || excluded(store, path)) continue;
+			await visitor(path);
+		}
+	};
+	await walk(store.root, "");
+}
+
 export async function walkSafeNoteMetadata(store: StoreConfig, visitor: (note: SafeNoteMetadata) => void | Promise<void>, signal?: AbortSignal, onProgress?: () => void): Promise<number> {
 	let count = 0;
 	await walkSafePaths(store, async (path, metadata) => { throwIfAborted(signal); await visitor({ note: { store: store.name, path }, mtime: metadata.mtime.toISOString(), size: Number(metadata.size) }); count += 1; }, signal, onProgress);

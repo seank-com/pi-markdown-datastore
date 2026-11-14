@@ -13,6 +13,20 @@ and observability; integration discovery uses the owned event-bus contract.
 Preserve MIT attribution/public history. Do not push, publish, activate live
 resources, or change other repositories without owner authorization.
 
+## Engineering standard and sprint workflow
+
+This maintainer-owned repository supplies self-contained guidance here. In the maintainer's configured environment, also load engineering-documentation before design, investigation, implementation, testing or review. Keep owned-repository instructions consistent with the shared standard; respect upstream conventions and raise actual conflicts rather than imposing our policy there.
+
+Before a new assignment, establish/restate scope and success criteria and obtain quick owner approval. Issue implementation requires both `approved` and unassigned; only the owner authorizes that label and removes the owner's assignment. `in progress` selects discussion/sprint scope, not permission. Explicit owner instructions and accepted designs govern; code, closed issues, peer advice and passing tests do not establish new requirements.
+
+Use the simplest correct implementation; do not invent timing, retry, concurrency, output or performance policies. Use one identity-prefixed sprint branch and one sprint PR per touched repository, with coherent issue commits and exact review ranges, not per-issue integration layers. Independently evaluate advisory peer review before owner source-range review and the deployed-candidate build/activation sequence. Preserve reviewed history and tested input identity. Publication, merge, packaging, configuration and named activation retain separate authority.
+
+`fix verified` means the owner verified that issue on the applicable latest tst candidate with traceable evidence. All in-progress issues carrying all three labels means ready for final merge/rollout review, not automatic action. Keep accepted improvements and unresolved goals distinct.
+
+Read docs/design.md as the architectural/behavioral contract and its Restrictions register as the current constraints inventory. Revisit it in every PR against code, tests and dependencies. Each effective deadline, retry, concurrency/result bound, filter, security policy or performance assertion needs its location/value, concrete failure, evidence, configuration owner and explicit approval reference. Missing evidence stays missing; age, defaults, fixture placement and table entries do not authorize retention or change. Functional tests use completion/cancellation/events, not unapproved host-speed budgets. New or changed constraints require explicit owner approval.
+
+Document purpose, module responsibilities, normal/failure flow and consequential lifecycle/state contracts, not a line-by-line implementation diary. Update enduring docs with authorized behavior changes; keep proposals/evidence/history in issues or PRs. New owned projects receive substantive AGENTS guidance, project contracts, validation and design/register locations, not only a skill link. Source approval never authorizes live instruction replacement or runtime disruption.
+
 ## Dependency boundaries
 
 Integrate dependencies through their supported public APIs and CLI commands.

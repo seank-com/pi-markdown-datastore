@@ -3,21 +3,21 @@ import { lstat, open, realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { DatastoreError } from "./errors.ts";
+import { loadSharedCatalog } from "./shared-catalog.ts";
 
-export const HARD_MAX_RESULT_BYTES = 32 * 1024;
-export const HARD_MAX_RESULT_LINES = 800;
-export const HARD_MAX_FILE_BYTES = 10 * 1024 * 1024;
-export const HARD_MAX_SEARCH_RESULTS = 20;
-export const HARD_MAX_CANDIDATES = 500;
-export const HARD_MAX_OUTLINE = 100;
+import { assertNoDuplicateJsonKeys, HARD_MAX_FILE_BYTES } from "./config-common.ts";
+export { assertNoDuplicateJsonKeys, clampReadBudget, exceedsBudget, HARD_MAX_CANDIDATES, HARD_MAX_FILE_BYTES, HARD_MAX_OUTLINE, HARD_MAX_SEARCH_RESULTS, resolveResultBudget } from "./config-common.ts";
+export type { ResultBudget } from "./config-common.ts";
 
-export interface DatastoreDefaults { maxResultBytes: number; maxResultLines: number; operationTimeoutMs: number }
+export interface DatastoreDefaults { maxResultBytes?: number; maxResultLines?: number; operationTimeoutMs: number }
 export interface QmdConfig { enabled: boolean; installation: { executable?: string; packageRoot?: string }; minimumVersion: string }
 
+export interface SharedStoreReference { catalog: string; store: string; socketPath: string; definitionRevision: string }
 export interface StoreConfig {
 	name: string; configuredRoot: string; root: string; rootWasSymlink: boolean; rootDev: number; rootIno: number;
 	include: string[]; exclude: string[]; maxFileBytes: number;
 	search: { defaultMode: "lexical" | "semantic" | "hybrid"; qmdCollection: string };
+	shared?: SharedStoreReference;
 }
 export interface MarkdownDatastoreConfig {
 	schemaVersion: 1; projectRoot: string; configPath: string; stateRoot: string; defaults: DatastoreDefaults;
@@ -29,6 +29,8 @@ const DEFAULT_KEYS = new Set(["maxResultBytes", "maxResultLines", "operationTime
 const QMD_KEYS = new Set(["enabled", "installation", "minimumVersion"]);
 const INSTALL_KEYS = new Set(["executable", "packageRoot"]);
 const STORE_KEYS = new Set(["root", "include", "exclude", "maxFileBytes", "search"]);
+const SHARED_STORE_KEYS = new Set(["shared"]);
+const SHARED_REF_KEYS = new Set(["catalog", "store"]);
 const SEARCH_KEYS = new Set(["defaultMode", "qmdCollection"]);
 const STORE_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
 
@@ -51,56 +53,14 @@ function integer(value: unknown, min: number, max: number): number {
 	if (!Number.isInteger(value) || (value as number) < min || (value as number) > max) throw new DatastoreError("CONFIG_INVALID");
 	return value as number;
 }
+function optionalBudget(value: unknown): number | undefined {
+	if (value === undefined) return undefined;
+	if (!Number.isSafeInteger(value) || (value as number) < 1) throw new DatastoreError("CONFIG_INVALID");
+	return value as number;
+}
 function stringArray(value: unknown): string[] {
 	if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.length === 0)) throw new DatastoreError("CONFIG_INVALID");
 	return [...value];
-}
-
-/** Strict JSON duplicate-key pass. JSON.parse alone silently accepts the last duplicate. */
-export function assertNoDuplicateJsonKeys(text: string): void {
-	let index = 0;
-	const ws = () => { while (/\s/.test(text[index] ?? "")) index += 1; };
-	const quoted = (): string => {
-		const start = index;
-		if (text[index++] !== '"') throw new DatastoreError("CONFIG_INVALID");
-		let escaped = false;
-		while (index < text.length) {
-			const char = text[index++];
-			if (!escaped && char === '"') {
-				try { return JSON.parse(text.slice(start, index)); } catch { throw new DatastoreError("CONFIG_INVALID"); }
-			}
-			if (!escaped && char === "\\") escaped = true; else escaped = false;
-		}
-		throw new DatastoreError("CONFIG_INVALID");
-	};
-	const value = (): void => {
-		ws();
-		if (text[index] === "{") object();
-		else if (text[index] === "[") array();
-		else if (text[index] === '"') void quoted();
-		else {
-			const match = /^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/.exec(text.slice(index));
-			if (!match) throw new DatastoreError("CONFIG_INVALID");
-			index += match[0].length;
-		}
-	};
-	const object = (): void => {
-		index += 1; ws(); const keys = new Set<string>();
-		if (text[index] === "}") { index += 1; return; }
-		for (;;) {
-			ws(); const key = quoted();
-			if (keys.has(key)) throw new DatastoreError("CONFIG_INVALID");
-			keys.add(key); ws(); if (text[index++] !== ":") throw new DatastoreError("CONFIG_INVALID");
-			value(); ws(); const delimiter = text[index++];
-			if (delimiter === "}") return;
-			if (delimiter !== ",") throw new DatastoreError("CONFIG_INVALID");
-		}
-	};
-	const array = (): void => {
-		index += 1; ws(); if (text[index] === "]") { index += 1; return; }
-		for (;;) { value(); ws(); const delimiter = text[index++]; if (delimiter === "]") return; if (delimiter !== ",") throw new DatastoreError("CONFIG_INVALID"); }
-	};
-	value(); ws(); if (index !== text.length) throw new DatastoreError("CONFIG_INVALID");
 }
 
 async function assertProtectedDirectory(path: string): Promise<void> {
@@ -169,8 +129,8 @@ export async function loadMarkdownDatastoreConfig(projectRootInput: string, conf
 
 	const defaultsRaw = record(top.defaults); exactKeys(defaultsRaw, DEFAULT_KEYS);
 	const defaults: DatastoreDefaults = {
-		maxResultBytes: integer(defaultsRaw.maxResultBytes, 1, HARD_MAX_RESULT_BYTES),
-		maxResultLines: integer(defaultsRaw.maxResultLines, 1, HARD_MAX_RESULT_LINES),
+		maxResultBytes: optionalBudget(defaultsRaw.maxResultBytes),
+		maxResultLines: optionalBudget(defaultsRaw.maxResultLines),
 		operationTimeoutMs: integer(defaultsRaw.operationTimeoutMs, 100, 60_000),
 	};
 	const qmdRaw = record(top.qmd); exactKeys(qmdRaw, QMD_KEYS);
@@ -187,7 +147,24 @@ export async function loadMarkdownDatastoreConfig(projectRootInput: string, conf
 	const canonicalRoots = new Set<string>();
 	for (const [name, value] of Object.entries(storesRaw)) {
 		if (!STORE_NAME.test(name)) throw new DatastoreError("CONFIG_INVALID");
-		const storeRaw = record(value); exactKeys(storeRaw, STORE_KEYS);
+		const storeRaw = record(value);
+		if (Object.hasOwn(storeRaw, "shared")) {
+			exactKeys(storeRaw, SHARED_STORE_KEYS);
+			const sharedRaw = record(storeRaw.shared); exactKeys(sharedRaw, SHARED_REF_KEYS);
+			const catalogPath = string(sharedRaw.catalog);
+			const sharedId = string(sharedRaw.store);
+			if (!isAbsolute(catalogPath) || !STORE_NAME.test(sharedId)) throw new DatastoreError("CONFIG_INVALID");
+			const catalog = await loadSharedCatalog(catalogPath);
+			const defined = catalog.stores.get(sharedId);
+			if (!defined) throw new DatastoreError("CONFIG_INVALID");
+			stores.set(name, {
+				name, configuredRoot: defined.root, root: defined.root, rootWasSymlink: false, rootDev: defined.rootDev, rootIno: defined.rootIno,
+				include: defined.include, exclude: defined.exclude, maxFileBytes: defined.maxFileBytes, search: defined.search,
+				shared: { catalog: catalog.path, store: sharedId, socketPath: catalog.socketPath, definitionRevision: defined.definitionRevision },
+			});
+			continue;
+		}
+		exactKeys(storeRaw, STORE_KEYS);
 		const configuredRoot = string(storeRaw.root);
 		const rootInput = isAbsolute(configuredRoot) ? configuredRoot : resolve(projectRoot, configuredRoot);
 		const rootLstat = await lstat(rootInput).catch(() => { throw new DatastoreError("CONFIG_INVALID"); });

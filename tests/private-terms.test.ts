@@ -61,6 +61,41 @@ test("hooks refuse private terms in staged files, messages and pushes", () => {
 		assert.match(all.stderr, /existing\.md:1: matches/);
 		ok("push", "-q", "--no-verify", "origin", "main");
 
+		ok("switch", "-q", "-c", "feature");
+		ok("commit", "-q", "--allow-empty", "-m", "Clean feature");
+		ok("push", "-q", "origin", "feature");
+		ok("switch", "-q", "main");
+		writeFileSync(join(repo, "accepted-main.md"), "Example Person\n");
+		ok("add", "accepted-main.md");
+		ok("commit", "-q", "--no-verify", "-m", "Accepted main Example Person");
+		ok("push", "-q", "--no-verify", "origin", "main");
+		ok("switch", "-q", "feature");
+		ok("merge", "-q", "--no-verify", "--no-ff", "origin/main", "-m", "Merge accepted main");
+		const updated = run("push", "-q", "origin", "feature");
+		assert.equal(updated.status, 0, `published main history must not block the feature: ${updated.stderr}`);
+		const cleanFeature = run("rev-parse", "HEAD").stdout.trim();
+		for (const kind of ["message", "line"]) {
+			if (kind === "line") {
+				writeFileSync(join(repo, "feature-leak.md"), "Example Person\n");
+				ok("add", "feature-leak.md");
+			}
+			ok("commit", "-q", "--no-verify", "--allow-empty", "-m", kind === "message" ? "Feature Example Person" : "Feature line");
+			const refused = run("push", "-q", "origin", "feature");
+			assert.notEqual(refused.status, 0, `feature ${kind} must still be checked`);
+			assert.match(refused.stderr, kind === "message" ? /message:1: matches/ : /feature-leak\.md:1: matches/);
+			ok("reset", "-q", "--hard", cleanFeature);
+		}
+		ok("commit", "-q", "--allow-empty", "-m", "Ordinary feature update");
+		ok("push", "-q", "origin", "feature");
+		const newBase = run("rev-parse", "HEAD").stdout.trim();
+		ok("switch", "-q", "-c", "new-feature");
+		ok("commit", "-q", "--no-verify", "--allow-empty", "-m", "New branch Example Person");
+		assert.notEqual(run("push", "-q", "origin", "new-feature").status, 0, "new branch leak must still fail");
+		ok("reset", "-q", "--hard", newBase);
+		ok("commit", "-q", "--allow-empty", "-m", "Clean new branch");
+		ok("push", "-q", "origin", "new-feature");
+		ok("switch", "-q", "main");
+
 		writeFileSync(join(repo, "leak.md"), "hello\nwritten by example person\n");
 		ok("add", "leak.md");
 		const staged = run("commit", "-q", "-m", "Leaky file");
