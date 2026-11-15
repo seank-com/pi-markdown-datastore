@@ -113,7 +113,7 @@ export class MaintenanceCoordinator {
 		let raw: any;
 		try {
 			const info = await lstat(this.jobsPath);
-			if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0 || info.size > 256 * 1024) throw new DatastoreError("INDEX_CORRUPT");
+			if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) throw new DatastoreError("INDEX_CORRUPT");
 			raw = JSON.parse(await readFile(this.jobsPath, "utf8"));
 		} catch (error: any) {
 			if (error?.code !== "ENOENT") { if (error instanceof DatastoreError) throw error; throw new DatastoreError("INDEX_CORRUPT"); }

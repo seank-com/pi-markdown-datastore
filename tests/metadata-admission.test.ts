@@ -21,6 +21,21 @@ async function fixture(t: TestContext) {
 	return { root, coordinator, releases };
 }
 
+test("admitted metadata paths survive a ledger larger than the former read-size ceiling", async (t) => {
+	const { root, coordinator } = await fixture(t);
+	const paths = Array.from({ length: 5000 }, (_, index) => `notes/${String(index).padStart(5, "0")}-${"a".repeat(60)}.md`);
+	coordinator.notePaths("a", paths);
+	const receipt = await coordinator.enqueue("metadata", ["a"], "explicit-maintenance");
+	coordinator.shutdown();
+	await coordinator.settled();
+	assert.ok((await readFile(join(root, "jobs.json"))).byteLength > 256 * 1024, "exercise the former read-only ceiling");
+	const restored = new MaintenanceCoordinator(join(root, "jobs.json"), () => new Set(["a", "b"]));
+	t.after(async () => { restored.shutdown(); await restored.settled(); });
+	await restored.ensureLoaded();
+	assert.deepEqual(restored.get(String(receipt.refreshId))?.paths, paths);
+	assert.equal(restored.get(String(receipt.refreshId))?.state, "queued");
+});
+
 test("paths arriving during initial admission are covered by their durable receipt", async (t) => {
 	const { root, coordinator, releases } = await fixture(t);
 	let release!: () => void;
