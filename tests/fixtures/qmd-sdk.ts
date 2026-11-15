@@ -1,12 +1,12 @@
 /** Public SDK contract fixture: no backend private exports or internal handles. */
-import { existsSync, readFileSync, readdirSync, writeFileSync, appendFileSync, watch } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync, appendFileSync, renameSync, watch } from 'node:fs';
 import { dirname, join } from 'node:path';
 type Doc={path:string;text:string};
 export async function createStore({dbPath,config}:any) {
  const root=dirname(dbPath).endsWith('/backend')?dirname(dirname(dbPath)):dirname(dbPath),log=(event:string)=>appendFileSync(join(root,'calls.log'),event+'\n');
  let closed=false;log('open');
  const read=():any=>existsSync(dbPath)?JSON.parse(readFileSync(dbPath,'utf8')):{collections:{},pending:0,vector:false};
- const save=(state:any)=>writeFileSync(dbPath,JSON.stringify(state));
+ const save=(state:any)=>{const next=dbPath+'.writing-'+process.pid;writeFileSync(next,JSON.stringify(state));renameSync(next,dbPath);};
  const behavior=()=>existsSync(join(root,'behavior.json'))?JSON.parse(readFileSync(join(root,'behavior.json'),'utf8')):{};
  const gate=async(operation:string)=>{const name=behavior()[operation+'Gate'];if(!name)return;await new Promise<void>((resolve,reject)=>{const released=join(root,name+'.release');const watcher=watch(root,()=>{if(existsSync(released)){watcher.close();resolve();}});watcher.on('error',error=>{watcher.close();reject(error);});writeFileSync(join(root,name+'.entered'),'');if(existsSync(released)){watcher.close();resolve();}});};
  const scan=(root:string,prefix=''):Doc[]=>readdirSync(join(root,prefix),{withFileTypes:true}).flatMap(e=>{const path=prefix?prefix+'/'+e.name:e.name;return e.isDirectory()?scan(root,path):e.isFile()&&path.endsWith('.md')?[{path,text:readFileSync(join(root,path),'utf8')}]:[];});
