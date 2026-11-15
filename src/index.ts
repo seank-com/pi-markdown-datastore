@@ -10,7 +10,7 @@ import {
 	type MarkdownDatastoreRequest, type MarkdownDatastoreResult, type MarkdownDatastoreRpcEnvelope,
 	type ReadInput, type RefreshInput,
 } from "./contract.ts";
-import { loadMarkdownDatastoreConfig, projectDatastoreConfigPath } from "./config.ts";
+import { configuredStoreNames, loadMarkdownDatastoreConfig, projectDatastoreConfigPath, type StoreConfig } from "./config.ts";
 import { DatastoreError, datastoreError } from "./errors.ts";
 import { discoverQmdBinding, qmdApplicationDirectory, QmdAdapter } from "./qmd-adapter.ts";
 import { adoptLegacyApplicationJobs, MaintenanceCoordinator, sourceDefinition } from "./maintenance-coordinator.ts";
@@ -19,6 +19,7 @@ import { prepareQmdStateDirectory } from "./qmd-adapter.ts";
 import { MetadataIndex, registerMetadata } from "./metadata-index.ts";
 import { MarkdownDatastoreService } from "./service.ts";
 import { SharedIndexClient } from "./shared-client.ts";
+import { commitSharedStore, onSharedStoreDiscard, rejectSharedStore } from "./root-binding.ts";
 
 export interface MarkdownDatastoreExtensionOptions {
 	projectRoot?: string; configPath?: string;
@@ -129,9 +130,9 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 			const capability: MarkdownDatastoreCapability = {
 				version: 1, contractVersion: MARKDOWN_DATASTORE_CONTRACT_VERSION, policyVersion: 1, resultBudgetVersion: 1 as const,
 				get instanceId() { return generation === ownGeneration ? instanceId : undefined; },
-				get ready() { return generation === ownGeneration && service !== undefined; },
-				get stores() { return generation === ownGeneration && service ? [...service.config.stores.keys()] : []; },
-				get metadata() { return generation === ownGeneration && service ? { links: true as const, backlinks: true as const, tags: true as const } : undefined; },
+				get ready() { return generation === ownGeneration && service !== undefined && !service.config.structuralError; },
+				get stores() { return generation === ownGeneration && service && !service.config.structuralError ? configuredStoreNames(service.config) : []; },
+				get metadata() { return generation === ownGeneration && service && !service.config.structuralError ? { links: true as const, backlinks: true as const, tags: true as const } : undefined; },
 			};
 			pi.events.emit(MARKDOWN_DATASTORE_CAPABILITY_REPLY, { version: 1, requestId: request.requestId, capability });
 		});
@@ -151,6 +152,7 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 		};
 		const dispatch = async (request: MarkdownDatastoreRequest, signal?: AbortSignal): Promise<MarkdownDatastoreResult> => {
 			if (!service) throw unavailable;
+			if (service.config.structuralError) throw service.config.structuralError;
 			switch (request.operation) {
 				case "roots": return service.roots(request.input, signal);
 				case "validateDestination": return service.validateDestination(request.input, signal);
@@ -222,31 +224,82 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 			let config; try { config = await loadMarkdownDatastoreConfig(projectRoot, configPath); } catch (error) { if (generation !== ownGeneration) return; unavailable = datastoreError(error, "CONFIG_INVALID"); ctx.ui.setStatus("markdown-datastore", `datastore: disabled (${unavailable.code})`); return; }
 			if (generation !== ownGeneration) return;
 			const privateStores = [...config.stores.values()].filter((store) => !store.shared);
-			let qmd: QmdAdapter | undefined;
-			const sharedClients = new Map([...config.stores.values()].filter((store) => store.shared).map((store) => [store.name, new SharedIndexClient(store.shared!)]));
-			if (generation !== ownGeneration) { await Promise.allSettled([qmd?.shutdown(), ...[...sharedClients.values()].map((client) => client.shutdown())].filter((operation): operation is Promise<void> => operation !== undefined)); return; }
+			const backends = new Map<string, QmdAdapter>();
+			const sharedClients = new Map<string, SharedIndexClient>();
+			if (generation !== ownGeneration) { await Promise.allSettled([...[...backends.values()].map(adapter => adapter.shutdown()), ...[...sharedClients.values()].map((client) => client.shutdown())].filter((operation): operation is Promise<void> => operation !== undefined)); return; }
 			let ownership;
 			try { await prepareQmdStateDirectory(config.stateRoot); ownership = await acquireIndexOwnership(config.stateRoot); }
 			catch (error) { if (generation !== ownGeneration) return; unavailable = datastoreError(error, "STORE_UNAVAILABLE"); ctx.ui.setStatus("markdown-datastore", `datastore: disabled (${unavailable.code})`); return; }
 			if (generation !== ownGeneration) { await ownership.release(); return; }
 			const jobsPath = join(config.stateRoot, "jobs.json");
-			const qmdConfig = { ...config, stores: new Map(privateStores.map((store) => [store.name, store])) };
-			try { await adoptLegacyApplicationJobs(config.stateRoot, jobsPath, new Set(privateStores.map((store) => store.name)), (version) => qmdApplicationDirectory(qmdConfig, version), (job, version) => sourceDefinition(job.stores.map((name) => qmdConfig.stores.get(name)!), job.mode === "metadata" ? undefined : { version })); }
-			catch (error) { await ownership.release(); if (generation !== ownGeneration) return; unavailable = datastoreError(error, "INDEX_CORRUPT"); ctx.ui.setStatus("markdown-datastore", `datastore: disabled (${unavailable.code})`); return; }
-			const coordinator = new MaintenanceCoordinator(jobsPath, () => new Set(config.stores.keys()), (job) => sourceDefinition(job.stores.map((name) => config.stores.get(name)!), job.mode === "metadata" || !qmd ? undefined : { version: qmd.binding.version }));
-			if (config.qmd.enabled && privateStores.length) try { qmd = await (options.createQmd ?? createQmd)({ ...config, stores: new Map(privateStores.map((store) => [store.name, store])) }, coordinator); } catch {}
-			const indexes = new Map(privateStores.map((store) => [store.name, new MetadataIndex(join(config.stateRoot, `metadata-${store.name}`))]));
-			if (indexes.size) registerMetadata(coordinator, indexes, config.stores);
-			const abandon = async () => { coordinator.shutdown(); await coordinator.settled(); await qmd?.shutdown(); await Promise.all([...sharedClients.values()].map((client) => client.shutdown())); await ownership.release(); };
-			try { await coordinator.ensureLoaded(); }
+			const privateNames = config.privateStoreNames ?? new Set(privateStores.map(store => store.name));
+			const admitHistory = async () => {
+				const complete = [...privateNames].every(name => config.stores.has(name));
+				const qmdConfig = { ...config, stores: new Map([...privateNames].filter(name => config.stores.has(name)).map(name => [name, config.stores.get(name)!])) };
+				await adoptLegacyApplicationJobs(config.stateRoot, jobsPath, privateNames,
+					version => complete ? qmdApplicationDirectory(qmdConfig, version) : undefined,
+					(job, version) => sourceDefinition(job.stores.map(name => qmdConfig.stores.get(name)!), job.mode === "metadata" ? undefined : { version }));
+			};
+			const coordinator = new MaintenanceCoordinator(jobsPath, () => new Set(configuredStoreNames(config)), (job) => {
+				if (config.structuralError) return undefined;
+				const stores = job.stores.map(name => config.stores.get(name));
+				if (stores.some(store => !store)) return undefined;
+				const version = job.mode === "metadata" ? undefined : backends.get(job.stores[0])?.binding.version;
+				if (job.mode !== "metadata" && (!version || job.stores.some(name => backends.get(name)?.binding.version !== version))) return undefined;
+				return sourceDefinition(stores as StoreConfig[], version ? { version } : undefined);
+			}, admitHistory);
+			const indexes = new Map<string, MetadataIndex>();
+			const initializing = new Map<string, Promise<void>>();
+			const onStore = (store: StoreConfig): Promise<void> => {
+				const pending = initializing.get(store.name); if (pending) return pending;
+				const operation = (async () => {
+					if (generation !== ownGeneration) throw new DatastoreError("CANCELLED");
+					if (store.shared) {
+						if (!sharedClients.has(store.name)) {
+							const client = new SharedIndexClient(store.shared, { attached: () => commitSharedStore(store), rejected: () => rejectSharedStore(store) });
+							sharedClients.set(store.name, client);
+							onSharedStoreDiscard(store, () => { if (sharedClients.get(store.name) === client) sharedClients.delete(store.name); void client.shutdown(); });
+						}
+						return;
+					}
+					if (indexes.has(store.name)) return;
+					indexes.set(store.name, new MetadataIndex(join(config.stateRoot, `metadata-${store.name}`)));
+					registerMetadata(coordinator, indexes, config.stores);
+					if (config.qmd.enabled) try {
+						const adapter = await (options.createQmd ?? createQmd)({ ...config, stores: new Map([[store.name, store]]), unavailableStores: undefined }, coordinator);
+						if (generation !== ownGeneration) { await adapter.shutdown(); throw new DatastoreError("CANCELLED"); }
+						backends.set(store.name, adapter);
+					} catch (error) { if (generation !== ownGeneration) throw error; }
+				})();
+				initializing.set(store.name, operation);
+				void operation.finally(() => initializing.delete(store.name)).catch(() => undefined);
+				return operation;
+			};
+			const abandon = async () => { coordinator.shutdown(); await Promise.allSettled(initializing.values()); await coordinator.settled(); await Promise.all([...backends.values()].map(adapter => adapter.shutdown())); await Promise.all([...sharedClients.values()].map((client) => client.shutdown())); await ownership.release(); };
+			const loadMaintenance = async () => {
+				try { await coordinator.ensureLoaded(); return true; }
+				catch (error) { if (error instanceof DatastoreError && error.code === "STORE_UNAVAILABLE" && error.details?.sourceIdentityPending === true) return false; throw error; }
+			};
+			let maintenanceReady: boolean;
+			try { maintenanceReady = await loadMaintenance(); }
 			catch (error) { await abandon(); if (generation !== ownGeneration) return; unavailable = datastoreError(error, "INDEX_CORRUPT"); ctx.ui.setStatus("markdown-datastore", `datastore: disabled (${unavailable.code})`); return; }
+			if (generation !== ownGeneration) { await abandon(); return; }
+			try { for (const store of config.stores.values()) await onStore(store); }
+			catch (error) { await abandon(); if (generation !== ownGeneration) return; throw error; }
 			if (generation !== ownGeneration) { await abandon(); return; }
 			coordinator.relaunchQueued();
 			if (generation !== ownGeneration) { await abandon(); return; }
-			service = new MarkdownDatastoreService(config, undefined, qmd, sharedClients);
+			service = new MarkdownDatastoreService(config, undefined, undefined, sharedClients, backends, async store => {
+				await onStore(store);
+				if (generation !== ownGeneration) throw new DatastoreError("CANCELLED");
+				if (!await loadMaintenance()) return;
+				if (generation !== ownGeneration) throw new DatastoreError("CANCELLED");
+				coordinator.relaunchQueued();
+				for (const [name, backend] of backends) void backend.startupReconcile([config.stores.get(name)!]).catch(() => undefined);
+			});
 			service.bindMetadata(coordinator, indexes, ownership);
 			if (generation !== ownGeneration) { const abandoned = service; service = undefined; await abandoned.shutdown(); return; }
-			if (qmd) void qmd.startupReconcile(privateStores).catch(() => undefined);
+			if (maintenanceReady) for (const [name, backend] of backends) void backend.startupReconcile([config.stores.get(name)!]).catch(() => undefined);
 			ctx.ui.setStatus("markdown-datastore", "datastore: ready");
 		});
 		pi.on("session_shutdown", async (_event, ctx) => { generation += 1; removeRpc(); capabilityUnsubscribe?.(); capabilityUnsubscribe = undefined; const current = service; service = undefined; await current?.shutdown(); ctx.ui.setStatus("markdown-datastore", undefined); });

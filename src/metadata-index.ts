@@ -297,6 +297,8 @@ export async function reconcileChanged(coordinator: MaintenanceCoordinator, inde
 	for (const [name, store] of stores) {
 		if (store.shared) continue;
 		const index = indexes.get(name); if (!index) continue;
+		try {
+		await assertRootIdentity(store);
 		const snapshot = await index.snapshot();
 		const changed: string[] = []; const seen = new Set<string>();
 		await walkSafeNoteMetadata(store, (note) => { seen.add(note.note.path); const prior = snapshot?.files[note.note.path]; if (!prior || prior.mtime !== note.mtime) changed.push(note.note.path); });
@@ -308,11 +310,12 @@ export async function reconcileChanged(coordinator: MaintenanceCoordinator, inde
 			const receipt = await coordinator.enqueue("metadata", [name], "startup-reconciliation");
 			await coordinator.persisted(String(receipt.refreshId));
 		}
-		if (coordinator.qmdDirty(name) && coordinator.hasRunner("lexical")) {
+		if (coordinator.qmdDirty(name) && coordinator.hasRunner("lexical", name)) {
 			const lexical = await coordinator.enqueue("lexical", [name], "startup-reconciliation");
 			await coordinator.persisted(String(lexical.refreshId));
 			if (coordinator.get(String(lexical.refreshId))?.state === "succeeded") coordinator.clearQmd(name);
 		}
+		} catch (error) { if (!(error instanceof DatastoreError) || error.code !== "STORE_UNAVAILABLE") throw error; }
 	}
 }
 export function registerMetadata(coordinator: MaintenanceCoordinator, indexes: Map<string, MetadataIndex>, stores: ReadonlyMap<string, StoreConfig>): void {

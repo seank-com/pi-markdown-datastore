@@ -6,7 +6,7 @@ import { adoptLegacyApplicationJobs, MaintenanceCoordinator, sourceDefinition } 
 import { MetadataIndex, registerMetadata, reconcileChanged, pageRendered, continuationOffset, continuationToken, tagCandidate } from "./metadata-index.ts";
 import type { MarkdownDatastoreConfig, StoreConfig } from "./config.ts";
 import { clampReadBudget } from "./config-common.ts";
-import { validateRelativeContainedPath } from "./containment.ts";
+import { assertRootIdentity, validateRelativeContainedPath } from "./containment.ts";
 import { DatastoreError } from "./errors.ts";
 import { loadSharedCatalog, type SharedCatalog, type SharedStoreDefinition } from "./shared-catalog.ts";
 import { attachSharedParser, encodeSharedMessage, generationId, listenOwnedSocket, parseSharedRequest, type SharedCall, type SharedHello, type SharedReply } from "./shared-ipc.ts";
@@ -47,16 +47,27 @@ export async function startSharedHost(catalogPath: string, options: { schedule?:
 		const currentServer = server;
 		const stopped = currentServer ? new Promise<void>((resolve, reject) => currentServer.close(error => error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING" ? reject(error) : resolve())) : Promise.resolve();
 		for (const socket of sockets) socket.destroy();
+		await Promise.allSettled(initializing.values());
 		for (const coordinator of coordinators.values()) coordinator.shutdown();
 		await Promise.all([...coordinators.values()].map((coordinator) => coordinator.settled()));
 		await Promise.all([...ownerships.values()].map((ownership) => ownership.release()));
 		await Promise.all([stopped, ...[...adapters.values()].map(adapter => adapter.shutdown())]);
 	})();
-	try {
-		// Admission precedes endpoint changes; no workers or reconciliation run yet.
-		for (const definition of catalog.stores.values()) {
-			const config = storeConfig(catalog, definition);
+	const initializing = new Map<string, Promise<void>>();
+	const configs = new Map<string, MarkdownDatastoreConfig>();
+	const admit = async (id: string): Promise<void> => {
+		if (closing) throw new DatastoreError("STORE_UNAVAILABLE");
+		const pending = initializing.get(id); if (pending) return pending;
+		const operation = (async () => {
+			const definition = catalog.stores.get(id) ?? await catalog.unavailableStores.get(id)?.();
+			if (!definition) throw new DatastoreError("STORE_UNKNOWN");
+			let config = configs.get(id);
+			if (!config) { config = storeConfig(catalog, definition); configs.set(id, config); }
+			await assertRootIdentity(config.stores.get(id)!).catch(() => { throw new DatastoreError("STORE_UNAVAILABLE", { sourceRoot: true }); });
+			if (coordinators.has(id)) return;
+			if (closing) throw new DatastoreError("STORE_UNAVAILABLE");
 			let coordinator!: MaintenanceCoordinator;
+			try {
 			const stateDirectory = `${catalog.stateRoot}/${definition.id}`;
 			await prepareQmdStateDirectory(stateDirectory);
 			ownerships.set(definition.id, await acquireIndexOwnership(stateDirectory));
@@ -76,7 +87,23 @@ export async function startSharedHost(catalogPath: string, options: { schedule?:
 			registerMetadata(coordinator, new Map([[definition.id, index]]), config.stores);
 			coordinator.startCycle(() => reconcileChanged(coordinator, new Map([[definition.id, index]]), config.stores), undefined, options.schedule);
 			await coordinator.ensureLoaded();
+			if (closing) throw new DatastoreError("STORE_UNAVAILABLE");
 			coordinator.relaunchQueued();
+			if (server) { const adapter = adapters.get(id); if (adapter) void adapter.startupReconcile([...config.stores.values()]).catch(() => undefined); }
+			} catch (error) {
+				coordinator?.shutdown(); await coordinator?.settled();
+				await adapters.get(id)?.shutdown(); await ownerships.get(id)?.release();
+				coordinators.delete(id); metadata.delete(id); adapters.delete(id); ownerships.delete(id);
+				throw error;
+			}
+		})();
+		initializing.set(id, operation);
+		try { await operation; } finally { initializing.delete(id); }
+	};
+	try {
+		// Admit only bound members before endpoint publication. Missing members are admitted on demand.
+		for (const definition of catalog.stores.values()) {
+			try { await admit(definition.id); } catch (error) { if (!(error instanceof DatastoreError) || error.code !== "STORE_UNAVAILABLE" || error.details?.sourceRoot !== true) throw error; }
 		}
 		server = await listenOwnedSocket(catalog.socketPath, (socket) => {
 		sockets.add(socket);
@@ -96,6 +123,7 @@ export async function startSharedHost(catalogPath: string, options: { schedule?:
 		}, () => socket.destroy());
 		const handle = async (message: SharedHello | SharedCall): Promise<void> => {
 			if (message.version !== 1 || typeof message.store !== "string" || typeof message.definitionRevision !== "string") throw new DatastoreError("CONFIG_INVALID");
+			await admit(message.store);
 			const definition = catalog.stores.get(message.store);
 			const adapter = adapters.get(message.store);
 			const index = metadata.get(message.store);

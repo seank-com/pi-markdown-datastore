@@ -37,6 +37,78 @@ symlink entries rather than following them and refuse selected hard-linked notes
 Source permissions and bytes are never rewritten, moved, or repaired. Exact paths
 and canonical datastore URIs identify notes.
 
+### Store availability and recovery
+
+`config` and `shared-catalog` validate configuration structure independently of
+source-root liveness. `root-binding` distinguishes a missing/unreachable root
+from schema, permission, symlink and present non-directory errors. Structural
+errors fail configuration load; an unavailable catalog file defers only its
+references until the file can first be read. A structurally invalid catalog,
+including one first read after recovery, fails project operations rather than
+granting partial authority. Parsed project and catalog definitions are not
+hot-reloaded by recovery.
+
+A store is unbound until full root/ancestry validation can capture its real
+canonical directory and device/inode. Unbound stores have no source definition,
+shared definition revision, backend or newly admitted job. The next operation
+for that store retries binding, with concurrent first requests sharing admission
+and no cached failure, background retry timer or retry count. A private binding never rewrites its captured identity. Shared client observations
+remain provisional until a successful direct read/find, direct root refresh,
+complete policy result, or host hello commits the exact source object used.
+Direct and policy use do not require a live shared service. A rejected first
+attachment can discard only a still-provisional observation; its next request
+fully restats the root without re-reading parsed definitions. An in-flight source
+or policy observation prevents discard until its outcome is known. Success
+commits that object. A failed source/policy observation discards an uncommitted
+capture once no in-flight observer still holds it, even without a host response.
+It cannot discard another observation's successfully committed object. Once committed,
+the identity is never rewritten for the session, even if a host disagrees.
+An absent committed root remains unavailable; returning with the same identity
+restores access. A replacement or unsafe alias remains unavailable until an
+explicit configuration/session change.
+Private duplicate roots fail initial load; a late duplicate does not bind and
+does not disable siblings. Independent shared definitions may still deliberately
+index the same root.
+
+`service` admits the selected store before reads/search/maintenance. Store-scoped
+operations on unavailable roots return `STORE_UNAVAILABLE`. Status includes an
+unavailable capability entry for each affected store; unscoped refresh operates
+on healthy stores and returns store-specific warnings. If no requested root is
+available, refresh fails. Root and destination policy remain complete-scope,
+fail-closed operations: one unavailable root rejects the entire policy result.
+The common maintenance cycle skips unavailable stores without clearing dirty
+work or stopping inventory for healthy stores.
+
+`index` constructs one immutable qmd binding per bound private store, lazily for
+stores that return after startup. `MaintenanceCoordinator` routes backend work
+by store while preserving one application queue, serial execution, cancellation
+and existing receipt/source-definition checks, including multi-store receipts.
+A receipt spanning independent indexes succeeds only when all its routed work
+succeeds and has no single index generation. Partial native success remains
+per-store freshness, not a rollback promise. A missing runner leaves its receipt
+queued until the matching backend is available, without replaying against a
+substitute definition.
+Old combined private qmd directories are not migrated or edited; the separate
+bindings build their own derived indexes from source. Common metadata and the
+stable ledger keep their existing paths. Strict legacy-ledger adoption still
+requires a proven historical source identity. If a stable ledger is absent and
+historical jobs exist while a private identity is unbound, queue loading and new
+maintenance wait with `STORE_UNAVAILABLE`; healthy direct reads and status remain
+available. The next store operation retries that provenance gate after binding.
+No partial fingerprint is called corrupt, no fresh ledger replaces unresolved
+history, and no historical file is changed. With all identities known, normal
+strict adoption resumes. An actual identity mismatch still fails compatibility
+validation rather than guessing a migration.
+
+`shared-host` admits healthy catalog members before listening and admits an
+initially unavailable member on its next request, single-flight. Failed lazy admission releases its partial coordinator, backend and ownership
+before a subsequent request can retry. The host checks
+its captured identity on subsequent requests. Client and host revisions must
+still agree; an existing host identity is never replaced to satisfy a new client.
+A dead shared service is a separate operator-managed liveness failure; clients
+do not start it. Committed root identities are captured for the process/session lifetime,
+not persisted as a new authority registry across restarts.
+
 The normal include pattern is `**/*.md`. Existing include/exclude patterns select
 scanning and indexing, not access control: exact direct find/read can access
 otherwise valid Markdown excluded from those selections. The configured root is
@@ -181,7 +253,7 @@ additional encountered restrictions rather than assuming this list is exhaustive
 | Configuration size 64 KiB/mode `0600` and canonical configured root/file identity, link, type and UTF-8 checks. Locations: `src/config.ts`, source access helpers. | Enforces the described namespace/configuration authority contract while keeping source unchanged. Specific mode/path-exclusion approval references remain unestablished; same-account processes are not new hostile principals. |
 | File 10 MiB, search 20 results, backend candidates 500, outline 100 entries; continuation registry 256 entries/15 minutes. Locations: configuration, search/read and continuation code. Omitted result byte/line budgets are unbounded. An explicit configured or caller budget is honored and is not a hidden maximum. Approval for the remaining numeric limits is not established. | Prevents unbounded source reads and unbounded candidate selection. It does not authorize a result-size ceiling. |
 | Configured reader operation timeout 100-60,000 ms; service ceiling 900,000 ms; client default 900,000 ms and allowed range 1-900,000 ms; maintenance update/embed deadline 35 minutes. Locations: config, service, client and qmd lifecycle code. | Aborts work under different queue/execution scopes described below. These are our chosen envelopes, not automatic approval from qmd/Pi. Numeric approval remains missing; a durable refresh receipt is not completed maintenance. |
-| Two supervised workers, serial maintenance, maintenance semantic-admission drain; idle exit 5 minutes with injected range 25-300,000 ms; automatic semantic batching 5 minutes. Locations: qmd adapter/worker clients. | Implements the described coordination/model-release behavior. Concurrency, cadence and idle values require explicit approval evidence, not inference from dependency defaults. |
+| Two supervised workers per immutable qmd index (one index per bound private store or shared definition), common serial maintenance, maintenance semantic-admission drain; idle exit 5 minutes with injected range 25-300,000 ms; automatic semantic batching 5 minutes. Locations: qmd adapter/worker clients. | Implements the described coordination/model-release behavior. Concurrency, cadence and idle values require explicit approval evidence, not inference from dependency defaults. |
 | Worker diagnostic stderr 1 MiB, cancellation TERM 100 ms/KILL 250 ms. Location: `src/qmd-worker-client.ts`. Request and result frames are not rejected for size. | The stderr cap and kill escalation remain. Their approval is not established. They are not result budgets. |
 | Metadata preflight 100,000 documents/512 MiB; latest 20 job records subject to active-job bound. Location: `src/qmd-adapter.ts` and maintenance state. | Limits scan/admission metadata and retained receipts, not transactional index correctness. Numeric rationale/approval remain unestablished. |
 | Default test child 300,000 ms; package outer 60,000 ms/subprocess 30,000 ms; facade cases 5,000 ms; worker/CLI subprocess 10,000 ms and CLI capture 1 MiB; opt-in native cases 90,000 ms/180,000 ms. Locations: `scripts/test.ts`, package/facade/qmd/worker/CLI tests. | Functional qualification can fail solely because a host/backend is slow or verbose. Fixture/opt-in status and green tests do not establish owner approval for these budgets. |
@@ -196,6 +268,7 @@ additional encountered restrictions rather than assuming this list is exhaustive
 | Embed extraction rejects more than 500 image/wikilink embed references in one note, before downstream selection. Location: `extractEmbedTargets`, `src/markdown.ts`; fixed by the component. | Limits the extracted reference list and can reject an otherwise readable note. Specific numeric necessity and owner approval are not established; this is separate from the 500 search-candidate bound. Recorded during the owner-directed cap review on 2026-11-15, not newly approved. |
 | Qmd adapter snapshot metadata reader accepts at most 65,536 bytes. Location: `QmdAdapter.prepare`, `src/qmd-adapter.ts`, reading `reconciliation.json`; fixed by the component. | Caps bytes parsed for the adapter's fixed-shape snapshot. The producer/consumer shape has not demonstrated the growing path-list mismatch seen in the stable ledger, but numeric necessity and approval remain unestablished. This is not a qmd-native database or result-frame limit. |
 | Frontmatter depth 8, 1,000 nodes, 16 KiB strings, and 10 YAML aliases. Location: `src/markdown.ts`. Exceeding one fails the note as `FRONTMATTER_INVALID`. | Bounds YAML walked while parsing notes. Issue #2 surfaced these inherited values. This table records them. It does not approve them. |
+| Per-store outage containment, demand-driven first binding and immutable captured identities. Locations: `root-binding`, `config`, `shared-catalog`, `service`, `index` and `shared-host`. Approved scope: issue #14; Sean explicitly selected next-operation recovery on 2026-11-15. Root liveness includes ENOENT, EIO, ETIMEDOUT, ESTALE, ENODEV, ENXIO and network-down/unreachable errors; EACCES, EPERM, ELOOP and present non-directories are not liveness. No recovery deadline, retry count or timer is introduced. | Prevents one failed mount or combined private backend binding disabling unrelated healthy stores, without assigning placeholder identities or silently adopting replacement roots. Shared-client first observations remain provisional until successful direct/policy use or host attachment; rejected observations cannot overwrite a committed identity. Unresolved legacy provenance blocks queue admission, not healthy direct access. Complete root/destination policy still rejects incomplete authority scope. Per-store backend ownership, rather than a new worker concurrency cap, provides isolation; source review precedes activation. |
 | One maintenance owner per derived index, independent of IPC path. Protected ownership directory `0700`, records `0600`; live or unverifiable owner/worker PIDs refuse admission. Locations: `src/index-ownership.ts`, `QmdAdapter`, native-worker registration. | Approved single-index ownership and operator restart without manual dead-owner cleanup, issue #4 and the owner's 2026-11-12 recovery decision. Atomic nonempty-directory admission prevents simultaneous reclaimers replacing one another. Only proven-dead process records are reclaimed; no lease timer, election, process killing or autostart. PID reuse is conservatively treated as live, not guessed dead. |
 
 ## Public qmd lifecycle
@@ -208,8 +281,8 @@ The documented CLI `search --format json --full-path` is also exercised by
 compatibility tests. No runtime path recovery through the CLI is needed for this
 SDK release.
 
-Two lazily created supervised processes share one durable index: one search
-worker and one maintenance worker. Each owns its public store for its lifetime
+Each bound store's qmd adapter has two lazily created supervised processes
+sharing its durable index: one search worker and one maintenance worker. Each owns its public store for its lifetime
 and calls public `close()` on idle/shutdown. Five-minute idle exit releases
 models; reopening retains native on-disk state. Search reuses this durable index.
 qmd controls cache reuse, pruning and update invalidation. Explicit refresh may
@@ -317,7 +390,7 @@ The service runs with `--catalog` under operator control, either manually or thr
 
 `src/index-ownership.ts` admits one owning maintenance unit for the actual derived index before the host changes its endpoint or starts reconciliation. A different catalog or socket does not bypass that guard. A complete, nonempty ownership generation is published atomically. Native workers register before SDK access; a surviving worker prevents a replacement owner even after its parent has exited. Graceful shutdown stops requests/workers, persists receipts and releases ownership. After an unclean exit, an operator-started replacement reclaims proven-dead records and uses the same interrupted-job reconciliation. Live or unverifiable process identity remains unavailable rather than being killed or silently replaced. The component does not restart itself or launch a replacement on client connection; the operator manages startup and restart, including the optional login LaunchAgent.
 
-Private stores use the same coordinator, metadata index, and admission algorithm. Qmd, when present, is a backend on that coordinator, not a second owner of the metadata directory. Search validation, aggregate budgets/warnings and status readiness use common private/shared paths; receipts and reconciliation present the project's local store aliases while underlying refresh IDs and queue keys remain canonical.
+Private stores use the same coordinator, metadata index, and admission algorithm. Each bound private store has its own qmd adapter when available; scoped backend runners share the project's common coordinator, not separate application queues or metadata owners. Search validation, aggregate budgets/warnings and status readiness use common private/shared paths; receipts and reconciliation present the project's local store aliases while underlying refresh IDs and queue keys remain canonical.
 
 ## Integration lifecycle and packaging
 
@@ -376,8 +449,10 @@ and runtime validation.
 
 All six model-facing tools and the event responder register independently of
 configuration success. Configuration/backend construction occurs in
-`session_start` after project trust. Missing/invalid configuration disables
+`session_start` after project trust. Missing/structurally invalid configuration disables
 operation, not visibility: calls retain the actual configuration error code.
+Root liveness failures leave the service and healthy stores available, including
+when roots are absent at startup; discovery lists all configured aliases.
 Untrusted projects fail with `PROJECT_UNTRUSTED` without loading configuration or
 starting a backend. Optional qmd failure does not disable valid direct operations.
 Consumers query during Pi's `resources_discover`, which runs after all start handlers and works in either load order without retry timers. Earlier

@@ -152,7 +152,8 @@ test("a live owner socket is not replaced and a public parent is refused", async
 
 test("private and shared search validation emit the same warnings", async () => {
 	const root = await realpath(await mkdtemp(join(tmpdir(), "datastore-parity-")));
-	const store = { name: "notes", root, configuredRoot: root, rootWasSymlink: false, rootDev: 0, rootIno: 0, include: ["**/*.md"], exclude: [], maxFileBytes: 4096, search: { defaultMode: "hybrid" as const, qmdCollection: "notes" } };
+	const identity = await lstat(root);
+	const store = { name: "notes", root, configuredRoot: root, rootWasSymlink: false, rootDev: identity.dev, rootIno: identity.ino, include: ["**/*.md"], exclude: [], maxFileBytes: 4096, search: { defaultMode: "hybrid" as const, qmdCollection: "notes" } };
 	const config: any = { schemaVersion: 1, projectRoot: root, configPath: join(root, "config.json"), stateRoot: join(root, "state"), defaults: { maxResultBytes: 8192, maxResultLines: 100, operationTimeoutMs: 3000 }, qmd: { enabled: true }, stores: new Map([["notes", store]]) };
 	const backend = { candidates: [], rejectedCandidates: 1, manifest: { stores: {}, pendingEmbeddings: 0, semanticAt: undefined, hasVectorIndex: false }, generation: "gen-" + "a".repeat(32), requestedMode: "hybrid", effectiveMode: "lexical", embeddingActive: true, queueMs: 0, operationMs: 0 };
 	const local: any = { binding: { version: "fixture" }, activity: () => ({ embeddingActive: true }), isLexicallyCurrent: () => false, search: async () => backend, shutdown: async () => undefined };

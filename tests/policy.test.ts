@@ -100,7 +100,10 @@ test("a new ancestor alias cannot preserve access merely by preserving the root 
   await assert.rejects(client.roots({}), code("STORE_UNAVAILABLE"));
   await assert.rejects(client.validateDestination({ path: join(f.base, "outside.md") }), code("STORE_UNAVAILABLE"));
   await assert.rejects(client.read({ note: { store: "notes", path: "one.md" } }), code("STORE_UNAVAILABLE"));
-  await assert.rejects(client.refresh({ mode: "direct" }), code("STORE_UNAVAILABLE"));
+  const refresh = await client.refresh({ mode: "direct" });
+  assert.deepEqual(refresh.data.roots, { shared: "available" });
+  assert.deepEqual(refresh.warnings.map(warning => warning.code), ["STORE_UNAVAILABLE"]);
+  await assert.rejects(client.refresh({ store: "notes", mode: "direct" }), code("STORE_UNAVAILABLE"));
 });
 
 test("missing, invalid and untrusted instances return explicit policy errors", async t => {

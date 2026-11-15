@@ -40,8 +40,16 @@ Write `.pi/markdown-datastore/config.json` with generic store identities. Omit `
 
 Then `chmod 600 .pi/markdown-datastore/config.json`. The config and authority
 parents must be current-user-owned, regular directories/files with the existing
-safe-mode contract. Root directories must exist; relative roots resolve against
-this project, and deliberately configured absolute roots are allowed. Store aliases
+safe-mode contract. Relative roots resolve against
+this project, and deliberately configured absolute roots are allowed. A missing or
+unreachable root leaves only that store unavailable; healthy stores still load.
+The next operation retries full validation without a Pi reload. A returning root
+must match its previously committed identity, if any; a replacement is not silently
+adopted. A shared client's first observation is committed by a successful direct
+read/find, direct root refresh, complete policy result, or shared-host handshake.
+Failed first attachment can discard an unused provisional observation; it cannot
+replace an identity already used successfully, including direct use while the
+shared service is down. Store aliases
 must be unique. Private roots and qmd collections are unique within their
 project-owned backend; shared canonical definitions use independent namespaces. Unknown/duplicate config
 keys are rejected. Roots must name real directories without symlink aliases,
@@ -131,7 +139,9 @@ For example, a catalog can use this shape. The numeric settings repeat the priva
 }
 ```
 
-The source root and the state/socket parents must exist. The host creates and validates its protected state directory without changing source permissions. Keep socket paths within the operating system's native Unix-socket support; an OS path error is not permission to move source files or invent a new application length policy.
+The state/socket parents must be available. An unavailable source root leaves
+that member unbound; the host serves healthy members and admits the returning
+member on its next request. The host creates and validates its protected state directory without changing source permissions. Keep socket paths within the operating system's native Unix-socket support; an OS path error is not permission to move source files or invent a new application length policy.
 
 ### Manual foreground check
 
@@ -209,7 +219,19 @@ The local name may differ from the catalog id. Search and refresh fail while the
 
 A second host cannot claim an already-owned index by selecting a different socket or catalog path. On graceful shutdown, the common maintenance unit closes its workers and releases ownership. After a crash, the operator may run the same foreground command again: proven-dead owner/worker records are reclaimed, interrupted receipts are recovered and reconciliation runs. No manual dead-lock-file deletion or ownership lease timer is required; login startup is the operator's LaunchAgent responsibility, not a client attachment behavior. If a recorded process is still live or cannot be verified dead, startup reports unavailable; inspect ownership rather than deleting its records or automatically killing that process.
 
-Catalog and project definitions are loaded at startup, not hot-reloaded. Deliberate definition changes require reloading the corresponding host/project; changed source-root identities invalidate old attachments rather than silently redirecting them.
+Catalog and project definitions are parsed once, not hot-reloaded. An initially
+unreachable catalog is first parsed when a referenced store is requested after it
+returns. Bad schema, unsafe permissions and unsafe root aliases remain structural
+errors, not reasons to bypass validation. Deliberate definition changes require
+reloading the corresponding host/project; changed source-root identities invalidate
+old attachments rather than silently redirecting them.
+
+Use `datastore_status` to distinguish source-root unavailability from shared-service
+or backend failure. Status reports unavailable capabilities per store. Unscoped
+refresh processes available stores with warnings for unavailable members; a scoped
+refresh fails for its unavailable store. Root/destination policy still fails if any
+configured store cannot be validated. Restoring a source root does not restart a
+dead shared service; that remains an explicitly authorized operator action.
 
 During coordinator-owned semantic maintenance, lexical reads use a separate
 process. Hybrid requests return lexical results with `SEMANTIC_UNAVAILABLE`
@@ -218,7 +240,15 @@ retryable `SEMANTIC_UNAVAILABLE` (embedding underway; try again later). Strict
 freshness still rejects unreconciled state. Run maintenance through this
 coordinator; independently launched writers are not tracked.
 
-Private derived state resides below `.pi/markdown-datastore/state/`; shared state uses the catalog's `stateRoot`. The common ledger and metadata JSON stay at the application state root. Qmd's opaque child directory is specific to its release and configured source identities. Directory/file
+Private derived state resides below `.pi/markdown-datastore/state/`; shared state uses the catalog's `stateRoot`. The common ledger and metadata JSON stay at the application state root. Qmd's opaque child directory is specific to its release and configured source identities.
+Each private store has an independent backend binding beneath the same application
+state root. Older combined private qmd directories are left untouched; the separate
+bindings require source reindexing. The common ledger and metadata paths do not move.
+If the stable ledger is absent and historical jobs need an initially unavailable
+private source identity for provenance, maintenance waits rather than adopting
+with a partial fingerprint or replacing history. Healthy direct reads and status
+remain usable. Restore the source and request that store again so strict adoption
+can complete; historical files stay unchanged. Directory/file
 permissions are 0700/0600. Use qmd to build these indexes from source, rather than
 copying a global index. Search failure does not prevent direct reads. Native
 embedding has qmd's SDK session cap; native update/embed worker requests also

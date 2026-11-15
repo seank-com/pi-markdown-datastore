@@ -28,7 +28,7 @@ export function sourceDefinition(stores: { name: string; root: string; rootDev: 
 	return createHash("sha256").update(JSON.stringify({ stores: [...stores].sort((left, right) => left.name.localeCompare(right.name)).map((store) => ({ name: store.name, root: store.root, rootDev: store.rootDev, rootIno: store.rootIno, include: [...store.include], exclude: [...store.exclude], maxFileBytes: store.maxFileBytes, qmdCollection: backend ? store.search?.qmdCollection : undefined })), backend: backend?.version })).digest("hex");
 }
 
-export async function adoptLegacyApplicationJobs(stateRoot: string, stablePath: string, knownStores: ReadonlySet<string>, expectedDirectory: (version: string) => string, identityFor?: (job: { mode: string; stores: string[] }, version: string) => string): Promise<void> {
+export async function adoptLegacyApplicationJobs(stateRoot: string, stablePath: string, knownStores: ReadonlySet<string>, expectedDirectory: (version: string) => string | undefined, identityFor?: (job: { mode: string; stores: string[] }, version: string) => string): Promise<void> {
 	try { await lstat(stablePath); return; } catch (error: any) { if (error?.code !== "ENOENT") throw error; }
 	const names = await readdir(stateRoot).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return []; throw error; });
 	const matches: { directory: string; path: string }[] = [];
@@ -41,7 +41,9 @@ export async function adoptLegacyApplicationJobs(stateRoot: string, stablePath: 
 		const path = join(directory, "jobs.json");
 		const file = await lstat(path).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? undefined : Promise.reject(error));
 		if (!file) continue;
-		if (directory !== expectedDirectory(parsed[1])) throw new DatastoreError("INDEX_CORRUPT");
+		const expected = expectedDirectory(parsed[1]);
+		if (expected === undefined) throw new DatastoreError("STORE_UNAVAILABLE", { sourceIdentityPending: true });
+		if (directory !== expected) throw new DatastoreError("INDEX_CORRUPT");
 		matches.push({ directory, path });
 	}
 	if (matches.length > 1) throw new DatastoreError("INDEX_CORRUPT");
@@ -65,6 +67,7 @@ export class MaintenanceCoordinator {
 	#persisted = new Map<string, Promise<void>>();
 	#settlePersist = new Map<string, { resolve: () => void; reject: (error: unknown) => void }>();
 	#runners = new Map<Mode, MaintenanceRunner>();
+	#storeRunners = new Map<Mode, Map<string, MaintenanceRunner>>();
 	#loaded = false;
 	#loading?: Promise<void>;
 	#tail: Promise<void> = Promise.resolve();
@@ -79,10 +82,16 @@ export class MaintenanceCoordinator {
 	#cycleFailure?: unknown;
 	readonly jobsPath: string;
 	readonly knownStores: () => ReadonlySet<string>;
-	readonly definitionFor?: (job: { mode: string; stores: string[] }) => string;
-	constructor(jobsPath: string, knownStores: () => ReadonlySet<string>, definitionFor?: (job: { mode: string; stores: string[] }) => string) { this.jobsPath = jobsPath; this.knownStores = knownStores; this.definitionFor = definitionFor; }
-	register(mode: Mode, runner: MaintenanceRunner): void { this.#runners.set(mode, runner); }
-	hasRunner(mode: Mode): boolean { return this.#runners.has(mode); }
+	readonly definitionFor?: (job: { mode: string; stores: string[] }) => string | undefined;
+	readonly beforeLoad?: () => Promise<void>;
+	constructor(jobsPath: string, knownStores: () => ReadonlySet<string>, definitionFor?: (job: { mode: string; stores: string[] }) => string | undefined, beforeLoad?: () => Promise<void>) { this.jobsPath = jobsPath; this.knownStores = knownStores; this.definitionFor = definitionFor; this.beforeLoad = beforeLoad; }
+	register(mode: Mode, runner: MaintenanceRunner, stores?: Iterable<string>): void {
+		if (!stores) { this.#runners.set(mode, runner); return; }
+		const routes = this.#storeRunners.get(mode) ?? new Map<string, MaintenanceRunner>();
+		for (const store of stores) routes.set(store, runner);
+		this.#storeRunners.set(mode, routes);
+	}
+	hasRunner(mode: Mode, store?: string): boolean { return this.#runners.has(mode) || (store ? this.#storeRunners.get(mode)?.has(store) === true : Boolean(this.#storeRunners.get(mode)?.size)); }
 	notePaths(store: string, paths: string[]): void { const set = this.#pendingPaths.get(store) ?? new Set<string>(); for (const path of paths) set.add(path); this.#pendingPaths.set(store, set); }
 	#claimPaths(stores: string[]): string[] { const claimed: string[] = []; for (const store of stores) { const set = this.#pendingPaths.get(store); if (!set) continue; claimed.push(...set); this.#pendingPaths.delete(store); } return [...new Set(claimed)].sort(); }
 	takePaths(store: string): string[] { const set = this.#pendingPaths.get(store); this.#pendingPaths.delete(store); return set ? [...set] : []; }
@@ -110,6 +119,7 @@ export class MaintenanceCoordinator {
 		try { await this.#loading; } finally { this.#loading = undefined; }
 	}
 	private async load(): Promise<void> {
+		await this.beforeLoad?.();
 		let raw: any;
 		try {
 			const info = await lstat(this.jobsPath);
@@ -159,6 +169,7 @@ export class MaintenanceCoordinator {
 		if (this.#closed) throw new DatastoreError("CANCELLED");
 		const ordered = [...stores].sort();
 		const current = this.definitionFor?.({ mode, stores: ordered });
+		if (this.definitionFor && current === undefined) throw new DatastoreError("STORE_UNAVAILABLE");
 		if (definition !== undefined && current !== undefined && definition !== current) throw new DatastoreError("STALE_INDEX");
 		definition ??= current;
 		const key = `${mode}:${ordered.join(",")}${intent === "rebuild" ? ":rebuild" : ""}`;
@@ -210,10 +221,21 @@ export class MaintenanceCoordinator {
 	relaunchQueued(): void { for (const job of this.#jobs.values()) if (job.state === "queued") this.launch(job); }
 	private launch(job: QmdRefreshJob): void {
 		if (this.#closed || this.#controllers.has(job.refreshId) || job.state !== "queued") return;
-		if (this.definitionFor && job.definition !== this.definitionFor(job)) return;
+		if (this.definitionFor) { const current = this.definitionFor(job); if (current === undefined || job.definition !== current) return; }
 		const mode = job.mode;
-		const runner = this.#runners.get(mode);
-		if (!runner) return;
+		let runner = this.#runners.get(mode);
+		if (!runner) {
+			const routes = this.#storeRunners.get(mode);
+			if (!routes || job.stores.some(name => !routes.has(name))) return;
+			runner = async (job, signal, report) => {
+				let result: { generation?: string } | void = undefined;
+				const groups = new Map<MaintenanceRunner, string[]>();
+				for (const name of job.stores) { const route = routes.get(name)!; groups.set(route, [...(groups.get(route) ?? []), name]); }
+				for (const [route, stores] of groups) result = await route({ ...job, stores }, signal, report);
+				// Independent indexes do not share a publication generation.
+				return groups.size === 1 ? result : undefined;
+			};
+		}
 		const controller = new AbortController();
 		this.#controllers.set(job.refreshId, controller);
 		const previous = this.#tail;

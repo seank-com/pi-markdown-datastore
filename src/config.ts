@@ -1,9 +1,10 @@
 import { constants } from "node:fs";
-import { lstat, open, realpath, stat } from "node:fs/promises";
+import { lstat, open, realpath } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { DatastoreError } from "./errors.ts";
-import { loadSharedCatalog } from "./shared-catalog.ts";
+import { definitionRevision, loadSharedCatalog } from "./shared-catalog.ts";
+import { inspectConfiguredRoot, provisionSharedStore } from "./root-binding.ts";
 
 import { assertNoDuplicateJsonKeys, HARD_MAX_FILE_BYTES } from "./config-common.ts";
 export { assertNoDuplicateJsonKeys, clampReadBudget, exceedsBudget, HARD_MAX_CANDIDATES, HARD_MAX_FILE_BYTES, HARD_MAX_OUTLINE, HARD_MAX_SEARCH_RESULTS, resolveResultBudget } from "./config-common.ts";
@@ -22,6 +23,9 @@ export interface StoreConfig {
 export interface MarkdownDatastoreConfig {
 	schemaVersion: 1; projectRoot: string; configPath: string; stateRoot: string; defaults: DatastoreDefaults;
 	qmd: QmdConfig; stores: ReadonlyMap<string, StoreConfig>;
+	unavailableStores?: ReadonlyMap<string, () => Promise<StoreConfig>>;
+	readonly structuralError?: DatastoreError;
+	privateStoreNames?: ReadonlySet<string>;
 }
 
 const TOP_KEYS = new Set(["schemaVersion", "defaults", "qmd", "stores"]);
@@ -143,6 +147,19 @@ export async function loadMarkdownDatastoreConfig(projectRootInput: string, conf
 	const storesRaw = record(top.stores);
 	if (Object.keys(storesRaw).length === 0) throw new DatastoreError("CONFIG_INVALID");
 	const stores = new Map<string, StoreConfig>();
+	const unavailableStores = new Map<string, () => Promise<StoreConfig>>();
+	let structuralError: DatastoreError | undefined;
+	const catalogs = new Map<string, Promise<Awaited<ReturnType<typeof loadSharedCatalog>>>>();
+	const catalogFor = async (path: string) => {
+		let pending = catalogs.get(path);
+		if (!pending) { pending = loadSharedCatalog(path); catalogs.set(path, pending); }
+		try { return await pending; } catch (error) {
+			if (catalogs.get(path) === pending) catalogs.delete(path);
+			if (error instanceof DatastoreError && error.code !== "STORE_UNAVAILABLE") structuralError = error;
+			throw error;
+		}
+	};
+	const privateStoreNames = new Set<string>();
 	const qmdCollections = new Set<string>();
 	const canonicalRoots = new Set<string>();
 	for (const [name, value] of Object.entries(storesRaw)) {
@@ -154,25 +171,33 @@ export async function loadMarkdownDatastoreConfig(projectRootInput: string, conf
 			const catalogPath = string(sharedRaw.catalog);
 			const sharedId = string(sharedRaw.store);
 			if (!isAbsolute(catalogPath) || !STORE_NAME.test(sharedId)) throw new DatastoreError("CONFIG_INVALID");
-			const catalog = await loadSharedCatalog(catalogPath);
-			const defined = catalog.stores.get(sharedId);
-			if (!defined) throw new DatastoreError("CONFIG_INVALID");
-			stores.set(name, {
-				name, configuredRoot: defined.root, root: defined.root, rootWasSymlink: false, rootDev: defined.rootDev, rootIno: defined.rootIno,
-				include: defined.include, exclude: defined.exclude, maxFileBytes: defined.maxFileBytes, search: defined.search,
-				shared: { catalog: catalog.path, store: sharedId, socketPath: catalog.socketPath, definitionRevision: defined.definitionRevision },
-			});
+			const bind = async (): Promise<StoreConfig> => {
+				const existing = stores.get(name); if (existing) return existing;
+				const catalog = await catalogFor(catalogPath);
+				const defined = catalog.stores.get(sharedId) ?? await catalog.unavailableStores.get(sharedId)?.();
+				if (!defined) { structuralError = new DatastoreError("CONFIG_INVALID"); throw structuralError; }
+				const observed = await inspectConfiguredRoot(defined.root).catch(() => { throw new DatastoreError("STORE_UNAVAILABLE"); });
+				if (!observed) throw new DatastoreError("STORE_UNAVAILABLE");
+				const revision = definitionRevision({ id: sharedId, ...observed, include: defined.include, exclude: defined.exclude, maxFileBytes: defined.maxFileBytes, search: defined.search, qmd: catalog.qmd });
+				const store: StoreConfig = {
+					name, configuredRoot: observed.root, root: observed.root, rootWasSymlink: false, rootDev: observed.rootDev, rootIno: observed.rootIno,
+					include: defined.include, exclude: defined.exclude, maxFileBytes: defined.maxFileBytes, search: defined.search,
+					shared: { catalog: catalog.path, store: sharedId, socketPath: catalog.socketPath, definitionRevision: revision },
+				};
+				provisionSharedStore(store, () => { if (stores.get(name) === store) stores.delete(name); });
+				stores.set(name, store); return store;
+			};
+			unavailableStores.set(name, bind);
+			try { await bind(); } catch (error) { if (!(error instanceof DatastoreError) || error.code !== "STORE_UNAVAILABLE") throw error; }
 			continue;
 		}
 		exactKeys(storeRaw, STORE_KEYS);
+		privateStoreNames.add(name);
 		const configuredRoot = string(storeRaw.root);
 		const rootInput = isAbsolute(configuredRoot) ? configuredRoot : resolve(projectRoot, configuredRoot);
-		const rootLstat = await lstat(rootInput).catch(() => { throw new DatastoreError("CONFIG_INVALID"); });
-		const root = await realpath(rootInput).catch(() => { throw new DatastoreError("CONFIG_INVALID"); });
-		if (rootLstat.isSymbolicLink() || root !== resolve(rootInput)) throw new DatastoreError("SYMLINK_REJECTED");
-		const rootStat = await stat(root).catch(() => { throw new DatastoreError("CONFIG_INVALID"); });
-		if (!rootStat.isDirectory() || canonicalRoots.has(root)) throw new DatastoreError("CONFIG_INVALID");
-		canonicalRoots.add(root);
+		const captured = await inspectConfiguredRoot(rootInput, "SYMLINK_REJECTED");
+		if (captured && canonicalRoots.has(captured.root)) throw new DatastoreError("CONFIG_INVALID");
+		if (captured) canonicalRoots.add(captured.root);
 		const searchRaw = record(storeRaw.search); exactKeys(searchRaw, SEARCH_KEYS);
 		const defaultMode = string(searchRaw.defaultMode) as StoreConfig["search"]["defaultMode"];
 		const qmdCollection = string(searchRaw.qmdCollection);
@@ -180,13 +205,37 @@ export async function loadMarkdownDatastoreConfig(projectRootInput: string, conf
 		qmdCollections.add(qmdCollection);
 		const include = storeRaw.include === undefined ? ["**/*.md"] : stringArray(storeRaw.include);
 		if (qmd.enabled && include.length !== 1) throw new DatastoreError("CONFIG_INVALID");
-		stores.set(name, {
-			name, configuredRoot, root, rootWasSymlink: rootLstat.isSymbolicLink(), rootDev: rootStat.dev, rootIno: rootStat.ino,
-			include,
+		const settings = { name, configuredRoot, rootWasSymlink: false, include,
 			exclude: storeRaw.exclude === undefined ? [".git/**", `${CONFIG_DIR_NAME}/**`] : stringArray(storeRaw.exclude),
-			maxFileBytes: integer(storeRaw.maxFileBytes, 1, HARD_MAX_FILE_BYTES),
-			search: { defaultMode, qmdCollection },
+			maxFileBytes: integer(storeRaw.maxFileBytes, 1, HARD_MAX_FILE_BYTES), search: { defaultMode, qmdCollection } };
+		const storeFor = (identity: { root: string; rootDev: number; rootIno: number }): StoreConfig => ({
+			name, configuredRoot, root: identity.root, rootWasSymlink: false, rootDev: identity.rootDev, rootIno: identity.rootIno,
+			include: settings.include, exclude: settings.exclude, maxFileBytes: settings.maxFileBytes, search: settings.search,
+		});
+		if (captured) stores.set(name, storeFor(captured));
+		else unavailableStores.set(name, async () => {
+			const existing = stores.get(name); if (existing) return existing;
+			const identity = await inspectConfiguredRoot(rootInput, "SYMLINK_REJECTED").catch(() => { throw new DatastoreError("STORE_UNAVAILABLE"); });
+			if (!identity || canonicalRoots.has(identity.root)) throw new DatastoreError("STORE_UNAVAILABLE");
+			canonicalRoots.add(identity.root);
+			const store = storeFor(identity); stores.set(name, store); return store;
 		});
 	}
-	return { schemaVersion: 1, projectRoot, configPath, stateRoot: resolve(configPath, "..", "state"), defaults, qmd, stores };
+	return { schemaVersion: 1, projectRoot, configPath, stateRoot: resolve(configPath, "..", "state"), defaults, qmd, stores, unavailableStores, privateStoreNames, get structuralError() { return structuralError; } };
+}
+
+export function configuredStoreNames(config: MarkdownDatastoreConfig): string[] {
+	return [...new Set([...config.stores.keys(), ...(config.unavailableStores?.keys() ?? [])])];
+}
+const pendingBindings = new WeakMap<MarkdownDatastoreConfig, Map<string, Promise<StoreConfig>>>();
+export async function resolveConfiguredStore(config: MarkdownDatastoreConfig, name: string): Promise<StoreConfig> {
+	if (config.structuralError) throw config.structuralError;
+	const existing = config.stores.get(name); if (existing) return existing;
+	const bind = config.unavailableStores?.get(name);
+	if (!bind) throw new DatastoreError("STORE_UNKNOWN", { store: name });
+	const pending = pendingBindings.get(config) ?? new Map<string, Promise<StoreConfig>>();
+	pendingBindings.set(config, pending);
+	const current = pending.get(name); if (current) return current;
+	const operation = bind(); pending.set(name, operation);
+	try { return await operation; } finally { pending.delete(name); }
 }

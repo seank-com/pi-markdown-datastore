@@ -126,8 +126,8 @@ export class QmdAdapter {
     if (job.mode === "lexical") { for (const name of result.reconciledStores) this.#semanticStores.add(this.config.stores.get(name)!); this.#semanticBatch.schedule(); }
     return result;
   };
-  this.#coordinator.register("lexical", run);
-  this.#coordinator.register("semantic", run);
+  this.#coordinator.register("lexical", run, this.config.stores.keys());
+  this.#coordinator.register("semantic", run, this.config.stores.keys());
  }
  async acquireOwnership(): Promise<IndexOwnership> {
   if (this.#closed) throw new DatastoreError("CANCELLED");

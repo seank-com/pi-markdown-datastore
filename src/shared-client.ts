@@ -17,7 +17,8 @@ export class SharedIndexClient {
 	#opening?: Promise<Socket>;
 	#lifecycle = new AbortController();
 	#closed = false;
-	constructor(attachment: SharedAttachment) { this.attachment = { ...attachment }; }
+	readonly observation?: { attached: () => void; rejected: () => void };
+	constructor(attachment: SharedAttachment, observation?: { attached: () => void; rejected: () => void }) { this.attachment = { ...attachment }; this.observation = observation; }
 	private ready(signal?: AbortSignal): Promise<Socket> {
 		throwIfAborted(signal);
 		if (this.#closed) throw new DatastoreError("CANCELLED");
@@ -39,7 +40,7 @@ export class SharedIndexClient {
 		throwIfAborted(signal);
 		let socket: Socket;
 		try { socket = await connectSharedSocket(this.attachment.socketPath, signal); }
-		catch { throw signal.aborted ? abortError(signal) : new DatastoreError("STORE_UNAVAILABLE"); }
+		catch { this.observation?.rejected(); throw signal.aborted ? abortError(signal) : new DatastoreError("STORE_UNAVAILABLE"); }
 		this.#connecting = socket;
 		const pending = new Map<string, Waiter>();
 		let boundGeneration: string | undefined;
@@ -69,8 +70,9 @@ export class SharedIndexClient {
 			if (socket.destroyed) throw new DatastoreError("STORE_UNAVAILABLE");
 			this.#generation = hello.generation; this.version = hello.version;
 			this.#pending = pending; this.#socket = socket;
+			this.observation?.attached();
 			return socket;
-		} catch (error) { retire(error); throw error; }
+		} catch (error) { retire(error); this.observation?.rejected(); throw error; }
 		finally { if (this.#connecting === socket) this.#connecting = undefined; }
 	}
 	private send(socket: Socket, pending: Map<string, Waiter>, operation: string, input: Record<string, unknown> | undefined, signal?: AbortSignal): Promise<unknown> {
