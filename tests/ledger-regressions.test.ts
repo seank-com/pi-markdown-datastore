@@ -9,6 +9,66 @@ function coordinator(dir: string) {
 	return new MaintenanceCoordinator(join(dir, "jobs.json"), () => new Set(["memory"]));
 }
 
+function terminalHistory() {
+	return Array.from({ length: 20 }, (_, index) => {
+		const state = (["succeeded", "failed", "cancelled"] as const)[index % 3];
+		const createdAt = new Date(Date.UTC(2026, 0, index + 1)).toISOString();
+		// The earliest-created job completed last; retention follows terminal updates.
+		const updatedAt = index === 0 ? "2026-02-01T00:00:00.000Z" : createdAt;
+		return { version: 1, refreshId: index.toString(16).padStart(32, "0"), key: "metadata:memory", mode: "metadata", stores: ["memory"], ownership: "explicit-maintenance", state, phase: state, createdAt, updatedAt, completedAt: updatedAt, progress: { documentsCompleted: 0, errors: 0 } };
+	});
+}
+
+test("full ledger evicts oldest terminal updates and preserves recent receipts across reload", async (t) => {
+	const dir = await realpath(await mkdtemp(join(tmpdir(), "datastore-retention-")));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const history = terminalHistory();
+	const owner = coordinator(dir);
+	await writeFile(owner.jobsPath, JSON.stringify({ version: 1, jobs: history }), { mode: 0o600 });
+	t.after(async () => { owner.shutdown(); await owner.settled(); });
+	const first = await owner.enqueue("lexical", ["memory"], "explicit-maintenance");
+	assert.equal(owner.jobs().length, 20);
+	assert.equal(owner.get(history[1].refreshId), undefined);
+	for (const job of history.filter((_, index) => index !== 1)) assert.ok(owner.get(job.refreshId));
+	const second = await owner.enqueue("semantic", ["memory"], "explicit-maintenance");
+	assert.equal(owner.get(history[2].refreshId), undefined);
+	assert.ok(owner.get(history[0].refreshId), "recently completed old job remains");
+	assert.ok(owner.get(history[19].refreshId), "newest-created receipt remains");
+	assert.equal(owner.jobs().length, 20);
+	owner.shutdown();
+	await owner.settled();
+	const restored = coordinator(dir);
+	t.after(async () => { restored.shutdown(); await restored.settled(); });
+	await restored.ensureLoaded();
+	assert.deepEqual(restored.jobs().map((job) => job.refreshId).sort(), owner.jobs().map((job) => job.refreshId).sort());
+	for (const receipt of [first, second]) assert.equal(restored.get(String(receipt.refreshId))?.state, "queued");
+});
+
+test("retention protects running and queued jobs while evicting an old terminal receipt", async (t) => {
+	const dir = await realpath(await mkdtemp(join(tmpdir(), "datastore-active-retention-")));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const history = terminalHistory();
+	const active = history.slice(0, 2).map((job, index) => ({ ...job, mode: index === 0 ? "lexical" : "semantic", key: `${index === 0 ? "lexical" : "semantic"}:memory`, state: "queued", phase: "queued", completedAt: undefined }));
+	const owner = coordinator(dir);
+	await writeFile(owner.jobsPath, JSON.stringify({ version: 1, jobs: [...active, ...history.slice(2)] }), { mode: 0o600 });
+	let release!: () => void;
+	const held = new Promise<void>((resolve) => { release = resolve; });
+	let started!: () => void;
+	const entered = new Promise<void>((resolve) => { started = resolve; });
+	owner.register("lexical", async () => { started(); await held; });
+	t.after(async () => { release(); await owner.settled(); owner.shutdown(); });
+	await owner.ensureLoaded();
+	owner.relaunchQueued();
+	await entered;
+	const next = await owner.enqueue("metadata", ["memory"], "explicit-maintenance");
+	assert.equal(owner.get(active[0].refreshId)?.state, "running");
+	assert.equal(owner.get(active[1].refreshId)?.state, "queued");
+	assert.equal(owner.get(String(next.refreshId))?.state, "queued");
+	assert.equal(owner.get(history[2].refreshId), undefined);
+	assert.ok(owner.get(history[19].refreshId));
+	assert.equal(owner.jobs().length, 20);
+});
+
 test("ledger keeps progress, capacity, validation, and explicit cancel", async (t) => {
 	const dir = await realpath(await mkdtemp(join(tmpdir(), "datastore-ledger-")));
 	t.after(() => rm(dir, { recursive: true, force: true }));

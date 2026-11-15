@@ -205,7 +205,7 @@ export class MaintenanceCoordinator {
 		admission.catch(() => undefined);
 		this.#admissions.set(key, admission);
 		try {
-			const terminal = this.jobs().filter((item) => !["queued", "running"].includes(item.state));
+			const terminal = this.jobs().filter((item) => !["queued", "running"].includes(item.state)).sort((left, right) => left.updatedAt.localeCompare(right.updatedAt));
 			while (this.#jobs.size + 1 > TERMINAL_JOB_LIMIT && terminal.length) this.#jobs.delete(terminal.shift()!.refreshId);
 			if (this.#jobs.size + 1 > TERMINAL_JOB_LIMIT) throw new DatastoreError("RESULT_LIMIT_EXCEEDED");
 			const now = new Date().toISOString();
