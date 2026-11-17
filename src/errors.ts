@@ -20,13 +20,14 @@ const SAFE_MESSAGES: Record<MarkdownDatastoreErrorCode, string> = {
 	STALE_INDEX: "The datastore index is stale.", STALE_CANDIDATE_DROPPED: "A stale backend candidate was dropped.",
 	STALE_CONTINUATION: "The note changed after the continuation was issued.",
 	EXPIRED_CONTINUATION: "The continuation is expired or unavailable.", TIMEOUT: "The datastore operation timed out.",
-	CANCELLED: "The datastore operation was cancelled.", RESULT_LIMIT_EXCEEDED: "The datastore result exceeded its hard limit.",
+	CANCELLED: "The datastore operation was cancelled.", RESULT_LIMIT_EXCEEDED: "The datastore result exceeded the requested budget.",
 };
 
 const READ_VIEWS = new Set(["content", "section", "outline", "metadata", "links", "backlinks", "related"]);
 const READ_OPTIONS = new Set(["includeFrontmatter", "headingPath", "occurrence", "sectionHandle", "excludeSections", "includeSemanticRelated"]);
 function safeMessage(code: MarkdownDatastoreErrorCode, details?: Readonly<Record<string, unknown>>): string {
 	if (code === "INVALID_NOTE_REF" && details?.reason === "OPTION_NOT_ALLOWED" && typeof details.view === "string" && READ_VIEWS.has(details.view) && typeof details.option === "string" && READ_OPTIONS.has(details.option)) return `The ${details.option} option is not valid for the ${details.view} view.`;
+	if (code === "RESULT_LIMIT_EXCEEDED" && details?.operationApplied === true) return `The datastore result exceeded the requested budget. Applied work remains: ${Array.isArray(details.refreshIds) ? details.refreshIds.join(",") : ""}.`;
 	return SAFE_MESSAGES[code];
 }
 

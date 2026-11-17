@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFileSync, spawn } from "node:child_process";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -28,7 +28,9 @@ import { createMarkdownDatastoreClient, queryMarkdownDatastoreCapability, type M
 const note: NoteRef = {store:"notes",path:"one.md"};
 declare const bus: MarkdownDatastoreCapabilityBus;
 const capability: MarkdownDatastoreCapability | undefined = queryMarkdownDatastoreCapability(bus);
-void createMarkdownDatastoreClient(bus).read({note});
+void createMarkdownDatastoreClient(bus).read({note, view:"links"});
+void createMarkdownDatastoreClient(bus).tags({store:"notes"});
+void createMarkdownDatastoreClient(bus).refresh({action:"start", store:"notes", mode:"metadata"});
 const policy: MarkdownDatastorePolicyV1 = createMarkdownDatastoreClient(bus, { capability });
 void policy.roots({}); void policy.validateDestination({ path: "/example/new.md" });
 `);
@@ -42,6 +44,73 @@ void policy.roots({}); void policy.validateDestination({ path: "/example/new.md"
     stores: { notes: { root: "notes", include: ["**/*.md"], exclude: [], maxFileBytes: 4096, search: { defaultMode: "lexical", qmdCollection: "notes" } } },
   };
   await writeFile(join(configDir, "config.json"), JSON.stringify(config), { mode: 0o600 });
+  await t.test("foreground shared CLI starts and stops without installed Pi peers", async () => {
+    const run = await realpath(await mkdtemp("/tmp/datastore-cli-"));
+    const catalog = join(run, "catalog.json"), socketPath = join(run, "owner.sock");
+    await writeFile(catalog, JSON.stringify({ ...config, socketPath, stateRoot: join(run, "state"),
+      stores: { notes: { ...config.stores.notes, root: await realpath(join(consumer, "notes")) } },
+    }), { mode: 0o600 });
+    for (const name of ["@earendil-works", "typebox"]) {
+      await assert.rejects(stat(join(consumer, "node_modules", name)), { code: "ENOENT" });
+    }
+    const child = spawn(process.execPath, [join(consumer, "node_modules/@seank/pi-markdown-datastore/dist/shared-service-main.js"), "--catalog", catalog], {
+      cwd: consumer, stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stderr = "", stdout = "";
+    child.stderr.on("data", chunk => { stderr += chunk; });
+    const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(resolve => {
+      child.once("close", (code, signal) => resolve({ code, signal }));
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        child.once("error", reject);
+        child.stdout.on("data", chunk => { stdout += chunk; if (stdout.includes("\n")) resolve(); });
+        child.once("close", code => reject(new Error(`Shared CLI exited before readiness (${code}): ${stderr}`)));
+      });
+      // The service publishes an opaque nonempty generation, not a UUID.
+      assert.ok(stdout.trim());
+      assert.equal((await stat(socketPath)).isSocket(), true);
+      // No clients have attached: service lifetime must not depend on one.
+      assert.equal(child.exitCode, null);
+      child.kill("SIGTERM");
+      assert.deepEqual(await exited, { code: 0, signal: null });
+      await assert.rejects(stat(socketPath), { code: "ENOENT" });
+      assert.equal(await readFile(join(consumer, "notes/one.md"), "utf8"), "# One\nPacked source text\n");
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+      await exited;
+      await rm(run, { recursive: true, force: true });
+    }
+  });
+  await t.test("terminal-history operator CLI needs no Pi peers and preserves legacy receipts", async () => {
+    const state = await realpath(await mkdtemp(join(tmpdir(), "packed-maintenance-state-")));
+    try {
+      const history = join(state, "qmd-public-2.8.3-aaaaaaaaaaaaaaaa");
+      await mkdir(history, { mode: 0o700 });
+      const bytes = JSON.stringify({ version: 1, jobs: [] });
+      await writeFile(join(history, "jobs.json"), bytes, { mode: 0o600 });
+      const cli = join(consumer, "node_modules/@seank/pi-markdown-datastore/dist/maintenance-migration-main.js");
+      const invoke = (args: string[], entry = cli) => new Promise<string>((resolve, reject) => {
+        const child = spawn(process.execPath, [entry, "--state-root", state, ...args], { cwd: consumer, stdio: ["ignore", "pipe", "pipe"] });
+        let output = "", errors = "";
+        child.stdout.on("data", chunk => { output += chunk; });
+        child.stderr.on("data", chunk => { errors += chunk; });
+        child.once("error", reject);
+        child.once("close", (code, signal) => code === 0 && signal === null ? resolve(output) : reject(new Error(`Migration CLI failed (${code}/${signal}): ${errors}`)));
+      });
+      const alias = join(state, "migration-cli.js");
+      await symlink(cli, alias);
+      const inspected = JSON.parse(await invoke([], alias));
+      assert.equal(inspected.eligible, true); assert.equal(inspected.initialized, false);
+      await assert.rejects(stat(join(state, "jobs.json")), { code: "ENOENT" });
+      const initialized = JSON.parse(await invoke(["--initialize-terminal-history"]));
+      assert.equal(initialized.initialized, true);
+      assert.deepEqual(JSON.parse(await readFile(join(state, "jobs.json"), "utf8")), { version: 1, jobs: [] });
+      assert.equal(await readFile(join(history, "jobs.json"), "utf8"), bytes);
+      assert.equal(JSON.parse(await invoke(["--initialize-terminal-history"])).initialized, false);
+      for (const name of ["@earendil-works", "typebox"]) await assert.rejects(stat(join(consumer, "node_modules", name)), { code: "ENOENT" });
+    } finally { await rm(state, { recursive: true, force: true }); }
+  });
   const sdkRoot = await createQmdFixture(consumer);
   await writeFile(join(consumer, "probe.ts"), `
 import assert from "node:assert/strict";
@@ -67,7 +136,7 @@ const loaded = await loadExtensions([entry],process.cwd(),bus);
 assert.deepEqual(loaded.errors,[]);assert.equal(loaded.extensions.length,1);
 assert.equal(queryMarkdownDatastoreCapability(bus)?.ready,false);
 await start(loaded);
-assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(),["datastore_find","datastore_read","datastore_refresh","datastore_search","datastore_status"]);
+assert.deepEqual([...loaded.extensions[0].tools.keys()].sort(),["datastore_find","datastore_read","datastore_refresh","datastore_search","datastore_status","datastore_tags"]);
 const capability = queryMarkdownDatastoreCapability(bus)!;
 assert.equal(capability.ready,true);assert.deepEqual(capability.stores,["notes"]);
 assert.equal(capability.policyVersion,1);

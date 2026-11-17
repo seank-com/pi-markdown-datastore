@@ -8,7 +8,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   if [[ "$remote_sha" == "$zero" ]]; then
     node scripts/check-private-terms.ts --range "$local_sha" --not --remotes || status=1
   else
-    node scripts/check-private-terms.ts --range "$remote_sha..$local_sha" || status=1
+    node scripts/check-private-terms.ts --range "$remote_sha..$local_sha" --not origin/main || status=1
   fi
 done
 exit "$status"

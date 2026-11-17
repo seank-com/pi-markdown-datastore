@@ -2,8 +2,12 @@
 A simple extension for Pi that enables semantic and lexical searching across a folder of markdown files using QMD
 
 Direct content, section and outline reads, exact-path/URI lookup, and status
-work on their own. Optional qmd 2.8.3 adds lexical, semantic and hybrid search.
-Telegram and observability are not required.
+work on their own. Wikilink and frontmatter-tag indexing also works without qmd.
+Optional qmd 2.8.3 adds lexical, semantic and hybrid search.
+Telegram and observability are not required. The graph/tag JSON index accepts
+incremental changed-path notifications and reconciles filesystem observations
+every five minutes, independently of qmd. Explicit rebuild rereads source;
+ordinary reads do not scan or rebuild the store. See [setup](docs/setup.md).
 
 ## Local quick start
 
@@ -23,7 +27,7 @@ npm run test:package
 Create a project-local configuration as described in [setup](docs/setup.md),
 then start Pi with `-e /path/to/pi-markdown-datastore/dist/index.js`. Load this
 entry once. It registers `datastore_search`, `datastore_find`, `datastore_read`,
-`datastore_status`, and `datastore_refresh` consistently, even without valid
+`datastore_status`, `datastore_refresh`, and `datastore_tags` consistently, even without valid
 configuration. Missing/invalid configuration or an untrusted project disables
 service operation, not tool visibility. Calls report the specific configuration
 error or `PROJECT_UNTRUSTED`; fix the configuration/trust and start a new session.
@@ -98,6 +102,10 @@ or `PASSWORD`; there is no minimum value length. Private-term matching is
 unchanged. `PRIVATE_TERMS_FILE` and `PRIVATE_SECRETS_FILE` select other
 files. `npm run check:private -- --all` checks every staged file, including
 unchanged ones.
+
+Existing-branch pre-push scans exclude history already in the local `origin/main`
+tracking ref. Feature commit messages and added lines outside that baseline remain
+checked. New-branch scans still exclude all known remote history.
 
 Only compiled JS/declarations, the worker asset, generic docs, README, LICENSE,
 and package metadata ship. Original public history and extracted-code MIT

@@ -61,7 +61,7 @@ test("explicit traversal counts beyond the candidate ceiling while status remain
 	assert.equal(await countSafeNotes(config.stores.get("memory")!), 510);
 	const status = await new MarkdownDatastoreService(config).status({ store: "memory" });
 	const storeStatus = (status.data.stores as Array<any>)[0]; assert.equal(storeStatus.fileCount, undefined); assert.equal(storeStatus.fileCountSource, "unavailable");
-	assert.equal(storeStatus.capabilities.outline.state, "ready"); assert.equal(storeStatus.capabilities.graph, undefined); assert.equal(storeStatus.capabilities.metadata, undefined); assert.deepEqual(storeStatus.capabilities.mutations, { supported: false }); assert.deepEqual(storeStatus.permissionWarnings, []);
+	assert.equal(storeStatus.capabilities.outline.state, "ready"); assert.equal(storeStatus.capabilities.graph, undefined); assert.equal(storeStatus.capabilities.metadata.state, "unavailable"); assert.deepEqual(storeStatus.capabilities.mutations, { supported: false }); assert.deepEqual(storeStatus.permissionWarnings, []);
 	assert.ok(Buffer.byteLength(JSON.stringify(status)) < 32 * 1024);
 });
 
@@ -139,8 +139,9 @@ test("direct service pages bounded content and invalidates stale continuations",
 	const current = await fixture(t);
 	await writeFile(join(current.storeRoot, "note.md"), "# Heading\nline one\nline two\nline three\nline four\nline five\n");
 	const service = new MarkdownDatastoreService(await loadMarkdownDatastoreConfig(current.project, current.configPath));
-	const first = await service.read({ note: { store: "memory", path: "note.md" }, view: "content", maxBytes: 32, maxLines: 3 });
-	assert.equal(first.bounds.truncated, true); assert.equal(first.bounds.maxBytes, 32); assert.equal(first.bounds.maxLines, 3); assertBounded(first);
+	await assert.rejects(service.read({ note: { store: "memory", path: "note.md" }, view: "content", maxBytes: 32, maxLines: 3 }), { code: "RESULT_LIMIT_EXCEEDED" });
+	const first = await service.read({ note: { store: "memory", path: "note.md" }, view: "content", maxBytes: 2000, maxLines: 3 });
+	assert.equal(first.bounds.truncated, true); assert.equal(first.bounds.maxBytes, 2000); assert.equal(first.bounds.maxLines, 3); assertBounded(first);
 	assert.match(String(first.data.content), /Heading/);
 	assert.ok(first.bounds.continuation);
 	await writeFile(join(current.storeRoot, "note.md"), "# Changed\n");
@@ -162,8 +163,10 @@ test("outline returns opaque section handles and exact duplicate occurrence read
 
 test("unsupported discovery and graph views fail explicitly while direct outlines remain ready",async t=>{
  const f=await fixture(t);await writeFile(join(f.storeRoot,'note.md'),'# Note\nBody\n');const service=new MarkdownDatastoreService(await loadMarkdownDatastoreConfig(f.project,f.configPath));
- for(const selector of [{kind:'title',value:'Note'},{kind:'path',path:'note'},{kind:'tag',value:'tag'},{kind:'link',target:'note.md'}] as any[])await assert.rejects(service.find({store:'memory',selectors:[selector]}),{code:'CAPABILITY_UNAVAILABLE'});
- for(const view of ['links','backlinks','metadata','related'] as const)await assert.rejects(service.read({note:{store:'memory',path:'note.md'},view}),{code:'CAPABILITY_UNAVAILABLE'});
+ for(const selector of [{kind:'title',value:'Note'},{kind:'path',path:'note'},{kind:'link',target:'note.md'}] as any[])await assert.rejects(service.find({store:'memory',selectors:[selector]}),{code:'CAPABILITY_UNAVAILABLE'});
+ await assert.rejects(service.find({store:'memory',selectors:[{kind:'tag',value:'tag'}]} as never),{code:'STALE_INDEX'});
+ for(const view of ['links','backlinks'] as const)await assert.rejects(service.read({note:{store:'memory',path:'note.md'},view}),{code:'STALE_INDEX'});
+ for(const view of ['metadata','related'] as const)await assert.rejects(service.read({note:{store:'memory',path:'note.md'},view}),{code:'CAPABILITY_UNAVAILABLE'});
  assert.equal(((await service.read({note:{store:'memory',path:'note.md'},view:'outline'})).data.outline as any[]).length,1);
 });
 

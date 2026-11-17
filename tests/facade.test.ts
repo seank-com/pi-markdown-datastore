@@ -73,21 +73,35 @@ test("client RPC and direct search permit slow reranking and propagate deadline 
 
 test("trusted valid configuration registers exactly five strict tools", async (t) => {
 	const current = await fixture(t); const app = harness(current.project); createMarkdownDatastoreExtension({ projectRoot: current.project, configPath: current.configPath })(app.pi); await app.fire("session_start", { reason: "startup" });
-	assert.deepEqual(app.tools.map((tool) => tool.name), ["datastore_search", "datastore_find", "datastore_read", "datastore_status", "datastore_refresh"]);
+	assert.deepEqual(app.tools.map((tool) => tool.name), ["datastore_search", "datastore_find", "datastore_read", "datastore_status", "datastore_refresh", "datastore_tags"]);
 	for (const tool of app.tools) {
 		if (tool.parameters.type === "object") assert.equal(tool.parameters.additionalProperties, false);
 		else for (const schema of tool.parameters.anyOf) assert.equal(schema.additionalProperties, false);
 	}
 	const read = app.tools.find((tool) => tool.name === "datastore_read");
-	assert.equal(read.parameters.type, "object"); assert.equal(read.parameters.anyOf.length, 4);
+	assert.equal(read.parameters.type, "object"); assert.equal(read.parameters.anyOf.length, 5);
 	assert.equal(Check(read.parameters, { note: { store: "memory", path: "one.md" }, includeFrontmatter: true }), true);
 	assert.equal(Check(read.parameters, { note: { store: "memory", path: "one.md" }, view: "metadata", includeFrontmatter: false }), false);
 	assert.equal(Check(read.parameters, { note: { store: "memory", path: "one.md" }, view: "related", includeSemanticRelated: true }), false);
 	assert.equal(Check(read.parameters, { note: { store: "memory", path: "one.md" }, view: "metadata", includeSemanticRelated: false }), false);
 	const result = await read.execute("id", { note: { store: "memory", path: "one.md" }, view: "content" }, new AbortController().signal);
 	assert.match(result.content[0].text, /Body/); assert.equal(result.details.operation, "read");
-	assert.deepEqual(app.entries.map((entry) => entry.data.phase), ["start", "end"]); const metric = app.entries[1].data; assert.equal(metric.returnedCount, 1); assert.equal(metric.returnedBytes, 11); assert.equal(metric.returnedLines, 3); assert.equal(metric.maxBytes, 4096); assert.equal(metric.maxLines, 100); assert.equal(metric.truncated, false); assert.equal(metric.cacheHit, undefined); assert.deepEqual(metric.backendSelection, ["filesystem"]); assert.deepEqual(metric.freshnessStates, ["current"]); assert.deepEqual(metric.warningCodes, []); assert.equal(metric.outputSchema, "valid");
+	assert.deepEqual(app.entries.map((entry) => entry.data.phase), ["start", "end"]); const metric = app.entries[1].data; assert.equal(metric.returnedCount, 1); assert.equal(metric.returnedBytes, Buffer.byteLength(result.content[0].text)); assert.equal(metric.returnedLines, 2); assert.equal(metric.maxBytes, 4096); assert.equal(metric.maxLines, 100); assert.equal(metric.truncated, false); assert.equal(metric.cacheHit, undefined); assert.deepEqual(metric.backendSelection, ["filesystem"]); assert.deepEqual(metric.freshnessStates, ["current"]); assert.deepEqual(metric.warningCodes, []); assert.equal(metric.outputSchema, "valid");
 	assert.ok(app.entries.every((entry) => !JSON.stringify(entry).includes("one.md") && !JSON.stringify(entry).includes("Body")));
+});
+
+test("tool enum fields retain plain string-enum wire schemas", () => {
+	const app = harness("/synthetic-schema-project");
+	createMarkdownDatastoreExtension({ projectRoot: "/synthetic-schema-project" })(app.pi);
+	const search = JSON.parse(JSON.stringify(app.tools.find(tool => tool.name === "datastore_search").parameters));
+	const find = JSON.parse(JSON.stringify(app.tools.find(tool => tool.name === "datastore_find").parameters));
+	const read = JSON.parse(JSON.stringify(app.tools.find(tool => tool.name === "datastore_read").parameters));
+	assert.deepEqual(search.properties.mode, { type: "string", enum: ["lexical", "semantic", "hybrid"] });
+	assert.deepEqual(search.properties.freshness, { type: "string", enum: ["allow-stale", "require-current-lexical", "require-current-semantic"] });
+	assert.deepEqual(find.properties.match, { type: "string", enum: ["all", "any"] });
+	assert.deepEqual(find.properties.selectors.items.anyOf[0].properties.kind, { type: "string", enum: ["path"] });
+	assert.deepEqual(find.properties.selectors.items.anyOf[1].properties.kind, { type: "string", enum: ["uri"] });
+	assert.deepEqual(read.properties.view, { type: "string", enum: ["content", "section", "outline", "links", "backlinks"] });
 });
 
 test("conditional read/refresh schemas explicitly declare object branches without changing valid inputs", () => {
@@ -106,11 +120,16 @@ test("conditional read/refresh schemas explicitly declare object branches withou
 	for (const tool of app.tools) visit(tool.parameters);
 	const read = app.tools.find(tool => tool.name === "datastore_read").parameters;
 	const refresh = app.tools.find(tool => tool.name === "datastore_refresh").parameters;
-	for (const input of [{}, { note: { store: "memory", path: "one.md" } }, { continuation: "opaque" }, { view: "section", headingPath: ["Heading"] }, { view: "outline" }]) assert.equal(Check(read, input), true);
-	for (const input of [null, [], "text", { continuation: "opaque", store: "memory" }, { continuation: "opaque", maxLines: 10 }, { view: "content", headingPath: ["Heading"] }, { view: "section", includeFrontmatter: true }, { view: "outline", sectionHandle: "opaque" }, { unknown: true }]) assert.equal(Check(read, input), false);
+	// xAI rejects the nested start/path union despite explicit object types.
+	for (const branch of refresh.anyOf) {
+		assert.equal(branch.anyOf, undefined, "refresh root alternatives must be flat");
+		assert.equal(branch.oneOf, undefined, "refresh root alternatives must be flat");
+	}
+	for (const input of [{}, { note: { store: "memory", path: "one.md" } }, { continuation: "opaque" }, { continuation: "opaque", maxLines: 10 }, { view: "section", headingPath: ["Heading"] }, { view: "outline" }]) assert.equal(Check(read, input), true);
+	for (const input of [null, [], "text", { continuation: "opaque", store: "memory" }, { view: "content", headingPath: ["Heading"] }, { view: "section", includeFrontmatter: true }, { view: "outline", sectionHandle: "opaque" }, { unknown: true }]) assert.equal(Check(read, input), false);
 	const refreshId = "a".repeat(32);
-	for (const input of [{}, { action: "start", store: "memory", mode: "lexical" }, { action: "cancel", refreshId }]) assert.equal(Check(refresh, input), true);
-	for (const input of [null, [], "text", { refreshId }, { action: "start", refreshId }, { action: "cancel" }, { action: "cancel", refreshId, store: "memory" }, { action: "cancel", refreshId, mode: "semantic" }]) assert.equal(Check(refresh, input), false);
+	for (const input of [{}, { action: "start", store: "memory", mode: "lexical" }, { mode: "metadata" }, { mode: "metadata", paths: ["one.md"] }, { action: "start", mode: "metadata", paths: ["one.md"] }, { mode: "rebuild" }, { action: "cancel", refreshId }]) assert.equal(Check(refresh, input), true);
+	for (const input of [null, [], "text", { refreshId }, { action: "start", refreshId }, { action: "cancel" }, { action: "cancel", refreshId, store: "memory" }, { action: "cancel", refreshId, mode: "semantic" }, { action: "cancel", refreshId, paths: ["one.md"] }, { paths: ["one.md"] }, { mode: "lexical", paths: ["one.md"] }, { mode: "rebuild", paths: ["one.md"] }, { mode: "metadata", paths: [] }, { mode: "metadata", paths: [""] }]) assert.equal(Check(refresh, input), false);
 });
 
 test("refresh end metrics include only structural counts and backend state", async (t) => {
@@ -120,17 +139,17 @@ test("refresh end metrics include only structural counts and backend state", asy
 test("qmd startup reconciliation is enqueued without blocking startup", { timeout: 5000 }, async (t) => {
 	const current = await fixture(t); const raw = JSON.parse(await readFile(current.configPath, "utf8")); raw.qmd.enabled = true; await writeFile(current.configPath, JSON.stringify(raw), { mode: 0o600 }); let started = false; let release!: () => void; const pending = new Promise<void>((resolve) => { release = resolve; });
 	const qmd: any = { binding: { version: "2.8.3" }, startupReconcile: async () => { started = true; await pending; }, shutdown: async () => { release(); } }; const app = harness(current.project); createMarkdownDatastoreExtension({ projectRoot: current.project, configPath: current.configPath, createQmd: async () => qmd })(app.pi); const before = Date.now(); await app.fire("session_start");
-	assert.equal(started, true); assert.ok(Date.now() - before < 100); assert.equal(app.tools.length, 5); await app.fire("session_shutdown");
+	assert.equal(started, true); assert.ok(Date.now() - before < 100); assert.equal(app.tools.length, 6); await app.fire("session_shutdown");
 });
 
 test("five tools remain visible across initial failures, recovery, and valid-to-invalid transitions", async t => {
 	const current = await fixture(t); const original = await readFile(current.configPath);
 	const app = harness(current.project); let backendStarts = 0;
 	createMarkdownDatastoreExtension({ projectRoot: current.project, createQmd: async () => { backendStarts++; throw new Error("not installed"); } })(app.pi);
-	assert.equal(app.tools.length, 5, "registration does not wait for session_start");
-	const inputs: Record<string, unknown> = { datastore_search: { store: "memory", query: "body" }, datastore_find: { store: "memory", selectors: [{ kind: "path", path: "one.md" }] }, datastore_read: { note: { store: "memory", path: "one.md" } }, datastore_status: {}, datastore_refresh: {} };
+	assert.equal(app.tools.length, 6, "registration does not wait for session_start");
+	const inputs: Record<string, unknown> = { datastore_search: { store: "memory", query: "body" }, datastore_find: { store: "memory", selectors: [{ kind: "path", path: "one.md" }] }, datastore_read: { note: { store: "memory", path: "one.md" } }, datastore_status: {}, datastore_refresh: {}, datastore_tags: { store: "memory" } };
 	const fails = async (code: string) => {
-		assert.equal(app.tools.length, 5);
+		assert.equal(app.tools.length, 6);
 		for (const tool of app.tools) await assert.rejects(tool.execute("id", inputs[tool.name]), (error: any) => error.code === code);
 	};
 	await rm(current.configPath); await app.fire("session_start"); await fails("CONFIG_MISSING");
@@ -144,11 +163,12 @@ test("five tools remain visible across initial failures, recovery, and valid-to-
 	}
 	assert.equal(backendStarts, 2, "invalid configuration never constructs a backend");
 	await writeFile(current.configPath, original);
-	const untrusted = harness(current.project, false);
-	createMarkdownDatastoreExtension({ projectRoot: current.project, createQmd: async () => { throw new Error("trust bypassed"); } })(untrusted.pi);
-	await untrusted.fire("session_start"); assert.equal(untrusted.tools.length, 5);
+	const fresh = await fixture(t);
+	const untrusted = harness(fresh.project, false);
+	createMarkdownDatastoreExtension({ projectRoot: fresh.project, createQmd: async () => { throw new Error("trust bypassed"); } })(untrusted.pi);
+	await untrusted.fire("session_start"); assert.equal(untrusted.tools.length, 6);
 	for (const tool of untrusted.tools) await assert.rejects(tool.execute("id", inputs[tool.name]), (error: any) => error.code === "PROJECT_UNTRUSTED");
-	await assert.rejects((await import("node:fs/promises")).stat(join(current.project, ".pi/markdown-datastore/state")), { code: "ENOENT" });
+	await assert.rejects((await import("node:fs/promises")).stat(join(fresh.project, ".pi/markdown-datastore/state")), { code: "ENOENT" });
 	await app.fire("session_shutdown"); await untrusted.fire("session_shutdown");
 });
 
@@ -200,7 +220,7 @@ test("repeated session_start replaces and shuts down the previous service safely
 	const current = await fixture(t); const raw = JSON.parse(await readFile(current.configPath, "utf8")); raw.qmd.enabled = true; await writeFile(current.configPath, JSON.stringify(raw), { mode: 0o600 }); let shutdowns = 0;
 	const createQmd = async () => ({ binding: { version: "2.8.3" }, startupReconcile: async () => ({ refreshId: "c".repeat(32), mode: "lexical", state: "queued" }), startLexicalRefresh: async () => ({ refreshId: "b".repeat(32), mode: "lexical", state: "queued" }), shutdown: async () => { shutdowns += 1; } }) as any;
 	const app = harness(current.project); createMarkdownDatastoreExtension({ projectRoot: current.project, configPath: current.configPath, createQmd })(app.pi); await app.fire("session_start"); await app.fire("session_start");
-	assert.equal(shutdowns, 1); assert.equal(app.emitter.listenerCount(MARKDOWN_DATASTORE_REQUEST_EVENT), 1); assert.equal(app.tools.length, 5);
+	assert.equal(shutdowns, 1); assert.equal(app.emitter.listenerCount(MARKDOWN_DATASTORE_REQUEST_EVENT), 1); assert.equal(app.tools.length, 6);
 });
 
 test("event RPC dispatches once and is removed on shutdown", { timeout: 5000 }, async (t) => {

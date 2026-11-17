@@ -161,5 +161,6 @@ export function createMarkdownDatastoreClient(
 		read: (input: ReadInput, signal?: AbortSignal) => request<ReadResult>({ operation: "read", input }, signal),
 		status: (input: StatusInput, signal?: AbortSignal) => request<StatusResult>({ operation: "status", input }, signal),
 		refresh: (input: RefreshInput, signal?: AbortSignal) => request<RefreshResult>({ operation: "refresh", input }, signal),
+		tags: (input: { store: string; continuation?: string; maxBytes?: number; maxLines?: number }, signal?: AbortSignal) => request<RefreshResult>({ operation: "tags", input }, signal),
 	};
 }

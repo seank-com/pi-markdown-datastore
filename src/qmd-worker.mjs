@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline";
-import { isAbsolute } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
+import { lstatSync, writeFileSync } from "node:fs";
 
 process.umask(0o077);
 const idleMs = Number(process.argv[2]?.split("=")[1] ?? 300_000);
@@ -9,8 +10,23 @@ const send = value => process.stdout.write(`${JSON.stringify(value)}\n`);
 const statusShape = s => ({totalDocuments:s.totalDocuments,needsEmbedding:s.needsEmbedding,hasVectorIndex:s.hasVectorIndex});
 async function close() { if (closing) return; closing=true; clearTimeout(timer); try { await store?.close(); } finally { process.exit(0); } }
 function idle() { timer=setTimeout(()=>void close(),idleMs);timer.unref(); }
+function registerOwnership(r) {
+ const owner=r.ownership;
+ if(owner===undefined)return;
+ if(!owner || typeof owner.directory!=="string" || owner.directory!==join(dirname(dirname(r.dbPath)),"owner") || typeof owner.nonce!=="string" || !/^[0-9a-f]{32}$/.test(owner.nonce) || typeof owner.ownerName!=="string" || !new RegExp(`^owner-[1-9][0-9]*-${owner.nonce}$`).test(owner.ownerName))throw new Error("invalid_owner");
+ const primary=join(owner.directory,owner.ownerName),member=join(owner.directory,`worker-${process.pid}-${owner.nonce}`);
+ const info=lstatSync(primary);
+ if(!info.isFile() || info.nlink!==1 || info.uid!==process.getuid?.())throw new Error("invalid_owner");
+ writeFileSync(member,"",{flag:"a",mode:0o600});
+ const registered=lstatSync(member);
+ if(!registered.isFile() || registered.nlink!==1 || registered.uid!==process.getuid?.() || (registered.mode&0o077)!==0)throw new Error("invalid_owner");
+ // A contender that observed the dead parent before this registration cannot
+ // replace this now-nonempty directory. If it already replaced it, stop before SDK access.
+ lstatSync(primary);
+}
 async function execute(r) {
  try {
+  registerOwnership(r);
   const key=JSON.stringify([r.sdkUrl,r.dbPath,r.config]);
   if(identity && identity!==key) throw new Error("binding_changed");
   if(!store){ const sdk=await import(r.sdkUrl);store=await sdk.createStore({dbPath:r.dbPath,config:r.config});identity=key; }
@@ -38,7 +54,7 @@ async function execute(r) {
 }
 const lines=createInterface({input:process.stdin,crlfDelay:Infinity});
 lines.on('line',line=>{
- if(Buffer.byteLength(line)>1024*1024){void close();return;}
+
  let r;try{r=JSON.parse(line);}catch{void close();return;}
  if(r.version===2 && r.type==='shutdown'){if(!active)void close();else lines.close();return;}
  // Native SDK has no abort signal. The parent terminates this owned process and waits for exit.

@@ -44,8 +44,8 @@ async function snapshot(path: string): Promise<unknown> {
 }
 
 test("policy enumerates effective canonical roots and checks actual destinations without writes or qmd", async t => {
-  const f = await fixture(t); const before = await snapshot(f.base);
-  await f.fire("session_start"); const client = f.client();
+  const f = await fixture(t);
+  await f.fire("session_start"); const before = await snapshot(f.base); const client = f.client();
   const roots = (await client.roots({})).data.roots;
   assert.deepEqual(roots.map(root => [root.store, root.path]), [["notes", f.notes], ["shared", f.shared]]);
   for (const root of roots) { const info = await lstat(root.path); assert.equal(root.device, info.dev); assert.equal(root.inode, info.ino); }
@@ -100,7 +100,10 @@ test("a new ancestor alias cannot preserve access merely by preserving the root 
   await assert.rejects(client.roots({}), code("STORE_UNAVAILABLE"));
   await assert.rejects(client.validateDestination({ path: join(f.base, "outside.md") }), code("STORE_UNAVAILABLE"));
   await assert.rejects(client.read({ note: { store: "notes", path: "one.md" } }), code("STORE_UNAVAILABLE"));
-  await assert.rejects(client.refresh({ mode: "direct" }), code("STORE_UNAVAILABLE"));
+  const refresh = await client.refresh({ mode: "direct" });
+  assert.deepEqual(refresh.data.roots, { shared: "available" });
+  assert.deepEqual(refresh.warnings.map(warning => warning.code), ["STORE_UNAVAILABLE"]);
+  await assert.rejects(client.refresh({ store: "notes", mode: "direct" }), code("STORE_UNAVAILABLE"));
 });
 
 test("missing, invalid and untrusted instances return explicit policy errors", async t => {
