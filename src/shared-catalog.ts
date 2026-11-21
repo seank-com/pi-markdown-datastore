@@ -19,12 +19,15 @@ export interface SharedStoreDefinition {
 	definitionRevision: string;
 }
 
-export interface SharedCatalog {
+export interface SharedHostSettings {
 	path: string;
 	socketPath: string;
 	stateRoot: string;
 	defaults: { maxResultBytes?: number; maxResultLines?: number; operationTimeoutMs: number };
 	qmd: QmdConfig;
+}
+
+export interface SharedCatalog extends SharedHostSettings {
 	stores: ReadonlyMap<string, SharedStoreDefinition>;
 	unavailableStores: ReadonlyMap<string, () => Promise<SharedStoreDefinition>>;
 }
@@ -53,13 +56,13 @@ function integer(value: unknown, min: number, max: number): number {
 	return value as number;
 }
 
-async function readOwnedFile(path: string): Promise<string> {
-	const before = await lstat(path).catch((error) => { if (isRootUnavailable(error)) throw new DatastoreError("STORE_UNAVAILABLE"); throw new DatastoreError("CONFIG_INVALID"); });
-	if (!before.isFile() || before.isSymbolicLink() || before.uid !== process.getuid?.() || (before.mode & 0o077) !== 0 || before.size > 64 * 1024) throw new DatastoreError("CONFIG_INVALID");
+export async function readOwnedFile(path: string, configuration = true): Promise<string> {
+	const before = await lstat(path).catch((error) => { if (configuration && isRootUnavailable(error)) throw new DatastoreError("STORE_UNAVAILABLE"); throw error; });
+	if (!before.isFile() || before.isSymbolicLink() || before.uid !== process.getuid?.() || (before.mode & 0o077) !== 0 || (configuration && before.size > 64 * 1024)) throw new DatastoreError("CONFIG_INVALID");
 	const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
 	try {
 		const current = await handle.stat();
-		if (!current.isFile() || current.dev !== before.dev || current.ino !== before.ino) throw new DatastoreError("CONFIG_INVALID");
+		if (!current.isFile() || current.dev !== before.dev || current.ino !== before.ino || (configuration && current.size > 64 * 1024)) throw new DatastoreError("CONFIG_INVALID");
 		const bytes = Buffer.alloc(current.size);
 		let offset = 0;
 		while (offset < bytes.length) {
@@ -86,11 +89,19 @@ export async function loadSharedCatalog(pathInput: string): Promise<SharedCatalo
 async function parseSharedCatalog(pathInput: string): Promise<SharedCatalog> {
 	if (!isAbsolute(pathInput)) throw new DatastoreError("CONFIG_INVALID");
 	const path = await realpath(pathInput).catch((error) => { if (isRootUnavailable(error)) throw new DatastoreError("STORE_UNAVAILABLE"); throw new DatastoreError("CONFIG_INVALID"); });
-	const body = await readOwnedFile(path);
+	const top = parseSharedJson(await readOwnedFile(path)); exact(top, TOP);
+	const settings = parseSharedSettings(path, top);
+	const { qmd } = settings;
+	const storesRaw = record(top.stores);
+	return bindCatalog(settings, storesRaw);
+}
+
+export function parseSharedJson(body: string): Record<string, unknown> {
 	assertNoDuplicateJsonKeys(body);
-	let raw: unknown;
-	try { raw = JSON.parse(body); } catch { throw new DatastoreError("CONFIG_INVALID"); }
-	const top = record(raw); exact(top, TOP);
+	try { return record(JSON.parse(body)); } catch { throw new DatastoreError("CONFIG_INVALID"); }
+}
+
+export function parseSharedSettings(path: string, top: Record<string, unknown>): SharedHostSettings {
 	if (top.schemaVersion !== 1) throw new DatastoreError("CONFIG_VERSION_UNSUPPORTED");
 	const socketPath = text(top.socketPath);
 	const stateRoot = text(top.stateRoot);
@@ -108,7 +119,11 @@ async function parseSharedCatalog(pathInput: string): Promise<SharedCatalog> {
 	if ((executable === undefined) === (packageRoot === undefined) || (packageRoot !== undefined && !isAbsolute(packageRoot))) throw new DatastoreError("CONFIG_INVALID");
 	if (typeof qmdRaw.enabled !== "boolean") throw new DatastoreError("CONFIG_INVALID");
 	const qmd: QmdConfig = { enabled: qmdRaw.enabled, installation: { executable, packageRoot }, minimumVersion: text(qmdRaw.minimumVersion) };
-	const storesRaw = record(top.stores);
+	return { path, socketPath, stateRoot, defaults, qmd };
+}
+
+async function bindCatalog(settings: SharedHostSettings, storesRaw: Record<string, unknown>): Promise<SharedCatalog> {
+	const { qmd } = settings;
 	if (Object.keys(storesRaw).length === 0) throw new DatastoreError("CONFIG_INVALID");
 	const stores = new Map<string, SharedStoreDefinition>();
 	const unavailableStores = new Map<string, () => Promise<SharedStoreDefinition>>();
@@ -140,5 +155,5 @@ async function parseSharedCatalog(pathInput: string): Promise<SharedCatalog> {
 		if (captured) await bind();
 		else unavailableStores.set(id, () => bind());
 	}
-	return { path, socketPath, stateRoot, defaults, qmd, stores, unavailableStores };
+	return { ...settings, stores, unavailableStores };
 }

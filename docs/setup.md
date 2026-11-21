@@ -108,7 +108,62 @@ explicit lexical refresh when needed. The common five-minute reconciliation also
 
 `datastore_refresh` mode `metadata` updates the wikilink and frontmatter-tag index without qmd. Optional `paths` names the changed relative files; without them, or with mode `rebuild`, the index is rebuilt from source and ignores stored timestamps. A five-minute reconciliation on the common coordinator stats the store and updates changed paths before any lexical job. It runs for private and shared owners even when qmd is disabled. Publishing metadata does not mark qmd current.  `datastore_status` reports that index's readiness, revision, completeness, and job progress even when qmd is disabled or unavailable. `datastore_tags` lists tag identity, display spelling, and distinct page count. `datastore_read` views `links` and `backlinks` read that index. An attachment backlink is inspected, not opened as Markdown. A continuation on those results is bound to the store, revision, and query, and uses the same read budget check as the first page.
 
-## Shared catalog
+## Shared declarations
+
+A declaration-managed host uses protected, current-user-owned `host.json` in
+`~/.pi/markdown-datastore` (owner-only directory). Choose explicit absolute socket
+and state paths; use the same `defaults` and `qmd` objects shown in the legacy
+example below, and replace its `stores` object with a `reader` object containing
+`maxFileBytes` and `defaultMode`. These are host settings, not per-client
+requirements. The native collection name is generated independently of any
+project alias. Start the operator-managed host with:
+
+```sh
+node dist/shared-service-main.js --host-config "$HOME/.pi/markdown-datastore/host.json"
+```
+
+In a trusted project's `.pi/markdown-datastore/config.json`:
+
+```json
+{
+  "schemaVersion": 1,
+  "stores": {
+    "notes": { "shared": { "root": "/example/notebook", "include": ["**/*.md"], "exclude": [] } }
+  }
+}
+```
+
+`include` and `exclude` can be omitted for the values shown; shared definitions
+use one include pattern. Same-root registrations require the same effective
+arrays, including order and spelling. Use real absolute paths; nesting and
+filesystem aliases are rejected. A trailing directory separator is accepted.
+Shared-only projects need no QMD installation settings. Mixed projects keep
+their existing private settings. The first indexed operation attaches and
+registers as needed; it does not start the host. Direct reads need no host process.
+
+Back up source Markdown, complete project declarations and host settings. The
+host writes protected `registrations.json` beside `host.json` for unattended
+restart with zero clients. It has no project-directory references and can be
+recreated on normal attachment, so a fresh host without that file starts empty.
+Keep it if unattended reconstruction is needed before clients attach. An
+unreadable or invalid snapshot is a configuration error, not a fresh start.
+A missing source leaves its registration reserved and does not stop other
+stores. Native indexes and metadata snapshots can be rebuilt. Historical job
+receipts cannot be derived from Markdown; keep their ledgers if history or
+unfinished work must survive. Do not remove them to fix a registration failure.
+
+The foreground and login lifecycle below also applies to declarations; use
+`--host-config` and the absolute host config path in the LaunchAgent. Changing
+host settings or activating a service remains an operator action.
+
+## Legacy shared catalog
+
+Existing reference-only projects continue to use `--catalog` and their current
+state locations, ownership, and queue provenance. This mode requires no
+conversion. Declaration mode does not import old IDs, state directories or
+ledgers. Do not launch both modes for the same store or switch a live legacy
+store merely by replacing its project reference: a separate migration must
+prove provenance and preserve outstanding work before cutover.
 
 A shared store is opt-in. Write an absolute catalog the operator owns, then reference it from a project store. The catalog's `socketPath`, `stateRoot` and source roots are absolute. The socket parent must be an owner-only directory; the catalog must be a protected current-user-owned file. Its `defaults` and `qmd` fields are the same reader and backend settings a private store already uses, not transport limits.
 

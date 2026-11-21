@@ -1,5 +1,5 @@
 import type { Server, Socket } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { discoverQmdBinding, prepareQmdStateDirectory, qmdApplicationDirectory, QmdAdapter } from "./qmd-adapter.ts";
 import { acquireIndexOwnership, type IndexOwnership } from "./index-ownership.ts";
 import { adoptLegacyApplicationJobs, MaintenanceCoordinator, sourceDefinition } from "./maintenance-coordinator.ts";
@@ -9,6 +9,7 @@ import { clampReadBudget } from "./config-common.ts";
 import { assertRootIdentity, validateRelativeContainedPath } from "./containment.ts";
 import { DatastoreError } from "./errors.ts";
 import { loadSharedCatalog, type SharedCatalog, type SharedStoreDefinition } from "./shared-catalog.ts";
+import { loadDeclarationHostSettings, loadRegistrations } from "./shared-registrations.ts";
 import { attachSharedParser, encodeSharedMessage, generationId, listenOwnedSocket, parseSharedRequest, type SharedCall, type SharedHello, type SharedReply } from "./shared-ipc.ts";
 
 export interface SharedHost {
@@ -32,10 +33,18 @@ function storeConfig(catalog: SharedCatalog, definition: SharedStoreDefinition):
 	};
 }
 
-export async function startSharedHost(catalogPath: string, options: { schedule?: typeof setTimeout } = {}): Promise<SharedHost> {
-	const catalog = await loadSharedCatalog(catalogPath);
+export async function startSharedHost(catalogPath: string, options: { schedule?: typeof setTimeout; declarations?: boolean } = {}): Promise<SharedHost> {
+	const settings = options.declarations ? await loadDeclarationHostSettings(catalogPath) : undefined;
+	const registryOwner = settings ? await acquireIndexOwnership(dirname(settings.path)) : undefined;
+	const { registry, catalog } = await (async () => {
+		try {
+			const registry = settings && await loadRegistrations(settings);
+			const catalog = registry?.catalog ?? await loadSharedCatalog(catalogPath);
+			await prepareQmdStateDirectory(catalog.stateRoot);
+			return { registry, catalog };
+		} catch (error) { await registryOwner?.release(); throw error; }
+	})();
 	const generation = generationId();
-	await prepareQmdStateDirectory(catalog.stateRoot);
 	const adapters = new Map<string, QmdAdapter>();
 	const metadata = new Map<string, MetadataIndex>();
 	const coordinators = new Map<string, MaintenanceCoordinator>();
@@ -47,11 +56,13 @@ export async function startSharedHost(catalogPath: string, options: { schedule?:
 		const currentServer = server;
 		const stopped = currentServer ? new Promise<void>((resolve, reject) => currentServer.close(error => error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING" ? reject(error) : resolve())) : Promise.resolve();
 		for (const socket of sockets) socket.destroy();
+		await registry?.settled();
 		await Promise.allSettled(initializing.values());
 		for (const coordinator of coordinators.values()) coordinator.shutdown();
 		await Promise.all([...coordinators.values()].map((coordinator) => coordinator.settled()));
 		await Promise.all([...ownerships.values()].map((ownership) => ownership.release()));
-		await Promise.all([stopped, ...[...adapters.values()].map(adapter => adapter.shutdown())]);
+		try { await Promise.all([stopped, ...[...adapters.values()].map(adapter => adapter.shutdown())]); }
+		finally { await registryOwner?.release(); }
 	})();
 	const initializing = new Map<string, Promise<void>>();
 	const configs = new Map<string, MarkdownDatastoreConfig>();
@@ -113,12 +124,25 @@ export async function startSharedHost(catalogPath: string, options: { schedule?:
 			const code = error instanceof DatastoreError ? error.code : "STORE_UNAVAILABLE";
 			const applied = error instanceof DatastoreError && error.details?.operationApplied === true;
 			const refreshIds = applied && Array.isArray(error.details?.refreshIds) ? error.details.refreshIds.filter((id): id is string => typeof id === "string" && /^[0-9a-f]{32}$/.test(id)) : [];
-			send({ version: 1, requestId, generation, definitionRevision, ok: false, error: { code, ...(applied ? { details: { operationApplied: true, refreshIds } } : {}) } });
+			const conflicts = error instanceof DatastoreError && Array.isArray(error.details?.conflictingFields) ? error.details.conflictingFields : undefined;
+			send({ version: 1, requestId, generation, definitionRevision, ok: false, error: { code, ...(applied ? { details: { operationApplied: true, refreshIds } } : conflicts ? { details: { conflictingFields: conflicts } } : {}) } });
 		};
 		attachSharedParser(socket, (message) => {
 			let request;
 			try { request = parseSharedRequest(message); } catch (error) { fail(undefined, "", error); socket.destroy(); return; }
 			if (request.operation === "drop") { waiters.get(request.requestId)?.abort(new DatastoreError("CANCELLED")); return; }
+			if (request.operation === "helloDeclaration") {
+				const hello = request;
+				void (async () => {
+					if (!registry) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
+					if (closing) throw new DatastoreError("STORE_UNAVAILABLE");
+					const definition = await registry.register(hello.declaration, hello);
+					await admit(definition.id);
+					const version = adapters.get(definition.id)?.binding.version ?? "metadata";
+					send({ version: 1, requestId: hello.requestId, generation, definitionRevision: definition.definitionRevision, ok: true, result: { generation, version, resultBudgetVersion: 1, store: definition.id } });
+				})().catch(error => fail(hello.requestId, "", error));
+				return;
+			}
 			void handle(request).catch((error) => fail(request.requestId, request.definitionRevision, error));
 		}, () => socket.destroy());
 		const handle = async (message: SharedHello | SharedCall): Promise<void> => {
