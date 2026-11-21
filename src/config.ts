@@ -4,6 +4,7 @@ import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { DatastoreError } from "./errors.ts";
 import { definitionRevision, loadSharedCatalog } from "./shared-catalog.ts";
+import { declarationId, loadDeclarationHostSettings, parseDeclaration, type Declaration } from "./shared-registrations.ts";
 import { inspectConfiguredRoot, provisionSharedStore } from "./root-binding.ts";
 
 import { assertNoDuplicateJsonKeys, HARD_MAX_FILE_BYTES } from "./config-common.ts";
@@ -13,7 +14,7 @@ export type { ResultBudget } from "./config-common.ts";
 export interface DatastoreDefaults { maxResultBytes?: number; maxResultLines?: number; operationTimeoutMs: number }
 export interface QmdConfig { enabled: boolean; installation: { executable?: string; packageRoot?: string }; minimumVersion: string }
 
-export interface SharedStoreReference { catalog: string; store: string; socketPath: string; definitionRevision: string }
+export interface SharedStoreReference { store: string; socketPath: string; definitionRevision: string; declaration?: Declaration & { rootDev: number; rootIno: number } }
 export interface StoreConfig {
 	name: string; configuredRoot: string; root: string; rootWasSymlink: boolean; rootDev: number; rootIno: number;
 	include: string[]; exclude: string[]; maxFileBytes: number;
@@ -131,21 +132,24 @@ export async function loadMarkdownDatastoreConfig(projectRootInput: string, conf
 	const top = record(raw); exactKeys(top, TOP_KEYS);
 	if (top.schemaVersion !== 1) throw new DatastoreError("CONFIG_VERSION_UNSUPPORTED");
 
-	const defaultsRaw = record(top.defaults); exactKeys(defaultsRaw, DEFAULT_KEYS);
+	const storesRaw = record(top.stores);
+	if (Object.keys(storesRaw).length === 0) throw new DatastoreError("CONFIG_INVALID");
+	const sharedDeclarations = Object.values(storesRaw).map(value => record(value).shared).filter(value => value !== undefined && Object.hasOwn(record(value), "root"));
+	const host = sharedDeclarations.length ? await loadDeclarationHostSettings() : undefined;
+	const declarationOnly = host && sharedDeclarations.length === Object.keys(storesRaw).length;
+	const defaultsRaw = record(top.defaults ?? (declarationOnly ? host.defaults : undefined)); exactKeys(defaultsRaw, DEFAULT_KEYS);
 	const defaults: DatastoreDefaults = {
 		maxResultBytes: optionalBudget(defaultsRaw.maxResultBytes),
 		maxResultLines: optionalBudget(defaultsRaw.maxResultLines),
 		operationTimeoutMs: integer(defaultsRaw.operationTimeoutMs, 100, 60_000),
 	};
-	const qmdRaw = record(top.qmd); exactKeys(qmdRaw, QMD_KEYS);
+	const qmdRaw = record(top.qmd ?? (declarationOnly ? { ...host.qmd, enabled: false } : undefined)); exactKeys(qmdRaw, QMD_KEYS);
 	const installationRaw = record(qmdRaw.installation); exactKeys(installationRaw, INSTALL_KEYS);
 	const executable = installationRaw.executable === undefined ? undefined : string(installationRaw.executable);
 	const packageRoot = installationRaw.packageRoot === undefined ? undefined : string(installationRaw.packageRoot);
 	if ((executable === undefined) === (packageRoot === undefined) || (packageRoot !== undefined && !isAbsolute(packageRoot))) throw new DatastoreError("CONFIG_INVALID");
 	const qmd: QmdConfig = { enabled: bool(qmdRaw.enabled), installation: { executable, packageRoot }, minimumVersion: string(qmdRaw.minimumVersion) };
 
-	const storesRaw = record(top.stores);
-	if (Object.keys(storesRaw).length === 0) throw new DatastoreError("CONFIG_INVALID");
 	const stores = new Map<string, StoreConfig>();
 	const unavailableStores = new Map<string, () => Promise<StoreConfig>>();
 	let structuralError: DatastoreError | undefined;
@@ -167,7 +171,25 @@ export async function loadMarkdownDatastoreConfig(projectRootInput: string, conf
 		const storeRaw = record(value);
 		if (Object.hasOwn(storeRaw, "shared")) {
 			exactKeys(storeRaw, SHARED_STORE_KEYS);
-			const sharedRaw = record(storeRaw.shared); exactKeys(sharedRaw, SHARED_REF_KEYS);
+			const sharedRaw = record(storeRaw.shared);
+			if (Object.hasOwn(sharedRaw, "root")) {
+				const declaration = parseDeclaration(sharedRaw);
+				const bind = async () => {
+					const observed = await inspectConfiguredRoot(declaration.root);
+					if (!observed) throw new DatastoreError("STORE_UNAVAILABLE");
+					const store: StoreConfig = {
+						name, configuredRoot: declaration.root, ...declaration, ...observed, rootWasSymlink: false, ...host!.reader,
+						shared: { store: declarationId(declaration.root), socketPath: host!.socketPath, definitionRevision: "", declaration: { ...declaration, ...observed } },
+					};
+					provisionSharedStore(store, () => { if (stores.get(name) === store) stores.delete(name); });
+					stores.set(name, store);
+					return store;
+				};
+				unavailableStores.set(name, bind);
+				try { await bind(); } catch (error) { if (!(error instanceof DatastoreError) || error.code !== "STORE_UNAVAILABLE") throw error; }
+				continue;
+			}
+			exactKeys(sharedRaw, SHARED_REF_KEYS);
 			const catalogPath = string(sharedRaw.catalog);
 			const sharedId = string(sharedRaw.store);
 			if (!isAbsolute(catalogPath) || !STORE_NAME.test(sharedId)) throw new DatastoreError("CONFIG_INVALID");
@@ -182,7 +204,7 @@ export async function loadMarkdownDatastoreConfig(projectRootInput: string, conf
 				const store: StoreConfig = {
 					name, configuredRoot: observed.root, root: observed.root, rootWasSymlink: false, rootDev: observed.rootDev, rootIno: observed.rootIno,
 					include: defined.include, exclude: defined.exclude, maxFileBytes: defined.maxFileBytes, search: defined.search,
-					shared: { catalog: catalog.path, store: sharedId, socketPath: catalog.socketPath, definitionRevision: revision },
+					shared: { store: sharedId, socketPath: catalog.socketPath, definitionRevision: revision },
 				};
 				provisionSharedStore(store, () => { if (stores.get(name) === store) stores.delete(name); });
 				stores.set(name, store); return store;
