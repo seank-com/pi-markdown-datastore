@@ -4,11 +4,12 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { loadMarkdownDatastoreConfig } from "../src/config.ts";
+import { MarkdownDatastoreService } from "../src/service.ts";
 import { SharedIndexClient } from "../src/shared-client.ts";
 import { startSharedHost, type SharedHost } from "../src/shared-host.ts";
 import { declarationId } from "../src/shared-registrations.ts";
 
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, packageRoot?: string) {
 	const base = await realpath(await mkdtemp(join(tmpdir(), "ds-")));
 	const home = process.env.HOME;
 	process.env.HOME = base;
@@ -26,7 +27,7 @@ async function fixture(t: TestContext) {
 	const socketPath = join(base, "run", "s");
 	await mkdir(dirname(settings), { recursive: true, mode: 0o700 });
 	await writeFile(settings, JSON.stringify({ schemaVersion: 1, socketPath, stateRoot,
-		defaults: { operationTimeoutMs: 10000 }, qmd: { enabled: false, installation: { executable: "unused" }, minimumVersion: "2.8.3" },
+		defaults: { operationTimeoutMs: 10000 }, qmd: { enabled: Boolean(packageRoot), installation: packageRoot ? { packageRoot } : { executable: "unused" }, minimumVersion: "2.8.3" },
 		reader: { maxFileBytes: 1048576, defaultMode: "lexical" },
 	}), { mode: 0o600 });
 	const source = async (name: string) => { const root = join(base, name); await mkdir(root, { recursive: true }); await writeFile(join(root, "note.md"), "# Note\n"); return root; };
@@ -39,7 +40,7 @@ async function fixture(t: TestContext) {
 		clients.push(client);
 		return client;
 	};
-	return { base, settings, snapshot, stateRoot, source, attach, start: async () => host = await startSharedHost(settings, { declarations: true }), stop: async () => { await host?.close(); host = undefined; } };
+	return { base, settings, snapshot, stateRoot, socketPath, source, attach, start: async () => host = await startSharedHost(settings, { declarations: true }), stop: async () => { await host?.close(); host = undefined; } };
 }
 
 test("registration reconstructs with zero clients, then from any matching declaration after snapshot loss", async t => {
@@ -75,6 +76,81 @@ test("registration reconstructs with zero clients, then from any matching declar
 	assert.equal(empty.coordinators.size, 0);
 	await second.status();
 	assert.deepEqual([...empty.coordinators.keys()], [declarationId(root)]);
+});
+
+test("declaration direct find and read use local alias and host reader policy without a host", async t => {
+	const f = await fixture(t);
+	const root = await f.source("notes");
+	const settings = JSON.parse(await readFile(f.settings, "utf8"));
+	settings.reader.maxFileBytes = 16;
+	await writeFile(f.settings, JSON.stringify(settings));
+	await writeFile(join(root, "large.md"), "# Too large for host reader policy\n");
+	await f.attach("first", "local", root, ["note.md"]);
+	const service = new MarkdownDatastoreService(await loadMarkdownDatastoreConfig(join(f.base, "first")));
+	t.after(() => service.shutdown());
+	const note = { store: "local", path: "note.md" };
+	const found = await service.find({ store: "local", selectors: [{ kind: "path", path: note.path }] });
+	assert.deepEqual(found.data.candidates.map(match => match.note), [note]);
+	const read = await service.read({ note, view: "content" });
+	assert.deepEqual(read.data.note, note);
+	assert.match(read.data.content!, /# Note/);
+	await assert.rejects(service.read({ note: { ...note, path: "large.md" }, view: "content" }), { code: "FILE_TOO_LARGE" });
+	await assert.rejects(stat(f.socketPath), { code: "ENOENT" });
+	await assert.rejects(stat(f.snapshot), { code: "ENOENT" });
+});
+
+test("host reloads a generated registration snapshot larger than an authored config", async t => {
+	const f = await fixture(t);
+	await f.start();
+	const exclude = ["x".repeat(24 * 1024)];
+	const roots = [];
+	for (const name of ["one", "two", "three"]) {
+		const root = await f.source(name);
+		roots.push(root);
+		await (await f.attach(`project-${name}`, "local", root, exclude)).status();
+	}
+	assert.ok((await stat(f.snapshot)).size > 64 * 1024);
+	await f.stop();
+	const restored = await f.start();
+	assert.deepEqual([...restored.coordinators.keys()].sort(), roots.map(declarationId).sort());
+	for (const root of roots) assert.deepEqual(restored.catalog.stores.get(declarationId(root))?.exclude, exclude);
+});
+
+const nativePackage = process.env.DATASTORE_QMD_PACKAGE;
+test("native lexical declaration host rebuilds from its snapshot before any client attaches", { skip: !nativePackage }, async t => {
+	const f = await fixture(t, nativePackage);
+	const root = await f.source("notes");
+	await writeFile(join(root, "note.md"), "# Copper heron\n");
+	await writeFile(join(root, "second.md"), "# Copper owl\n");
+	await writeFile(join(root, "ignored.md"), "# Copper robin\n");
+	await writeFile(join(root, "outside.txt"), "# Copper finch\n");
+	const id = declarationId(root);
+	const first = await f.attach("first", "original", root, ["ignored.md"]);
+	const waitForLexical = async (host: SharedHost) => {
+		const adapter = host.adapters.get(id)!;
+		assert.ok(adapter, "the public native adapter must be available");
+		assert.equal(adapter.binding.version, "2.8.3");
+		// The host has already called this; await its memoized startup receipt.
+		const receipt = await adapter.startupReconcile([...adapter.config.stores.values()]);
+		await host.coordinators.get(id)!.settled();
+		const job = host.coordinators.get(id)!.get(String(receipt.refreshId));
+		assert.equal(job?.state, "succeeded", JSON.stringify(job));
+		assert.equal(job?.ownership, "startup-reconciliation");
+		assert.equal(adapter.isLexicallyCurrent(id), true);
+		assert.ok(host.coordinators.get(id)!.jobs().every(job => job.mode === "lexical"));
+	};
+	const search = async (client: SharedIndexClient) => (await client.search("copper", "lexical", 20, undefined)).candidates.map(hit => hit.path).sort();
+	const original = await f.start();
+	await first.status();
+	await waitForLexical(original);
+	assert.deepEqual(await search(first), ["note.md", "second.md"]);
+	await f.stop();
+	await rm(f.stateRoot, { recursive: true });
+	const rebuilt = await f.start();
+	await waitForLexical(rebuilt);
+	const second = await f.attach("second", "different", root, ["ignored.md"]);
+	assert.deepEqual(await search(second), ["note.md", "second.md"]);
+	assert.equal(await readFile(join(root, "ignored.md"), "utf8"), "# Copper robin\n");
 });
 
 test("overlapping admissions serialize and failed publication leaves no partial store", async t => {
