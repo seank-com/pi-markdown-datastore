@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { loadMarkdownDatastoreConfig } from "../src/config.ts";
+import { QmdAdapter } from "../src/qmd-adapter.ts";
 import { MarkdownDatastoreService } from "../src/service.ts";
 import { SharedIndexClient } from "../src/shared-client.ts";
 import { startSharedHost, type SharedHost } from "../src/shared-host.ts";
@@ -11,15 +12,23 @@ import { declarationId } from "../src/shared-registrations.ts";
 
 async function fixture(t: TestContext, packageRoot?: string) {
 	const base = await realpath(await mkdtemp(join(tmpdir(), "ds-")));
-	const home = process.env.HOME;
-	process.env.HOME = base;
+	const environment = { HOME: base, ...(packageRoot ? {
+		XDG_CACHE_HOME: join(base, "cache"), XDG_CONFIG_HOME: join(base, "config"), QMD_CONFIG_DIR: join(base, "config", "qmd"),
+	} : {}) };
+	const previous = Object.keys(environment).map(key => [key, process.env[key]] as const);
+	Object.assign(process.env, environment);
 	let host: SharedHost | undefined;
 	const clients: SharedIndexClient[] = [];
 	t.after(async () => {
-		if (home === undefined) delete process.env.HOME; else process.env.HOME = home;
-		await Promise.all(clients.map(client => client.shutdown()));
-		await host?.close();
-		await rm(base, { recursive: true, force: true });
+		try {
+			await Promise.all(clients.map(client => client.shutdown()));
+			await host?.close();
+			await rm(base, { recursive: true, force: true });
+		} finally {
+			for (const [key, value] of previous) {
+				if (value === undefined) delete process.env[key]; else process.env[key] = value;
+			}
+		}
 	});
 	const settings = join(base, ".pi", "markdown-datastore", "host.json");
 	const snapshot = join(dirname(settings), "registrations.json");
@@ -126,12 +135,20 @@ test("native lexical declaration host rebuilds from its snapshot before any clie
 	await writeFile(join(root, "outside.txt"), "# Copper finch\n");
 	const id = declarationId(root);
 	const first = await f.attach("first", "original", root, ["ignored.md"]);
+	const startup = QmdAdapter.prototype.startupReconcile;
+	const receipts = new Map<QmdAdapter, ReturnType<typeof startup>>();
+	t.mock.method(QmdAdapter.prototype, "startupReconcile", function (this: QmdAdapter, ...args: Parameters<typeof startup>) {
+		const receipt = startup.apply(this, args);
+		receipts.set(this, receipt);
+		return receipt;
+	});
 	const waitForLexical = async (host: SharedHost) => {
-		const adapter = host.adapters.get(id)!;
+		const adapter = host.adapters.get(id);
 		assert.ok(adapter, "the public native adapter must be available");
 		assert.equal(adapter.binding.version, "2.8.3");
-		// The host has already called this; await its memoized startup receipt.
-		const receipt = await adapter.startupReconcile([...adapter.config.stores.values()]);
+		const startupReceipt = receipts.get(adapter);
+		assert.ok(startupReceipt, "host must invoke startup reconciliation before it returns or accepts an attachment");
+		const receipt = await startupReceipt;
 		await host.coordinators.get(id)!.settled();
 		const job = host.coordinators.get(id)!.get(String(receipt.refreshId));
 		assert.equal(job?.state, "succeeded", JSON.stringify(job));
