@@ -420,8 +420,13 @@ and ledger provenance checks for the three current clients. Removing old-format
 support after all three migrate is part of this rollout. Today a host starts in
 one mode; it does not serve a mix of reference-only and declaration clients.
 `--host-config` does not import old receipt or index namespaces. Do not run both
-modes over the same store. The migration procedure, including preservation of
-outstanding work, is not yet established.
+modes over the same store. The stopped cutover prepares a new ledger generation
+only after verifying terminal legacy receipts. `shared-cutover` validates copies
+under the existing ownership leases and retains the original ledger bytes and
+binding context as historical evidence; it never adopts or rewrites receipts.
+The separate state root must be unused. The operator keeps the old service
+stopped through conversion and controls activation; preparation alone does not
+reserve or start the new host. See the staged conversion in `setup.md`.
 
 Indexed search, refresh, status and job cancellation for a shared store go to one foreground local service. The maintenance owner is `MaintenanceCoordinator`. `MetadataIndex` and `wiki` own graph and tag state. `QmdAdapter` is the optional qmd backend and is injected with that coordinator; it does not own the common ledger. The catalog's `qmd.enabled: false` disables native adapter creation regardless of installed packages. Graph-only and qmd-unavailable stores still have one coordinator and one metadata index per canonical store; accepted metadata jobs remain cancellable through that coordinator without a backend. The project does not keep a second coordinator or a private replacement index. If the service is unavailable, shared indexed operations fail and direct reads continue. Shutdown settles accepted work before releasing ownership.
 

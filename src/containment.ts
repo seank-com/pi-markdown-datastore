@@ -12,7 +12,9 @@ export interface SafeNote {
 }
 export interface SafeNoteMetadata { note: NoteRef; mtime: string; size: number }
 
-const STORE_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
+// Host-side note opens also construct URIs using a generated shared ID.
+// Project config still validates its aliases separately.
+const STORE_NAME = /^(?:[a-z][a-z0-9_-]{0,31}|s-[0-9a-f]{64})$/;
 const CONTROL = /[\u0000-\u001F\u007F]/;
 const UNRESERVED = /^[A-Za-z0-9._~-]$/;
 

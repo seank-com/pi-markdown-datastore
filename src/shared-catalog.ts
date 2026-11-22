@@ -56,7 +56,7 @@ function integer(value: unknown, min: number, max: number): number {
 	return value as number;
 }
 
-export async function readOwnedFile(path: string, configuration = true): Promise<string> {
+export async function readOwnedBytes(path: string, configuration = true): Promise<Buffer> {
 	const before = await lstat(path).catch((error) => { if (configuration && isRootUnavailable(error)) throw new DatastoreError("STORE_UNAVAILABLE"); throw error; });
 	if (!before.isFile() || before.isSymbolicLink() || before.uid !== process.getuid?.() || (before.mode & 0o077) !== 0 || (configuration && before.size > 64 * 1024)) throw new DatastoreError("CONFIG_INVALID");
 	const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
@@ -71,8 +71,13 @@ export async function readOwnedFile(path: string, configuration = true): Promise
 			offset += read.bytesRead;
 		}
 		if (offset !== bytes.length) throw new DatastoreError("CONFIG_INVALID");
-		try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes); } catch { throw new DatastoreError("CONFIG_INVALID"); }
+		return bytes;
 	} finally { await handle.close(); }
+}
+
+export async function readOwnedFile(path: string, configuration = true): Promise<string> {
+	const bytes = await readOwnedBytes(path, configuration);
+	try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes); } catch { throw new DatastoreError("CONFIG_INVALID"); }
 }
 
 export function definitionRevision(value: unknown): string {

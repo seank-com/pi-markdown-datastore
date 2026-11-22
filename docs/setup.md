@@ -170,7 +170,44 @@ queue provenance. The current service runs in one mode at a time and does not
 support mixed reference-only and declaration clients on one host. Declaration
 mode does not import old IDs, state directories or ledgers. Do not run both
 modes over the same store or change client config alone: the migration procedure
-must first establish how to preserve outstanding work.
+uses a terminal-only conversion, not receipt adoption.
+
+### Staged conversion for the three current clients
+
+1. Stage each new client package separately with its old project config and the
+   existing `--catalog` host. Verify shared search after each package move. Do
+   not change config formats during this stage.
+2. In a separately authorized common window, let maintenance finish, then stop
+   the old service and keep it stopped. Shared indexed operations will be down
+   during conversion; direct operations do not depend on the shared socket.
+3. With the host stopped, prepare an inert bundle outside logs and choose an
+   unused, explicit derived-state directory:
+
+   ```sh
+   node dist/shared-cutover-main.js /example/catalog.json /example/recovery/cutover /example/new-state
+   ```
+
+   The command refuses unfinished receipts (including work requeued at stop),
+   unverifiable definitions or ledgers, uncertain or active owners, and existing
+   output paths. It checks catalog members under their existing ownership leases.
+   It does not cancel jobs or modify source, input configs or ledger bytes.
+   A completed bundle has `report.json`, exact catalog and ledger copies with
+   ledger hashes and binding context, and candidate `host.json` and
+   `registrations.json`. Keep this bundle as history, not as a live queue.
+4. Review the candidates and retain the old service and project configs for
+   rollback. Install the host candidates in the protected host directory, and
+   replace each old `shared` reference with the corresponding complete
+   declaration from `report.json`, keeping its alias and all unrelated private
+   settings. Start only the declaration host and activate the new project configs
+   sequentially. Its new derived state is rebuilt from Markdown. The old receipts
+   are not visible in its new active ledger.
+5. Before new admissions, rollback can stop the candidate and restore the old
+   host and project configs with their original state. Once the new host has
+   admitted work (including startup reconciliation), this is no longer a
+   state-preserving rollback: preserve the new state and obtain a separate
+   disposition for that work. Never copy a new ledger into an old namespace.
+   Remove the old config format, host mode, and temporary preparation command
+   after all three actual clients have migrated and been accepted.
 
 A shared store is opt-in. Write an absolute catalog the operator owns, then reference it from a project store. The catalog's `socketPath`, `stateRoot` and source roots are absolute. The socket parent must be an owner-only directory; the catalog must be a protected current-user-owned file. Its `defaults` and `qmd` fields are the same reader and backend settings a private store already uses, not transport limits.
 

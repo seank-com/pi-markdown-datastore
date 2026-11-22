@@ -20,7 +20,7 @@ export interface SharedHost {
 	close: () => Promise<void>;
 }
 
-function storeConfig(catalog: SharedCatalog, definition: SharedStoreDefinition): MarkdownDatastoreConfig {
+export function sharedStoreConfig(catalog: SharedCatalog, definition: SharedStoreDefinition): MarkdownDatastoreConfig {
 	const store: StoreConfig = {
 		name: definition.id, configuredRoot: definition.root, root: definition.root, rootWasSymlink: false,
 		rootDev: definition.rootDev, rootIno: definition.rootIno, include: definition.include, exclude: definition.exclude,
@@ -73,7 +73,7 @@ export async function startSharedHost(catalogPath: string, options: { schedule?:
 			const definition = catalog.stores.get(id) ?? await catalog.unavailableStores.get(id)?.();
 			if (!definition) throw new DatastoreError("STORE_UNKNOWN");
 			let config = configs.get(id);
-			if (!config) { config = storeConfig(catalog, definition); configs.set(id, config); }
+			if (!config) { config = sharedStoreConfig(catalog, definition); configs.set(id, config); }
 			await assertRootIdentity(config.stores.get(id)!).catch(() => { throw new DatastoreError("STORE_UNAVAILABLE", { sourceRoot: true }); });
 			if (coordinators.has(id)) return;
 			if (closing) throw new DatastoreError("STORE_UNAVAILABLE");
@@ -169,10 +169,10 @@ export async function startSharedHost(catalogPath: string, options: { schedule?:
 					const paths = Array.isArray(call.input?.paths) ? call.input.paths.map((path) => validateRelativeContainedPath(path as string)) : [];
 					if (call.input?.rebuild === true && paths.length) throw new DatastoreError("INVALID_NOTE_REF");
 					if (paths.length) coordinator.notePaths(message.store, paths);
-					result = await coordinator.enqueue("metadata", [message.store], "explicit-maintenance", sourceDefinition([storeConfig(catalog, definition).stores.get(message.store)!]), call.input?.rebuild === true || call.input?.paths === undefined ? "rebuild" : undefined);
+					result = await coordinator.enqueue("metadata", [message.store], "explicit-maintenance", sourceDefinition([sharedStoreConfig(catalog, definition).stores.get(message.store)!]), call.input?.rebuild === true || call.input?.paths === undefined ? "rebuild" : undefined);
 				}
 				else if (call.operation === "links" || call.operation === "backlinks" || call.operation === "tagPages" || call.operation === "tags") {
-					const store = storeConfig(catalog, definition).stores.get(message.store);
+					const store = sharedStoreConfig(catalog, definition).stores.get(message.store);
 					if (!store) throw new DatastoreError("STORE_UNAVAILABLE");
 					const snapshot = await index.requireSnapshot();
 					const budget = clampReadBudget({ maxBytes: call.input?.maxBytes, maxLines: call.input?.maxLines }, { maxBytes: catalog.defaults.maxResultBytes, maxLines: catalog.defaults.maxResultLines });
