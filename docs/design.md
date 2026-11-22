@@ -21,11 +21,13 @@ qmd owns indexing, embeddings, ranking, model lifetime, cache storage and recove
 ## Identity and source validation
 
 Each trusted project supplies protected strict JSON configuration at
-`.pi/markdown-datastore/config.json`. Project store aliases are unique. Private definitions keep root and collection
+`.pi/markdown-datastore/config.json`. Project-local tool aliases are unique within each project's `stores` object. Private definitions keep root and collection
 uniqueness within their project-owned backend. Declaration-managed shared stores use the canonical absolute Markdown root as
 identity, with an independent backend namespace per root. Legacy catalogs keep
 their explicit IDs. Private and legacy definitions retain their original
-identity rules; a backend-local collection name can recur in independent indexes. Unknown/duplicate keys and unsafe configuration authority
+identity rules. A qmd collection name is scoped to its physical index, not to
+a project or to the host; separate indexes can each contain a collection named
+`notes`. Unknown/duplicate keys and unsafe configuration authority
 paths fail closed. Configuration is current-user-owned, at most 64 KiB and mode
 0600; authority directories have checked ownership and permissions.
 
@@ -388,7 +390,12 @@ reference. A complete declaration supplies an absolute canonical root and
 optional include/exclude arrays (effective defaults `["**/*.md"]` and `[]`).
 The declaration host rejects ancestor/descendant roots using path components.
 A repeated root joins only if both effective arrays match element-for-element.
-Aliases, backend settings and internal IDs are not registration equality fields.
+A tool alias is the project's `stores` key, not a qmd collection name or
+shared-store ID. For example, one project can call `/example/notebook` `notes`
+and another can call it `reference`; both use the same index if their patterns
+match. A third project can call a different root `/example/manuals` `notes`
+without a naming conflict. Aliases, backend settings and internal IDs are not
+registration equality fields.
 A private store over the same source remains a separate index. Direct find,
 read, outline and root policy stay in the project and do not require a socket.
 
@@ -408,12 +415,13 @@ already-bound store. The service returns a root-derived internal ID and current
 definition revision on attachment; the client pins them separately from the live
 generation. No add/remove-project lifecycle or definition hot reload is implied.
 
-The `--catalog` compatibility mode still uses explicit catalog IDs, existing
-state paths and the existing ledger provenance checks. `--host-config` does
-not convert reference-only clients or migrate old receipt/index namespaces.
-Switching a legacy store to a declaration is not a configuration shortcut to
-abandon its queue; continue using the original catalog until a separate,
-proven migration is available. Do not run both modes over the same store.
+`--catalog` temporarily preserves explicit catalog IDs, existing state paths,
+and ledger provenance checks for the three current clients. Removing old-format
+support after all three migrate is part of this rollout. Today a host starts in
+one mode; it does not serve a mix of reference-only and declaration clients.
+`--host-config` does not import old receipt or index namespaces. Do not run both
+modes over the same store. The migration procedure, including preservation of
+outstanding work, is not yet established.
 
 Indexed search, refresh, status and job cancellation for a shared store go to one foreground local service. The maintenance owner is `MaintenanceCoordinator`. `MetadataIndex` and `wiki` own graph and tag state. `QmdAdapter` is the optional qmd backend and is injected with that coordinator; it does not own the common ledger. The catalog's `qmd.enabled: false` disables native adapter creation regardless of installed packages. Graph-only and qmd-unavailable stores still have one coordinator and one metadata index per canonical store; accepted metadata jobs remain cancellable through that coordinator without a backend. The project does not keep a second coordinator or a private replacement index. If the service is unavailable, shared indexed operations fail and direct reads continue. Shutdown settles accepted work before releasing ownership.
 

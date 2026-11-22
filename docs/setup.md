@@ -115,8 +115,7 @@ A declaration-managed host uses protected, current-user-owned `host.json` in
 and state paths; use the same `defaults` and `qmd` objects shown in the legacy
 example below, and replace its `stores` object with a `reader` object containing
 `maxFileBytes` and `defaultMode`. These are host settings, not per-client
-requirements. The native collection name is generated independently of any
-project alias. Start the operator-managed host with:
+requirements. Start the operator-managed host with:
 
 ```sh
 node dist/shared-service-main.js --host-config "$HOME/.pi/markdown-datastore/host.json"
@@ -132,6 +131,12 @@ In a trusted project's `.pi/markdown-datastore/config.json`:
   }
 }
 ```
+
+`notes` is a tool alias, unique among this project's `stores` keys. Another
+project can use `reference` for `/example/notebook`, or use `notes` for a
+separate root such as `/example/manuals`. Neither alias chooses a qmd collection
+name. The separate physical indexes for those roots can each use a collection
+named `notes`.
 
 `include` and `exclude` can be omitted for the values shown; shared definitions
 use one include pattern. Same-root registrations require the same effective
@@ -158,12 +163,14 @@ host settings or activating a service remains an operator action.
 
 ## Legacy shared catalog
 
-Existing reference-only projects continue to use `--catalog` and their current
-state locations, ownership, and queue provenance. This mode requires no
-conversion. Declaration mode does not import old IDs, state directories or
-ledgers. Do not launch both modes for the same store or switch a live legacy
-store merely by replacing its project reference: a separate migration must
-prove provenance and preserve outstanding work before cutover.
+The existing reference-only format is retained for the rollout to the three
+current clients and will be removed as part of this work after all three migrate.
+Until cutover, `--catalog` uses the existing state locations, ownership, and
+queue provenance. The current service runs in one mode at a time and does not
+support mixed reference-only and declaration clients on one host. Declaration
+mode does not import old IDs, state directories or ledgers. Do not run both
+modes over the same store or change client config alone: the migration procedure
+must first establish how to preserve outstanding work.
 
 A shared store is opt-in. Write an absolute catalog the operator owns, then reference it from a project store. The catalog's `socketPath`, `stateRoot` and source roots are absolute. The socket parent must be an owner-only directory; the catalog must be a protected current-user-owned file. Its `defaults` and `qmd` fields are the same reader and backend settings a private store already uses, not transport limits.
 
