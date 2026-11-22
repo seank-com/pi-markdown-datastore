@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -114,6 +114,15 @@ void policy.roots({}); void policy.validateDestination({ path: "/example/new.md"
       assert.equal(JSON.parse(await invoke(["--initialize-terminal-history"])).initialized, false);
       for (const name of ["@earendil-works", "typebox"]) await assert.rejects(stat(join(consumer, "node_modules", name)), { code: "ENOENT" });
     } finally { await rm(state, { recursive: true, force: true }); }
+  });
+  await t.test("shared cutover CLI loads without installed Pi peers", async () => {
+    for (const name of ["@earendil-works", "typebox"]) await assert.rejects(stat(join(consumer, "node_modules", name)), { code: "ENOENT" });
+    const cli = join(consumer, "node_modules/@seank/pi-markdown-datastore/dist/shared-cutover-main.js");
+    const result = spawnSync(process.execPath, [cli], { cwd: consumer, encoding: "utf8" });
+    assert.ifError(result.error);
+    assert.equal(result.signal, null);
+    assert.equal(result.status, 2, result.stderr);
+    assert.match(result.stderr, /^usage: shared-cutover-main /);
   });
   const sdkRoot = await createQmdFixture(consumer);
   await writeFile(join(consumer, "probe.ts"), `

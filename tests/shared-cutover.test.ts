@@ -82,6 +82,18 @@ test("three client rollout refuses unsafe history and prepares a separate genera
 	await assert.rejects(stat(newState), { code: "ENOENT" });
 	const report = JSON.parse(await readFile(join(bundle, "report.json"), "utf8"));
 	assert.equal(report.generation, "new-ledgers-no-adoption");
+
+	// Preparing the bundle must not prevent restarting the original service.
+	host = await startSharedHost(catalog);
+	for (const { client } of old) await client.status();
+	const recovered = host.coordinators.get("notebook")!.get(id);
+	assert.equal(recovered?.state, "succeeded");
+	assert.deepEqual(JSON.parse(JSON.stringify(recovered)), JSON.parse(stoppedBytes).jobs.find((job: { refreshId: string }) => job.refreshId === id));
+	await stop();
+	assert.equal(await readFile(oldJobs, "utf8"), stoppedBytes);
+	assert.equal(await readFile(join(bundle, "ledger-0.json"), "utf8"), stoppedBytes);
+	await assert.rejects(stat(newState), { code: "ENOENT" });
+
 	const configDir = join(base, ".pi", "markdown-datastore");
 	await mkdir(configDir, { recursive: true, mode: 0o700 });
 	for (const file of ["host.json", "registrations.json"]) await writeFile(join(configDir, file), await readFile(join(bundle, file)), { mode: 0o600 });
