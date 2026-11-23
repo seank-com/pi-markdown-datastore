@@ -9,6 +9,8 @@ import { MetadataIndex, registerMetadata } from "../src/metadata-index.ts";
 import { MarkdownDatastoreService } from "../src/service.ts";
 import { SharedIndexClient } from "../src/shared-client.ts";
 import { startSharedHost } from "../src/shared-host.ts";
+import { declarationId } from "../src/shared-registrations.ts";
+import { writeDeclarationHost } from "./fixtures/declaration-host.ts";
 
 async function fixture(t: any, shared = false) {
  const root = await realpath(await mkdtemp("/tmp/budget-boundaries-"));
@@ -23,13 +25,15 @@ async function fixture(t: any, shared = false) {
  const continuations = new ContinuationRegistry(4);
  let service: MarkdownDatastoreService, coordinator: MaintenanceCoordinator;
  if (shared) {
-  const catalogPath = join(root, "catalog.json"), store = config.stores.get("notes")!;
-  await writeFile(catalogPath, JSON.stringify({ schemaVersion: 1, socketPath: join(root, "owner.sock"), stateRoot: join(root, "host-state"), defaults: config.defaults, qmd: config.qmd, stores: { canonical: { root: notes, include: store.include, exclude: store.exclude, maxFileBytes: store.maxFileBytes, search: store.search } } }), { mode: 0o600 });
-  const host = await startSharedHost(catalogPath);
+  const store = config.stores.get("notes")!;
+  const previousHome = process.env.HOME; process.env.HOME = root; t.after(() => { if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome; });
+  const hostPath = await writeDeclarationHost(join(root, ".pi", "markdown-datastore"), { socketPath: join(root, "owner.sock"), stateRoot: join(root, "host-state"), defaults: config.defaults, qmd: config.qmd, reader: { maxFileBytes: store.maxFileBytes, defaultMode: store.search.defaultMode }, stores: [{ root: notes, include: store.include, exclude: store.exclude }] });
+  const host = await startSharedHost(hostPath);
   t.after(() => host.close());
-  coordinator = host.coordinators.get("canonical")!;
-  await coordinator.enqueue("metadata", ["canonical"]); await coordinator.settled();
-  await writeFile(path, JSON.stringify({ schemaVersion: 1, defaults: config.defaults, qmd: config.qmd, stores: { notes: { shared: { catalog: catalogPath, store: "canonical" } } } }), { mode: 0o600 });
+  const id = declarationId(notes);
+  coordinator = host.coordinators.get(id)!;
+  await coordinator.enqueue("metadata", [id]); await coordinator.settled();
+  await writeFile(path, JSON.stringify({ schemaVersion: 1, defaults: config.defaults, qmd: config.qmd, stores: { notes: { shared: { root: notes, include: store.include, exclude: store.exclude } } } }), { mode: 0o600 });
   config = await loadMarkdownDatastoreConfig(root, path);
   const attachment = config.stores.get("notes")!.shared!;
   service = new MarkdownDatastoreService(config, continuations, undefined, new Map([["notes", new SharedIndexClient(attachment)]]));
@@ -110,7 +114,7 @@ test("all shared admissions remain identifiable when a finite response fails, an
  const { service } = await fixture(t);
  const ids = ["ab".repeat(16), "cd".repeat(16)]; let admissions = 0;
  const base = service.config.stores.get("notes")!;
- const stores = new Map(ids.map((_id, i) => ["alias" + i, { ...base, name: "alias" + i, shared: { catalog: "fixture", socketPath: "fixture", definitionRevision: "fixture", store: "canonical" + i } }]));
+ const stores = new Map(ids.map((_id, i) => ["alias" + i, { ...base, name: "alias" + i, shared: { socketPath: "fixture", definitionRevision: "a".repeat(64), store: "s-" + (i === 0 ? "ab" : "cd").repeat(32), declaration: { root: base.root, include: base.include, exclude: base.exclude, rootDev: base.rootDev, rootIno: base.rootIno } } }]));
  const clients = new Map(ids.map((refreshId, i) => ["alias" + i, { startLexical: async () => { admissions++; return { refreshId }; }, shutdown: async () => {} } as unknown as SharedIndexClient]));
  const subject = new MarkdownDatastoreService({ ...service.config, stores }, undefined, undefined, clients);
  t.after(() => subject.shutdown());

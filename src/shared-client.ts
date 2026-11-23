@@ -7,7 +7,7 @@ import { attachSharedParser, connectSharedSocket, encodeSharedMessage, parseShar
 import type { Declaration } from "./shared-registrations.ts";
 import { SHARED_STORE_ID } from "./shared-ipc.ts";
 
-export interface SharedAttachment { socketPath: string; store: string; definitionRevision: string; declaration?: Declaration & { rootDev: number; rootIno: number } }
+export interface SharedAttachment { socketPath: string; store: string; definitionRevision: string; declaration: Declaration & { rootDev: number; rootIno: number } }
 interface Waiter { resolve(value: unknown): void; reject(error: unknown): void }
 
 export class SharedIndexClient {
@@ -42,13 +42,15 @@ export class SharedIndexClient {
 	private async open(): Promise<Socket> {
 		const signal = this.#lifecycle.signal;
 		throwIfAborted(signal);
+		const observed = this.attachment.declaration;
+		if (!observed) throw new DatastoreError("CONFIG_INVALID");
 		let socket: Socket;
 		try { socket = await connectSharedSocket(this.attachment.socketPath, signal); }
 		catch { this.observation?.rejected(); throw signal.aborted ? abortError(signal) : new DatastoreError("STORE_UNAVAILABLE"); }
 		this.#connecting = socket;
 		const pending = new Map<string, Waiter>();
 		let boundGeneration: string | undefined;
-		let boundRevision = this.attachment.declaration ? undefined : this.attachment.definitionRevision;
+		let boundRevision: string | undefined;
 		const retire = (error: unknown) => { socket.destroy(); for (const waiter of pending.values()) waiter.reject(error); pending.clear(); };
 		attachSharedParser(socket, message => {
 			let reply: SharedReply;
@@ -71,11 +73,9 @@ export class SharedIndexClient {
 		try {
 			const hello = await this.send(socket, pending, "hello", undefined, signal) as { generation?: string; version?: string; resultBudgetVersion?: number; store?: string };
 			if (typeof hello?.generation !== "string" || hello.generation !== boundGeneration || typeof hello.version !== "string") throw new DatastoreError("BACKEND_OUTPUT_INVALID");
-			if (this.attachment.declaration) {
-				if (!hello.store || !SHARED_STORE_ID.test(hello.store) || !boundRevision || !/^[0-9a-f]{64}$/.test(boundRevision)) throw new DatastoreError("BACKEND_OUTPUT_INVALID");
-				if (this.#attachedDefinition && (this.#attachedDefinition.store !== hello.store || this.#attachedDefinition.definitionRevision !== boundRevision)) throw new DatastoreError("STORE_UNAVAILABLE");
-				this.#attachedDefinition = { store: hello.store, definitionRevision: boundRevision };
-			}
+			if (!hello.store || !SHARED_STORE_ID.test(hello.store) || !boundRevision || !/^[0-9a-f]{64}$/.test(boundRevision)) throw new DatastoreError("BACKEND_OUTPUT_INVALID");
+			if (this.#attachedDefinition && (this.#attachedDefinition.store !== hello.store || this.#attachedDefinition.definitionRevision !== boundRevision)) throw new DatastoreError("STORE_UNAVAILABLE");
+			this.#attachedDefinition = { store: hello.store, definitionRevision: boundRevision };
 			if (hello.resultBudgetVersion !== 1) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
 			throwIfAborted(signal);
 			if (socket.destroyed) throw new DatastoreError("STORE_UNAVAILABLE");
@@ -91,11 +91,10 @@ export class SharedIndexClient {
 		const id = requestId();
 		const binding = this.#attachedDefinition ?? { store: this.attachment.store, definitionRevision: this.attachment.definitionRevision };
 		const observed = this.attachment.declaration;
+		if (!observed) throw new DatastoreError("CONFIG_INVALID");
 		const payload = operation !== "hello"
 			? { version: 1, operation, requestId: id, generation: this.#generation, ...binding, input }
-			: observed
-				? { version: 1, operation: "helloDeclaration", requestId: id, rootDev: observed.rootDev, rootIno: observed.rootIno, declaration: { root: observed.root, include: observed.include, exclude: observed.exclude } }
-				: { version: 1, operation, requestId: id, ...binding };
+			: { version: 1, operation: "helloDeclaration", requestId: id, rootDev: observed.rootDev, rootIno: observed.rootIno, declaration: { root: observed.root, include: observed.include, exclude: observed.exclude } };
 		return new Promise((resolve, reject) => {
 			const finish = (error?: unknown, value?: unknown) => { signal?.removeEventListener("abort", abort); if (error) reject(error); else resolve(value); };
 			const abort = () => { pending.delete(id); if (!socket.destroyed) socket.write(encodeSharedMessage({ version: 1, operation: "drop", requestId: id })); finish(abortError(signal)); };

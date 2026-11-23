@@ -9,7 +9,8 @@ import { MetadataIndex, reconcileChanged, registerMetadata } from "../src/metada
 import { MarkdownDatastoreService } from "../src/service.ts";
 import type { RefreshInput } from "../src/contract.ts";
 import { startSharedHost } from "../src/shared-host.ts";
-import { loadSharedCatalog } from "../src/shared-catalog.ts";
+import { declarationId } from "../src/shared-registrations.ts";
+import { writeDeclarationHost } from "./fixtures/declaration-host.ts";
 import { SharedIndexClient } from "../src/shared-client.ts";
 
 async function store() {
@@ -141,22 +142,21 @@ test("a shared owner runs the injected clock and graph work before qmd", async (
 	await mkdir(notes);
 	await mkdir(state, { mode: 0o700 });
 	await writeFile(join(notes, "a.md"), "one\n");
-	const catalogPath = join(root, "catalog.json");
-	await writeFile(catalogPath, JSON.stringify({ schemaVersion: 1, socketPath: join(socketDir, "s.sock"), stateRoot: state, defaults: { maxResultBytes: 8192, maxResultLines: 100, operationTimeoutMs: 3000 }, qmd: { enabled: false, installation: { executable: "qmd" }, minimumVersion: "2.8.3" }, stores: { notebook: { root: notes, include: ["**/*.md"], exclude: [], maxFileBytes: 4096, search: { defaultMode: "lexical", qmdCollection: "notebook" } } } }), { mode: 0o600 });
+	const hostPath = await writeDeclarationHost(join(root, "host"), { socketPath: join(socketDir, "s.sock"), stateRoot: state, defaults: { maxResultBytes: 8192, maxResultLines: 100, operationTimeoutMs: 3000 }, qmd: { enabled: false, installation: { executable: "qmd" }, minimumVersion: "2.8.3" }, reader: { maxFileBytes: 4096, defaultMode: "lexical" }, stores: [{ root: notes }] });
 	let callback: (() => void) | undefined;
-	const host = await startSharedHost(catalogPath, { schedule: ((stored: () => void) => { callback = stored; return { unref() {}, ref() {} } as ReturnType<typeof setTimeout>; }) as typeof setTimeout });
+	const host = await startSharedHost(hostPath, { schedule: ((stored: () => void) => { callback = stored; return { unref() {}, ref() {} } as ReturnType<typeof setTimeout>; }) as typeof setTimeout });
 	let client: SharedIndexClient | undefined;
 	t.after(async () => { await client?.shutdown(); await host.close(); await rm(root, { recursive: true, force: true }); });
-	const coordinator = host.coordinators.get("notebook")!;
+	const coordinator = host.coordinators.get(declarationId(notes))!;
 	let sawMetadata = false;
 	coordinator.register("lexical", async () => { sawMetadata = coordinator.jobs().some((job) => job.mode === "metadata" && job.state === "succeeded"); });
 	await writeFile(join(notes, "a.md"), "two\n");
 	callback?.();
 	await coordinator.settled();
 	assert.equal(sawMetadata, true);
-	const catalog = await loadSharedCatalog(catalogPath);
-	assert.equal(catalog.stores.has("notebook"), true);
-	client = new SharedIndexClient({ socketPath: catalog.socketPath, store: "notebook", definitionRevision: catalog.stores.get("notebook")!.definitionRevision });
+	const defined = host.state.stores.get(declarationId(notes))!;
+	assert.equal(defined.root, notes);
+	client = new SharedIndexClient({ socketPath: host.state.socketPath, store: defined.id, definitionRevision: defined.definitionRevision, declaration: { root: defined.root, include: defined.include, exclude: defined.exclude, rootDev: defined.rootDev, rootIno: defined.rootIno } });
 	await assert.rejects(client.startMetadata(undefined, []), { code: "INVALID_NOTE_REF" });
 });
 

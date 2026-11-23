@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, open, realpath } from "node:fs/promises";
+import { lstat, open } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import type { QmdConfig, StoreConfig } from "./config.ts";
 import { assertNoDuplicateJsonKeys } from "./config-common.ts";
 import { DatastoreError } from "./errors.ts";
-import { inspectConfiguredRoot, isRootUnavailable } from "./root-binding.ts";
+import { isRootUnavailable } from "./root-binding.ts";
 
 export interface SharedStoreDefinition {
 	id: string;
@@ -27,18 +27,14 @@ export interface SharedHostSettings {
 	qmd: QmdConfig;
 }
 
-export interface SharedCatalog extends SharedHostSettings {
+export interface SharedHostState extends SharedHostSettings {
 	stores: ReadonlyMap<string, SharedStoreDefinition>;
 	unavailableStores: ReadonlyMap<string, () => Promise<SharedStoreDefinition>>;
 }
 
-const TOP = new Set(["schemaVersion", "socketPath", "stateRoot", "defaults", "qmd", "stores"]);
 const DEFAULTS = new Set(["maxResultBytes", "maxResultLines", "operationTimeoutMs"]);
 const QMD = new Set(["enabled", "installation", "minimumVersion"]);
 const INSTALL = new Set(["executable", "packageRoot"]);
-const STORE = new Set(["root", "include", "exclude", "maxFileBytes", "search"]);
-const SEARCH = new Set(["defaultMode", "qmdCollection"]);
-const NAME = /^[a-z][a-z0-9_-]{0,31}$/;
 
 function record(value: unknown): Record<string, unknown> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new DatastoreError("CONFIG_INVALID");
@@ -84,23 +80,6 @@ export function definitionRevision(value: unknown): string {
 	return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
-export async function loadSharedCatalog(pathInput: string): Promise<SharedCatalog> {
-	try { return await parseSharedCatalog(pathInput); }
-	catch (error) {
-		if (error instanceof DatastoreError) throw error;
-		throw new DatastoreError(isRootUnavailable(error) ? "STORE_UNAVAILABLE" : "CONFIG_INVALID");
-	}
-}
-async function parseSharedCatalog(pathInput: string): Promise<SharedCatalog> {
-	if (!isAbsolute(pathInput)) throw new DatastoreError("CONFIG_INVALID");
-	const path = await realpath(pathInput).catch((error) => { if (isRootUnavailable(error)) throw new DatastoreError("STORE_UNAVAILABLE"); throw new DatastoreError("CONFIG_INVALID"); });
-	const top = parseSharedJson(await readOwnedFile(path)); exact(top, TOP);
-	const settings = parseSharedSettings(path, top);
-	const { qmd } = settings;
-	const storesRaw = record(top.stores);
-	return bindCatalog(settings, storesRaw);
-}
-
 export function parseSharedJson(body: string): Record<string, unknown> {
 	assertNoDuplicateJsonKeys(body);
 	try { return record(JSON.parse(body)); } catch { throw new DatastoreError("CONFIG_INVALID"); }
@@ -125,40 +104,4 @@ export function parseSharedSettings(path: string, top: Record<string, unknown>):
 	if (typeof qmdRaw.enabled !== "boolean") throw new DatastoreError("CONFIG_INVALID");
 	const qmd: QmdConfig = { enabled: qmdRaw.enabled, installation: { executable, packageRoot }, minimumVersion: text(qmdRaw.minimumVersion) };
 	return { path, socketPath, stateRoot, defaults, qmd };
-}
-
-async function bindCatalog(settings: SharedHostSettings, storesRaw: Record<string, unknown>): Promise<SharedCatalog> {
-	const { qmd } = settings;
-	if (Object.keys(storesRaw).length === 0) throw new DatastoreError("CONFIG_INVALID");
-	const stores = new Map<string, SharedStoreDefinition>();
-	const unavailableStores = new Map<string, () => Promise<SharedStoreDefinition>>();
-	for (const [id, value] of Object.entries(storesRaw)) {
-		if (!NAME.test(id)) throw new DatastoreError("CONFIG_INVALID");
-		const storeRaw = record(value); exact(storeRaw, STORE);
-		const configuredRoot = text(storeRaw.root);
-		if (!isAbsolute(configuredRoot)) throw new DatastoreError("CONFIG_INVALID");
-		const captured = await inspectConfiguredRoot(configuredRoot);
-		const searchRaw = record(storeRaw.search); exact(searchRaw, SEARCH);
-		const defaultMode = text(searchRaw.defaultMode) as StoreConfig["search"]["defaultMode"];
-		const qmdCollection = text(searchRaw.qmdCollection);
-		if (!["lexical", "semantic", "hybrid"].includes(defaultMode) || !NAME.test(qmdCollection)) throw new DatastoreError("CONFIG_INVALID");
-		const include = storeRaw.include === undefined ? ["**/*.md"] : (Array.isArray(storeRaw.include) ? storeRaw.include.map(text) : (() => { throw new DatastoreError("CONFIG_INVALID"); })());
-		if (include.length !== 1) throw new DatastoreError("CONFIG_INVALID");
-		const exclude = storeRaw.exclude === undefined ? [] : (Array.isArray(storeRaw.exclude) ? storeRaw.exclude.map(text) : (() => { throw new DatastoreError("CONFIG_INVALID"); })());
-		const maxFileBytes = integer(storeRaw.maxFileBytes, 1, 10 * 1024 * 1024);
-		const bind = async (identity = captured): Promise<SharedStoreDefinition> => {
-			const existing = stores.get(id);
-			if (existing) return existing;
-			identity ??= await inspectConfiguredRoot(configuredRoot).catch(() => { throw new DatastoreError("STORE_UNAVAILABLE"); });
-			if (!identity) throw new DatastoreError("STORE_UNAVAILABLE");
-			const bound = stores.get(id); if (bound) return bound;
-			const value = { id, ...identity, include, exclude, maxFileBytes, search: { defaultMode, qmdCollection } };
-			const defined = { ...value, definitionRevision: definitionRevision({ ...value, qmd }) };
-			stores.set(id, defined);
-			return defined;
-		};
-		if (captured) await bind();
-		else unavailableStores.set(id, () => bind());
-	}
-	return { ...settings, stores, unavailableStores };
 }

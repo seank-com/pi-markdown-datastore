@@ -6,7 +6,7 @@ import type { StoreConfig } from "./config.ts";
 import { HARD_MAX_FILE_BYTES } from "./config-common.ts";
 import { DatastoreError } from "./errors.ts";
 import { inspectConfiguredRoot } from "./root-binding.ts";
-import { definitionRevision, parseSharedJson, parseSharedSettings, readOwnedFile, type SharedCatalog, type SharedHostSettings, type SharedStoreDefinition } from "./shared-catalog.ts";
+import { definitionRevision, parseSharedJson, parseSharedSettings, readOwnedFile, type SharedHostSettings, type SharedHostState, type SharedStoreDefinition } from "./shared-config.ts";
 
 export interface Declaration { root: string; include: string[]; exclude: string[] }
 export interface DeclarationHostSettings extends SharedHostSettings {
@@ -97,7 +97,7 @@ export async function loadRegistrations(settings: DeclarationHostSettings) {
 	}
 	const stores = new Map<string, SharedStoreDefinition>();
 	const unavailableStores = new Map<string, () => Promise<SharedStoreDefinition>>();
-	const catalog: SharedCatalog = { ...settings, stores, unavailableStores };
+	const state: SharedHostState = { ...settings, stores, unavailableStores };
 	const install = (declaration: Declaration) => {
 		const id = declarationId(declaration.root);
 		unavailableStores.set(id, async () => {
@@ -121,7 +121,7 @@ export async function loadRegistrations(settings: DeclarationHostSettings) {
 	}
 	let tail: Promise<unknown> = Promise.resolve();
 	return {
-		catalog,
+		state,
 		settled: () => tail,
 		register(declaration: Declaration, expected: { rootDev: number; rootIno: number }): Promise<SharedStoreDefinition> {
 			const operation = tail.then(async () => {

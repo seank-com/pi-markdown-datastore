@@ -39,6 +39,26 @@ indexes are disposable. Each qmd worker retains its public SDK store and native
 cache between requests. Interrupted maintenance can leave a partially updated
 index; direct source reads remain available. See [design](docs/design.md).
 
+## Shared stores
+
+Projects declare a canonical absolute source root and optional include/exclude
+patterns:
+
+```json
+"notes": { "shared": { "root": "/example/notebook", "include": ["**/*.md"], "exclude": [] } }
+```
+
+An operator supplies protected `~/.pi/markdown-datastore/host.json` and runs
+`node dist/shared-service-main.js --host-config /absolute/host.json`.
+Matching declarations share one index by root and effective patterns; project
+aliases are independent of index names. Nested shared roots are rejected.
+The host retains root/pattern registrations for maintenance without clients;
+ordinary attachments can reconstruct them. Clients do not start the service.
+Direct reads remain available while the host process is down; loading a
+declaration still requires its protected host settings file. See
+[setup](docs/setup.md#shared-markdown-stores) for host settings, login startup,
+ownership and recovery.
+
 ## Optional integration
 
 `@seank/pi-markdown-datastore/contract` exports the owned v1 types and identifiers.

@@ -13,6 +13,7 @@ import { discoverQmdBinding, QmdAdapter, type QmdRefreshJob } from "../src/qmd-a
 import { MarkdownDatastoreService } from "../src/service.ts";
 import { SharedIndexClient } from "../src/shared-client.ts";
 import { startSharedHost, type SharedHost } from "../src/shared-host.ts";
+import { declarationId } from "../src/shared-registrations.ts";
 import { attachSharedParser, encodeSharedMessage, requestId } from "../src/shared-ipc.ts";
 import { createQmdFixture } from "./fixtures/qmd-fixture.ts";
 
@@ -75,10 +76,18 @@ async function fixture(t: import("node:test").TestContext) {
 	}
 	const qmd = { enabled: true, installation: { packageRoot }, minimumVersion: "2.8.3" };
 	const defaults = { maxResultBytes: 8192, maxResultLines: 100, operationTimeoutMs: 3000 };
-	const catalog = join(root, "catalog.json");
-	const definition = { schemaVersion: 1, socketPath: join(sockets, "owner.sock"), stateRoot: join(root, "derived"), defaults, qmd, stores };
-	await writeFile(catalog, JSON.stringify(definition), { mode: 0o600 });
-	host = await startSharedHost(catalog);
+	const previousHome = process.env.HOME;
+	process.env.HOME = root;
+	t.after(() => { if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome; });
+	const hostDir = join(root, ".pi", "markdown-datastore");
+	await mkdir(hostDir, { recursive: true, mode: 0o700 });
+	const settings = join(hostDir, "host.json");
+	const socketPath = join(sockets, "owner.sock");
+	const stateRoot = join(root, "derived");
+	await writeFile(settings, JSON.stringify({ schemaVersion: 1, socketPath, stateRoot, defaults, qmd, reader: { maxFileBytes: 4096, defaultMode: "lexical" } }), { mode: 0o600 });
+	const registrations = Object.fromEntries(Object.values(stores).map((store) => { const value = store as { root: string; include: string[]; exclude: string[] }; return [value.root, { include: value.include, exclude: value.exclude }]; }));
+	await writeFile(join(hostDir, "registrations.json"), JSON.stringify({ schemaVersion: 1, registrations }), { mode: 0o600 });
+	host = await startSharedHost(settings);
 	const ready = async (adapter: QmdAdapter) => {
 		const receipt = await adapter.startupReconcile([...adapter.config.stores.values()]);
 		assert.equal((await job(adapter, String(receipt.refreshId))).state, "succeeded");
@@ -87,7 +96,7 @@ async function fixture(t: import("node:test").TestContext) {
 	const project = async (name: string, mixed = false, extra: Record<string, unknown> = {}) => {
 		const projectRoot = join(root, name), configDir = join(projectRoot, ".pi", "markdown-datastore");
 		await mkdir(configDir, { recursive: true, mode: 0o700 });
-		const selected: Record<string, unknown> = { book: { shared: { catalog, store: "notebook" } }, records: { shared: { catalog, store: "archive" } }, ...extra };
+		const selected: Record<string, unknown> = { book: { shared: { root: join(root, "notebook"), include: ["**/*.md"], exclude: [] } }, records: { shared: { root: join(root, "archive"), include: ["**/*.md"], exclude: [] } }, ...extra };
 		if (mixed) {
 			await mkdir(join(projectRoot, "private"), { mode: 0o700 }); await writeFile(join(projectRoot, "private", "copper.md"), "Copper private note.\n");
 			selected.personal = { root: "private", include: ["**/*.md"], exclude: [], maxFileBytes: 4096, search: { defaultMode: "lexical", qmdCollection: "notes" } };
@@ -103,10 +112,12 @@ async function fixture(t: import("node:test").TestContext) {
 		const service = new MarkdownDatastoreService(config, undefined, local, clients); services.push(service);
 		return { config, service, clients, local };
 	};
-	return { root, sockets, catalog, definition, project, ready, job, entered, behavior, release, trackChild, stopChild,
+	const notebookId = declarationId(join(root, "notebook"));
+	const archiveId = declarationId(join(root, "archive"));
+	return { root, sockets, settings, stores, notebookId, archiveId, project, ready, job, entered, behavior, release, trackChild, stopChild,
 		get host() { return host!; },
 		stopHost: async () => { await host?.close(); host = undefined; },
-		restart: async () => { await host?.close(); host = undefined; host = await startSharedHost(catalog); return host; },
+		restart: async () => { await host?.close(); host = undefined; host = await startSharedHost(settings); return host; },
 	};
 }
 
@@ -130,7 +141,7 @@ test("one catalog serves notebook/archive and mixed projects; a second endpoint 
 	for (const root of [join(f.root, "notebook"), mixed.config.stores.get("personal")!.root]) {
 		for (let index = 0; index < 10; index += 1) await writeFile(join(root, `budget-${index}.md`), "# Budget\nCopper budget " + "words ".repeat(500));
 	}
-	for (const [store, adapter] of [["book", f.host.adapters.get("notebook")!], ["personal", mixed.local!]] as const) {
+	for (const [store, adapter] of [["book", f.host.adapters.get(f.notebookId)!], ["personal", mixed.local!]] as const) {
 		const receipt = await mixed.service.refresh({ store, mode: "lexical" });
 		assert.equal((await f.job(adapter, String(receipt.data.qmd.refreshId))).state, "succeeded");
 		const bounded = await mixed.service.search({ store, query: "budget", mode: "lexical", includeContent: true, limit: 20 });
@@ -139,23 +150,27 @@ test("one catalog serves notebook/archive and mixed projects; a second endpoint 
 		assert.ok(bounded.bounds.returnedBytes <= mixed.config.defaults.maxResultBytes);
 		assert.ok(bounded.warnings.some(warning => warning.code === "RESULT_LIMIT_EXCEEDED"));
 	}
-	const alternate = join(f.root, "alternate.json");
-	await writeFile(alternate, JSON.stringify({ ...f.definition, socketPath: join(f.sockets, "alternate.sock") }), { mode: 0o600 });
-	await assert.rejects(startSharedHost(alternate), { code: "STORE_UNAVAILABLE" });
+	const alternateDir = join(f.root, "alternate-host");
+	await mkdir(alternateDir, { mode: 0o700 });
+	await chmod(alternateDir, 0o700);
+	const current = f.host.state;
+	await writeFile(join(alternateDir, "host.json"), JSON.stringify({ schemaVersion: 1, socketPath: join(f.sockets, "alternate.sock"), stateRoot: current.stateRoot, defaults: current.defaults, qmd: current.qmd, reader: { maxFileBytes: 4096, defaultMode: "lexical" } }), { mode: 0o600 });
+	await writeFile(join(alternateDir, "registrations.json"), await readFile(join(f.root, ".pi", "markdown-datastore", "registrations.json")), { mode: 0o600 });
+	await assert.rejects(startSharedHost(join(alternateDir, "host.json")), { code: "STORE_UNAVAILABLE" });
 	assert.equal((await mixed.service.search({ store: "book", query: "notebook" })).data.returned, 1);
 });
 
 test("held shared maintenance coalesces, serializes, survives detach and distinguishes explicit cancellation", async t => {
 	const f = await fixture(t), left = await f.project("left");
-	const right = await f.project("right", false, { book: undefined, "other-book": { shared: { catalog: f.catalog, store: "notebook" } } });
-	const adapter = f.host.adapters.get("notebook")!;
+	const right = await f.project("right", false, { book: undefined, "other-book": { shared: { root: join(f.root, "notebook"), include: ["**/*.md"], exclude: [] } } });
+	const adapter = f.host.adapters.get(f.notebookId)!;
 	const log = () => readFile(join(adapter.root, "calls.log"), "utf8");
 	const before = (await log()).split("\n").filter(item => item === "update").length;
 	await f.behavior(adapter, { updateGate: "held-update" });
 	const first = await left.service.refresh({ store: "book", mode: "lexical" });
 	const id = String(first.data.qmd.refreshId); await f.entered(adapter, "held-update", id);
 	assert.deepEqual(first.data.qmd.stores, ["book"]);
-	assert.deepEqual(adapter.activity().jobs.find(item => item.refreshId === id)!.stores, ["notebook"]);
+	assert.deepEqual(adapter.activity().jobs.find(item => item.refreshId === id)!.stores, [f.notebookId]);
 	const repeated = await right.service.refresh({ store: "other-book", mode: "lexical" });
 	assert.equal(repeated.data.qmd.refreshId, id); assert.equal(repeated.data.qmd.coalesced, true);
 	assert.deepEqual(repeated.data.qmd.stores, ["other-book"]);
@@ -180,7 +195,7 @@ test("held shared maintenance coalesces, serializes, survives detach and disting
 
 test("reader waiter cancellation leaves shared jobs alone; restart recovers receipts and rejects stale generations", async t => {
 	const f = await fixture(t), project = await f.project("caller");
-	const adapter = f.host.adapters.get("notebook")!;
+	const adapter = f.host.adapters.get(f.notebookId)!;
 	await f.behavior(adapter, { searchGate: "held-search" });
 	const controller = new AbortController();
 	const search = project.service.search({ store: "book", query: "copper", mode: "lexical" }, controller.signal);
@@ -191,17 +206,17 @@ test("reader waiter cancellation leaves shared jobs alone; restart recovers rece
 	await f.behavior(adapter, { updateGate: "interrupted-update" });
 	const receipt = await project.service.refresh({ store: "book", mode: "lexical" });
 	const id = String(receipt.data.qmd.refreshId); await f.entered(adapter, "interrupted-update", id);
-	const oldGeneration = f.host.generation, revision = f.host.catalog.stores.get("notebook")!.definitionRevision;
+	const oldGeneration = f.host.generation, revision = f.host.state.stores.get(f.notebookId)!.definitionRevision;
 	await f.behavior(adapter, {});
 	await f.restart();
 	assert.notEqual(f.host.generation, oldGeneration);
-	const recovered = f.host.adapters.get("notebook")!;
+	const recovered = f.host.adapters.get(f.notebookId)!;
 	assert.equal((await f.job(recovered, id)).state, "succeeded");
 	await f.ready(recovered);
-	const socket = createConnection(f.definition.socketPath);
+	const socket = createConnection(f.host.state.socketPath);
 	const stale = new Promise<any>((resolve, reject) => {
 		socket.once("error", reject); attachSharedParser(socket, reply => resolve(reply), reject);
-		socket.once("connect", () => socket.write(encodeSharedMessage({ version: 1, operation: "activity", requestId: requestId(), generation: oldGeneration, store: "notebook", definitionRevision: revision })));
+		socket.once("connect", () => socket.write(encodeSharedMessage({ version: 1, operation: "activity", requestId: requestId(), generation: oldGeneration, store: f.notebookId, definitionRevision: revision })));
 	});
 	try { assert.equal((await stale).error.code, "STORE_UNAVAILABLE"); } finally { socket.destroy(); }
 	assert.equal((await project.service.read({ store: "book", note: { store: "book", path: "copper.md" } })).data.note.store, "book");
@@ -209,7 +224,7 @@ test("reader waiter cancellation leaves shared jobs alone; restart recovers rece
 
 test("shared backend failure keeps failed receipts and rebuilds through the common maintenance unit", async t => {
 	const f = await fixture(t), project = await f.project("recovery");
-	const adapter = f.host.adapters.get("notebook")!;
+	const adapter = f.host.adapters.get(f.notebookId)!;
 	await f.behavior(adapter, { updateError: true });
 	const failed = await project.service.refresh({ store: "book", mode: "lexical" });
 	assert.equal((await f.job(adapter, String(failed.data.qmd.refreshId))).state, "failed");
@@ -224,7 +239,7 @@ test("shared backend failure keeps failed receipts and rebuilds through the comm
 
 test("cancelling a receipt waiter does not cancel already accepted shared maintenance", async t => {
 	const f = await fixture(t), caller = await f.project("waiter"), observer = await f.project("observer");
-	const adapter = f.host.adapters.get("notebook")!;
+	const adapter = f.host.adapters.get(f.notebookId)!;
 	await f.behavior(adapter, { updateGate: "accepted-job" });
 	let accepted!: (value: Record<string, unknown>) => void, releaseReply!: () => void;
 	const acceptedJob = new Promise<Record<string, unknown>>(resolve => { accepted = resolve; });
@@ -246,9 +261,9 @@ test("cancelling a receipt waiter does not cancel already accepted shared mainte
 
 test("operator restart after abrupt service exit reclaims ownership and recovers the same receipt", async t => {
 	const f = await fixture(t), project = await f.project("crash-caller");
-	const previous = f.host.adapters.get("notebook")!;
+	const previous = f.host.adapters.get(f.notebookId)!;
 	await f.stopHost();
-	const child = spawn(process.execPath, ["--experimental-strip-types", fileURLToPath(new URL("../src/shared-service-main.ts", import.meta.url)), "--catalog", f.catalog], { stdio: ["ignore", "pipe", "pipe"] });
+	const child = spawn(process.execPath, ["--experimental-strip-types", fileURLToPath(new URL("../src/shared-service-main.ts", import.meta.url)), "--host-config", f.settings], { stdio: ["ignore", "pipe", "pipe"] });
 	f.trackChild(child);
 	let errors = "";
 	child.stderr.on("data", value => { errors += String(value); });
@@ -275,7 +290,7 @@ test("operator restart after abrupt service exit reclaims ownership and recovers
 	await f.behavior(previous, {});
 	await f.restart();
 	assert.notEqual(f.host.generation, generation);
-	const recovered = f.host.adapters.get("notebook")!;
+	const recovered = f.host.adapters.get(f.notebookId)!;
 	assert.equal((await f.job(recovered, id)).state, "succeeded");
 	await f.ready(recovered);
 	assert.equal((await project.service.search({ store: "book", query: "copper", mode: "lexical", freshness: "require-current-lexical" })).data.returned, 1);
@@ -289,22 +304,21 @@ test("replacing a source root at the same path invalidates old shared attachment
 	await mkdir(join(f.root, "notebook"), { mode: 0o700 });
 	await writeFile(join(f.root, "notebook", "copper.md"), "Copper replacement source.\n");
 	await f.restart();
-	await f.ready(f.host.adapters.get("notebook")!);
-	assert.notEqual(f.host.catalog.stores.get("notebook")!.definitionRevision, revision);
+	await f.ready(f.host.adapters.get(f.notebookId)!);
+	assert.notEqual(f.host.state.stores.get(f.notebookId)!.definitionRevision, revision);
 	await assert.rejects(old.service.search({ store: "book", query: "copper", mode: "lexical" }), { code: "STORE_UNAVAILABLE" });
 	const fresh = await f.project("new-root");
 	assert.equal((await fresh.service.search({ store: "book", query: "copper", mode: "lexical", freshness: "require-current-lexical" })).data.returned, 1);
 });
 
-test("canonical definitions, not root paths or backend-local collection names, identify shared datastores", async t => {
+test("canonical root identity, not alias or collection name, identifies a shared datastore", async t => {
 	const f = await fixture(t);
-	await f.stopHost();
-	f.definition.stores.filtered = { ...(f.definition.stores.notebook as object), exclude: ["archived/**"] };
-	await writeFile(f.catalog, JSON.stringify(f.definition), { mode: 0o600 });
-	await f.restart(); await Promise.all([...f.host.adapters.values()].map(f.ready));
-	const project = await f.project("namespaces", true, { "second-book": { shared: { catalog: f.catalog, store: "filtered" } } });
+	const project = await f.project("namespaces", true, { "second-book": { shared: { root: join(f.root, "notebook"), include: ["**/*.md"], exclude: [] } } });
 	assert.equal(project.config.stores.get("book")!.root, project.config.stores.get("second-book")!.root);
-	assert.notEqual(project.config.stores.get("book")!.shared!.definitionRevision, project.config.stores.get("second-book")!.shared!.definitionRevision);
-	assert.notEqual(f.host.adapters.get("notebook")!.root, f.host.adapters.get("filtered")!.root);
+	assert.equal(project.config.stores.get("book")!.shared!.store, f.notebookId);
+	assert.equal(project.config.stores.get("second-book")!.shared!.store, f.notebookId);
+	assert.notEqual(f.notebookId, f.archiveId);
+	const conflict = await f.project("conflict", false, { filtered: { shared: { root: join(f.root, "notebook"), include: ["**/*.md"], exclude: ["archived/**"] } } });
+	await assert.rejects(conflict.service.search({ store: "filtered", query: "copper", mode: "lexical" }), { code: "CONFIG_INVALID" });
 	for (const store of ["book", "records", "second-book", "personal"]) assert.equal((await project.service.search({ store, query: "copper", mode: "lexical" })).data.returned, 1);
 });

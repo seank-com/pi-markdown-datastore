@@ -10,13 +10,6 @@ import { parseDeclaration, type Declaration } from "./shared-registrations.ts";
 
 export const SHARED_IPC_VERSION = 1;
 
-export interface SharedHello {
-	version: 1;
-	operation: "hello";
-	requestId?: string;
-	store: string;
-	definitionRevision: string;
-}
 export interface SharedCall {
 	version: 1;
 	operation: "search" | "status" | "startLexical" | "startSemantic" | "startMetadata" | "links" | "backlinks" | "tagPages" | "tags" | "cancel" | "activity" | "current";
@@ -35,7 +28,7 @@ export interface DeclarationHello {
 	rootDev: number;
 	rootIno: number;
 }
-export type SharedRequest = SharedHello | SharedCall | SharedDrop | DeclarationHello;
+export type SharedRequest = SharedCall | SharedDrop | DeclarationHello;
 export interface SharedReply {
 	version: 1;
 	requestId?: string;
@@ -50,7 +43,7 @@ export function encodeSharedMessage(value: unknown): string {
 	return `${JSON.stringify(value)}\n`;
 }
 
-export const SHARED_STORE_ID = /^(?:[a-z][a-z0-9_-]{0,31}|s-[0-9a-f]{64})$/;
+export const SHARED_STORE_ID = /^s-[0-9a-f]{64}$/;
 const ID = /^[0-9a-f]{32}$/;
 const REVISION = /^[0-9a-f]{64}$/;
 const GENERATION = /^gen-[0-9a-f]{32}$/;
@@ -73,7 +66,6 @@ export function parseSharedRequest(value: unknown): SharedRequest {
 		return { version: 1, operation: "helloDeclaration", requestId, declaration: parseDeclaration(message.declaration), rootDev, rootIno };
 	}
 	if (typeof message.store !== "string" || !SHARED_STORE_ID.test(message.store) || typeof message.definitionRevision !== "string" || !REVISION.test(message.definitionRevision)) throw new DatastoreError("CONFIG_INVALID");
-	if (message.operation === "hello") return { version: 1, operation: "hello", requestId: typeof message.requestId === "string" ? message.requestId : undefined, store: message.store, definitionRevision: message.definitionRevision };
 	if (!CALLS.has(message.operation) || typeof message.requestId !== "string" || !ID.test(message.requestId) || typeof message.generation !== "string" || !GENERATION.test(message.generation)) throw new DatastoreError("CONFIG_INVALID");
 	return { version: 1, operation: message.operation as SharedCall["operation"], requestId: message.requestId, generation: message.generation, store: message.store, definitionRevision: message.definitionRevision, input: message.input && typeof message.input === "object" ? message.input as Record<string, unknown> : undefined };
 }

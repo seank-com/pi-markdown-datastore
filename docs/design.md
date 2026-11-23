@@ -23,9 +23,8 @@ qmd owns indexing, embeddings, ranking, model lifetime, cache storage and recove
 Each trusted project supplies protected strict JSON configuration at
 `.pi/markdown-datastore/config.json`. Project-local tool aliases are unique within each project's `stores` object. Private definitions keep root and collection
 uniqueness within their project-owned backend. Declaration-managed shared stores use the canonical absolute Markdown root as
-identity, with an independent backend namespace per root. Legacy catalogs keep
-their explicit IDs. Private and legacy definitions retain their original
-identity rules. A qmd collection name is scoped to its physical index, not to
+identity, with an independent backend namespace per root. Private definitions
+retain their project-local identity rules. A qmd collection name is scoped to its physical index, not to
 a project or to the host; separate indexes can each contain a collection named
 `notes`. Unknown/duplicate keys and unsafe configuration authority
 paths fail closed. Configuration is current-user-owned, at most 64 KiB and mode
@@ -41,14 +40,12 @@ and canonical datastore URIs identify notes.
 
 ### Store availability and recovery
 
-`config` and `shared-catalog` validate configuration structure independently of
+`config` and `shared-config` validate configuration structure independently of
 source-root liveness. `root-binding` distinguishes a missing/unreachable root
 from schema, permission, symlink and present non-directory errors. Structural
-errors fail configuration load; an unavailable catalog file defers only its
-references until the file can first be read. A structurally invalid catalog,
-including one first read after recovery, fails project operations rather than
-granting partial authority. Parsed project and catalog definitions are not
-hot-reloaded by recovery.
+errors fail configuration load. Shared declarations require readable protected
+host settings at project load. Parsed project and host definitions are not
+hot-reloaded by source recovery.
 
 A store is unbound until full root/ancestry validation can capture its real
 canonical directory and device/inode. Unbound stores have no source definition,
@@ -102,8 +99,8 @@ history, and no historical file is changed. With all identities known, normal
 strict adoption resumes. An actual identity mismatch still fails compatibility
 validation rather than guessing a migration.
 
-`shared-host` admits healthy catalog members before listening and admits an
-initially unavailable member on its next request, single-flight. Failed lazy admission releases its partial coordinator, backend and ownership
+`shared-host` reconstructs healthy registered stores before listening and admits
+an initially unavailable store on its next request, single-flight. Failed lazy admission releases its partial coordinator, backend and ownership
 before a subsequent request can retry. The host checks
 its captured identity on subsequent requests. Client and host revisions must
 still agree; an existing host identity is never replaced to satisfy a new client.
@@ -201,13 +198,13 @@ A response failure does not replay, cancel or terminalize the accepted work.
 ### Budget flow and compatibility
 
 `contract`, `client` and `index` own typed inputs, discovery, tool schemas and
-result/error serialization. `config-common`, `config` and `shared-catalog` resolve
+result/error serialization. `config-common`, `config` and `shared-config` resolve
 the optional controls; `service`, `markdown`, `metadata-index` and `continuations`
 apply them while preserving source and paging identity.
 
 Discovery and the shared handshake advertise `resultBudgetVersion: 1`. A new
 client reports `CAPABILITY_UNAVAILABLE` rather than silently promising unbounded behavior
-from an older bounded owner. A client's selected budget does not become catalog
+from an older bounded owner. A client's selected budget does not become host
 policy for other clients. Output-budget changes do not change source/index
 identity or themselves require an index rebuild.
 
@@ -262,17 +259,16 @@ additional encountered restrictions rather than assuming this list is exhaustive
 | Publication content matching uses the README registry rules. Location: `scripts/check-private-terms.ts`; registry paths are configurable with `PRIVATE_TERMS_FILE`/`PRIVATE_SECRETS_FILE`. | Rejects matching private terms and credential values; matching-policy evidence is distinct from the revision-range correction and output cap. |
 | Existing-branch publication scans exclude `origin/main` ancestry; new branches exclude known remote history. Location: `.githooks/pre-push`. | Approved correction in PR #13 prevents published main history from blocking clean updates; feature checks remain. |
 | Publication scanner Git-output capture is 256 MiB. Location: `scripts/check-private-terms.ts`; fixed by scanner maintainers. | Can reject large captured Git output. Specific necessity/approval is not established by the registry or revision-selection rules. |
-| Operator-managed user LaunchAgent with `RunAtLoad=true`, documented in `docs/setup.md`; no `KeepAlive` or custom launchd deadline in the example. | Starts the shared catalog service at OS-account login independently of client connections. Operator owns installation and lifecycle; accepted by Sean during PR #13 review. It does not provide pre-login boot startup or authorize live activation. |
-| Shared catalog uses protected JSON, the inherited 64 KiB configuration bound and one include pattern per native collection; the socket parent is owner-only and the socket mode is `0600`. Locations: `src/shared-catalog.ts`, `src/shared-ipc.ts`; catalog values belong to the operator. | Canonical definitions and owner-account-only local IPC are approved in issue #4. The catalog reuses existing reader/file/operation ranges rather than selecting a new transport deadline or frame cap. Reuse does not approve legacy numeric bounds; the single-pattern mapping follows the qualified qmd collection interface. |
+| Operator-managed user LaunchAgent with `RunAtLoad=true`, documented in `docs/setup.md`; no `KeepAlive` or custom launchd deadline in the example. | Starts the shared service at OS-account login independently of client connections. Operator owns installation and lifecycle; accepted by Sean during PR #13 review. It does not provide pre-login boot startup or authorize live activation. |
+| Shared host settings use protected JSON, the inherited 64 KiB configuration bound and one include pattern per native collection; the socket parent is owner-only and the socket mode is `0600`. Locations: `src/shared-config.ts`, `src/shared-registrations.ts`, `src/shared-ipc.ts`; host values belong to the operator. | Canonical definitions and owner-account-only local IPC were approved in issue #4; declaration registration is approved in issue #16. The host reuses existing reader/file/operation ranges rather than selecting a new transport deadline or frame cap. Reuse does not approve inherited numeric bounds; the single-pattern mapping follows the qualified qmd collection interface. |
 | Declaration-managed shared hosts use the existing protected config and owner-only IPC contracts, and one snapshot writer using the existing ownership lease. Source path equality and disjoint shared roots, exact effective pattern arrays, and ordinary declaration attachment implement issue #16. Locations: `shared-registrations`, `shared-ipc`, `shared-host`. | Prevents duplicate or overlapping owners, competing snapshot writes and silently changed indexing scope. Host config retains the inherited 64 KiB bound; generated snapshots have no independent read-only size ceiling that would reject a successful registration on restart. No new deadline or retry policy. |
-| Terminal-only cutover prepares an inert bundle under the existing ownership/ledger validators; it refuses unfinished or unverifiable receipts, used/overlapping output or state paths, and differing legacy reader policies. QMD receipt provenance is qualified for 2.8.3. Locations: `shared-cutover` and `tests/shared-cutover.test.ts`; operator owns the input paths. | Prevents abandoning admitted work, overwriting existing state or silently changing reader policy. Terminal-only/new-ledger authorization is recorded in PR #17; other input checks are the finite converter's supported scope, not additional client registration equality fields. Original ledgers remain unchanged. |
 | Metadata catalog and relationship pages use caller budgets in the common result envelope. Location: `src/service.ts`. | A finite response is explicitly partial with a continuation or reports that it cannot fit; unbounded results may include the complete catalog. No new item cap or continuation TTL is added. |
 | The common stable maintenance ledger has no byte-size ceiling at reload. File identity, owner/mode, job schema and the existing 20-job count validation remain. Location: `MaintenanceCoordinator.load`. Owner approved removal of the former 256 KiB reader-only cap on 2026-11-15. | The writer can durably admit metadata path receipts larger than 256 KiB. Reload must not misclassify its own accepted output as corrupt or require receipt truncation. The independent job-count limit's numeric approval remains unresolved. |
 | Explicit terminal-history initialization requires an absent stable ledger, validated terminal-only history and existing exclusive application/historical ownership. Locations: `maintenance-migration` and its operator CLI. Owner-directed receipt-preserving recovery, 2026-11-14. Historical-file preflight still uses the 256 KiB bound, and job schema validation retains the 20-job bound; their numeric approval remains unresolved and no total-history cap is added. Neither is the removed common stable-ledger reload byte cap. | Prevents abandoning unfinished work, replacing a current queue or guessing a historical source identity. Automatic adoption remains strict. Inspection uses protected disposable copies; original receipts and native qmd storage remain untouched. |
 | Embed extraction rejects more than 500 image/wikilink embed references in one note, before downstream selection. Location: `extractEmbedTargets`, `src/markdown.ts`; fixed by the component. | Limits the extracted reference list and can reject an otherwise readable note. Specific numeric necessity and owner approval are not established; this is separate from the 500 search-candidate bound. Recorded during the owner-directed cap review on 2026-11-15, not newly approved. |
 | Qmd adapter snapshot metadata reader accepts at most 65,536 bytes. Location: `QmdAdapter.prepare`, `src/qmd-adapter.ts`, reading `reconciliation.json`; fixed by the component. | Caps bytes parsed for the adapter's fixed-shape snapshot. The producer/consumer shape has not demonstrated the growing path-list mismatch seen in the stable ledger, but numeric necessity and approval remain unestablished. This is not a qmd-native database or result-frame limit. |
 | Frontmatter depth 8, 1,000 nodes, 16 KiB strings, and 10 YAML aliases. Location: `src/markdown.ts`. Exceeding one fails the note as `FRONTMATTER_INVALID`. | Bounds YAML walked while parsing notes. Issue #2 surfaced these inherited values. This table records them. It does not approve them. |
-| Per-store outage containment, demand-driven first binding and immutable captured identities. Locations: `root-binding`, `config`, `shared-catalog`, `service`, `index` and `shared-host`. Approved scope: issue #14; Sean explicitly selected next-operation recovery on 2026-11-15. Root liveness includes ENOENT, EIO, ETIMEDOUT, ESTALE, ENODEV, ENXIO and network-down/unreachable errors; EACCES, EPERM, ELOOP and present non-directories are not liveness. No recovery deadline, retry count or timer is introduced. | Prevents one failed mount or combined private backend binding disabling unrelated healthy stores, without assigning placeholder identities or silently adopting replacement roots. Shared-client first observations remain provisional until successful direct/policy use or host attachment; rejected observations cannot overwrite a committed identity. Unresolved legacy provenance blocks queue admission, not healthy direct access. Complete root/destination policy still rejects incomplete authority scope. Per-store backend ownership, rather than a new worker concurrency cap, provides isolation; source review precedes activation. |
+| Per-store outage containment, demand-driven first binding and immutable captured identities. Locations: `root-binding`, `config`, `shared-config`, `service`, `index` and `shared-host`. Approved scope: issue #14; Sean explicitly selected next-operation recovery on 2026-11-15. Root liveness includes ENOENT, EIO, ETIMEDOUT, ESTALE, ENODEV, ENXIO and network-down/unreachable errors; EACCES, EPERM, ELOOP and present non-directories are not liveness. No recovery deadline, retry count or timer is introduced. | Prevents one failed mount or combined private backend binding disabling unrelated healthy stores, without assigning placeholder identities or silently adopting replacement roots. Shared-client first observations remain provisional until successful direct/policy use or host attachment; rejected observations cannot overwrite a committed identity. Unresolved legacy provenance blocks queue admission, not healthy direct access. Complete root/destination policy still rejects incomplete authority scope. Per-store backend ownership, rather than a new worker concurrency cap, provides isolation; source review precedes activation. |
 | One maintenance owner per derived index, independent of IPC path. Protected ownership directory `0700`, records `0600`; live or unverifiable owner/worker PIDs refuse admission. Locations: `src/index-ownership.ts`, `QmdAdapter`, native-worker registration. | Approved single-index ownership and operator restart without manual dead-owner cleanup, issue #4 and the owner's 2026-11-12 recovery decision. Atomic nonempty-directory admission prevents simultaneous reclaimers replacing one another. Only proven-dead process records are reclaimed; no lease timer, election, process killing or autostart. PID reuse is conservatively treated as live, not guessed dead. |
 
 ## Public qmd lifecycle
@@ -386,8 +382,7 @@ The common coordinator checks source inventory every five minutes, reconciles ch
 
 ## Shared datastores
 
-A project store can be private, a complete shared declaration, or a legacy
-reference. A complete declaration supplies an absolute canonical root and
+A project store is private or a complete shared declaration. A complete declaration supplies an absolute canonical root and
 optional include/exclude arrays (effective defaults `["**/*.md"]` and `[]`).
 The declaration host rejects ancestor/descendant roots using path components.
 A repeated root joins only if both effective arrays match element-for-element.
@@ -416,26 +411,12 @@ already-bound store. The service returns a root-derived internal ID and current
 definition revision on attachment; the client pins them separately from the live
 generation. No add/remove-project lifecycle or definition hot reload is implied.
 
-`--catalog` temporarily preserves explicit catalog IDs, existing state paths,
-and ledger provenance checks for the three current clients. Removing old-format
-support after all three migrate is part of this rollout. Today a host starts in
-one mode; it does not serve a mix of reference-only and declaration clients.
-`--host-config` does not import old receipt or index namespaces. Do not run both
-modes over the same store. The stopped cutover prepares a new ledger generation
-only after verifying terminal legacy receipts. `shared-cutover` validates copies
-under the existing ownership leases and retains the original ledger bytes and
-binding context as historical evidence; it never adopts or rewrites receipts.
-The separate state root must be unused. The operator keeps the old service
-stopped through conversion and controls activation; preparation alone does not
-reserve or start the new host. See the staged conversion in `setup.md`.
+Indexed search, refresh, status and job cancellation for a shared store go to one foreground local service. The maintenance owner is `MaintenanceCoordinator`. `MetadataIndex` and `wiki` own graph and tag state. `QmdAdapter` is the optional qmd backend and is injected with that coordinator; it does not own the common ledger. The host's `qmd.enabled: false` disables native adapter creation regardless of installed packages. Graph-only and qmd-unavailable stores still have one coordinator and one metadata index per canonical store; accepted metadata jobs remain cancellable through that coordinator without a backend. The project does not keep a second coordinator or a private replacement index. If the service is unavailable, shared indexed operations fail and direct reads continue. Shutdown settles accepted work before releasing ownership.
 
-Indexed search, refresh, status and job cancellation for a shared store go to one foreground local service. The maintenance owner is `MaintenanceCoordinator`. `MetadataIndex` and `wiki` own graph and tag state. `QmdAdapter` is the optional qmd backend and is injected with that coordinator; it does not own the common ledger. The catalog's `qmd.enabled: false` disables native adapter creation regardless of installed packages. Graph-only and qmd-unavailable stores still have one coordinator and one metadata index per canonical store; accepted metadata jobs remain cancellable through that coordinator without a backend. The project does not keep a second coordinator or a private replacement index. If the service is unavailable, shared indexed operations fail and direct reads continue. Shutdown settles accepted work before releasing ownership.
-
-The service runs with `--host-config` (declarations) or `--catalog` (legacy)
-under operator control, either manually or through one operator-installed macOS
+The service runs with `--host-config` under operator control, either manually or through one operator-installed macOS
 user LaunchAgent for that host. Its import path uses only production dependencies: `config-common` owns shared budgets and strict JSON validation, while `config` retains Pi-dependent project-path resolution for the hosted extension. A packed foreground-service test installs without Pi/TypeBox peers and verifies startup and graceful shutdown independently of the extension loader. The LaunchAgent starts it at account login, including login after reboot; it is not a pre-login system daemon. The service and its reconciliation cycle remain available with zero clients. Projects only connect to its configured owner-only socket: they do not install, launch or own the service or its LaunchAgent, and client attachment counts do not control its lifetime. Setup documents startup, inspection, deliberate restart and stop commands. Closing a project closes that client's waiters and any in-progress attachment. Attachment belongs to the client lifetime, so cancelling the first handshake waiter does not cancel other callers using that same attachment. It does not cancel an accepted shared job or rebuild the index. Replies must match the attached definition and live generation. Restarting the service creates a new generation. A request bound to the previous generation or a different definition revision fails instead of being retargeted. Definition revisions include captured source-root device/inode identity, so replacing a root at the same path invalidates old attachments.
 
-`src/index-ownership.ts` admits one owning maintenance unit for the actual derived index before the host changes its endpoint or starts reconciliation. A different catalog or socket does not bypass that guard. A complete, nonempty ownership generation is published atomically. Native workers register before SDK access; a surviving worker prevents a replacement owner even after its parent has exited. Graceful shutdown stops requests/workers, persists receipts and releases ownership. After an unclean exit, an operator-started replacement reclaims proven-dead records and uses the same interrupted-job reconciliation. Live or unverifiable process identity remains unavailable rather than being killed or silently replaced. The component does not restart itself or launch a replacement on client connection; the operator manages startup and restart, including the optional login LaunchAgent.
+`src/index-ownership.ts` admits one owning maintenance unit for the actual derived index before the host changes its endpoint or starts reconciliation. A different host config or socket does not bypass that guard. A complete, nonempty ownership generation is published atomically. Native workers register before SDK access; a surviving worker prevents a replacement owner even after its parent has exited. Graceful shutdown stops requests/workers, persists receipts and releases ownership. After an unclean exit, an operator-started replacement reclaims proven-dead records and uses the same interrupted-job reconciliation. Live or unverifiable process identity remains unavailable rather than being killed or silently replaced. The component does not restart itself or launch a replacement on client connection; the operator manages startup and restart, including the optional login LaunchAgent.
 
 Private stores use the same coordinator, metadata index, and admission algorithm. Each bound private store has its own qmd adapter when available; scoped backend runners share the project's common coordinator, not separate application queues or metadata owners. Search validation, aggregate budgets/warnings and status readiness use common private/shared paths; receipts and reconciliation present the project's local store aliases while underlying refresh IDs and queue keys remain canonical.
 

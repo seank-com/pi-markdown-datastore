@@ -9,8 +9,9 @@ import { createMarkdownDatastoreExtension } from "../src/index.ts";
 import { createMarkdownDatastoreClient, queryMarkdownDatastoreCapability } from "../src/client.ts";
 import { MarkdownDatastoreService } from "../src/service.ts";
 import { SharedIndexClient } from "../src/shared-client.ts";
-import { loadSharedCatalog } from "../src/shared-catalog.ts";
 import { startSharedHost } from "../src/shared-host.ts";
+import { declarationId, loadDeclarationHostSettings, loadRegistrations } from "../src/shared-registrations.ts";
+import { writeDeclarationHost } from "./fixtures/declaration-host.ts";
 import { isRootUnavailable, observeSource, rejectSharedStore } from "../src/root-binding.ts";
 import { createQmdFixture } from "./fixtures/qmd-fixture.ts";
 import { discoverQmdBinding, qmdApplicationDirectory, QmdAdapter } from "../src/qmd-adapter.ts";
@@ -32,13 +33,19 @@ async function fixture(t: test.TestContext) {
 	const raw: any = { schemaVersion: 1, defaults, qmd: { ...qmd }, stores: { live: definition(live, "live"), remote: definition(remote, "remote") } };
 	const configPath = join(directory, "config.json");
 	const save = () => writeFile(configPath, JSON.stringify(raw), { mode: 0o600 }); await save();
-	const catalog = join(base, "catalog.json"), socketPath = join(base, "md.sock");
-	const catalogRaw: any = { schemaVersion: 1, defaults, qmd, stateRoot: join(base, "state"), socketPath, stores: { live: definition(live, "live"), remote: definition(remote, "remote") } };
-	const saveCatalog = () => writeFile(catalog, JSON.stringify(catalogRaw), { mode: 0o600 }); await saveCatalog();
+	const previousHome = process.env.HOME;
+	process.env.HOME = base;
+	const socketPath = join(base, "md.sock");
+	const hostConfig = join(base, ".pi", "markdown-datastore", "host.json");
+	const hostSettings: any = { schemaVersion: 1, defaults, qmd, stateRoot: join(base, "state"), socketPath, reader: { maxFileBytes: 4096, defaultMode: "lexical" }, stores: { live: definition(live, "live"), remote: definition(remote, "remote") } };
+	const saveHost = async () => {
+		await writeDeclarationHost(join(base, ".pi", "markdown-datastore"), { socketPath, stateRoot: hostSettings.stateRoot, defaults, qmd, reader: hostSettings.reader, stores: Object.values(hostSettings.stores).map((store: any) => ({ root: store.root, include: store.include, exclude: store.exclude })) });
+	};
+	await saveHost();
 	const cleanup: Array<() => Promise<unknown>> = [];
-	t.after(async () => { for (const close of cleanup.reverse()) await close(); await rm(base, { recursive: true, force: true }); });
+	t.after(async () => { for (const close of cleanup.reverse()) await close(); if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome; await rm(base, { recursive: true, force: true }); });
 	const load = () => loadMarkdownDatastoreConfig(project);
-	return { base, project, live, remote, raw, save, configPath, load, catalog, catalogRaw, saveCatalog, definition, cleanup };
+	return { base, project, live, remote, raw, save, configPath, load, hostConfig, hostSettings, saveHost, definition, cleanup };
 }
 async function extension(t: test.TestContext, f: Awaited<ReturnType<typeof fixture>>, createQmd?: any) {
 	const emitter = new EventEmitter(), handlers = new Map<string, Function>();
@@ -50,11 +57,18 @@ async function extension(t: test.TestContext, f: Awaited<ReturnType<typeof fixtu
 	return { client: createMarkdownDatastoreClient(events, { capability: queryMarkdownDatastoreCapability(events) }), capability: queryMarkdownDatastoreCapability(events)! };
 }
 
-test("unavailable catalog sibling does not invalidate a healthy reference or private store", async t => {
+test("old shared catalog references are rejected", async t => {
+	const f = await fixture(t);
+	f.raw.stores.remote = { shared: { catalog: f.hostConfig, store: "remote" } };
+	await f.save();
+	await assert.rejects(f.load(), { code: "CONFIG_INVALID" });
+});
+
+test("an unavailable registered root does not invalidate a healthy declaration or private store", async t => {
 	const f = await fixture(t); await rm(f.remote, { recursive: true });
-	f.raw.stores = { private: f.definition(f.live, "private"), shared: { shared: { catalog: f.catalog, store: "live" } } }; await f.save();
-	const catalog = await loadSharedCatalog(f.catalog);
-	assert.deepEqual([...catalog.stores.keys()], ["live"]); assert.deepEqual([...catalog.unavailableStores.keys()], ["remote"]);
+	f.raw.stores = { private: f.definition(f.live, "private"), shared: { shared: { root: f.live, include: ["**/*.md"], exclude: [] } } }; await f.save();
+	const hostState = (await loadRegistrations(await loadDeclarationHostSettings(f.hostConfig))).state;
+	assert.deepEqual([...hostState.stores.keys()], [declarationId(f.live)]); assert.deepEqual([...hostState.unavailableStores.keys()], [declarationId(f.remote)]);
 	const config = await f.load(); assert.deepEqual(configuredStoreNames(config), ["private", "shared"]);
 	const service = new MarkdownDatastoreService(config); f.cleanup.push(() => service.shutdown());
 	assert.match(String((await service.read({ note: { store: "private", path: "one.md" } })).data.content), /Healthy source/);
@@ -109,14 +123,16 @@ test("concurrent different-name late bindings atomically exclude duplicate priva
 	assert.equal(results.filter(result => result.status === "rejected" && result.reason.code === "STORE_UNAVAILABLE").length, 1);
 });
 
-test("a malformed catalog on its first readable operation fails closed rather than becoming partial authority", async t => {
-	const f = await fixture(t); await rm(f.catalog);
-	f.raw.stores.remote = { shared: { catalog: f.catalog, store: "remote" } }; await f.save();
+test("malformed host settings fail closed rather than becoming partial authority", async t => {
+	const f = await fixture(t); await rm(f.hostConfig);
+	f.raw.stores.remote = { shared: { root: f.remote, include: ["**/*.md"], exclude: [] } }; await f.save();
 	const { client } = await extension(t, f);
-	await writeFile(f.catalog, "{}", { mode: 0o600 });
-	await assert.rejects(client.read({ note: { store: "remote", path: "one.md" } }), code("CONFIG_VERSION_UNSUPPORTED"));
-	await assert.rejects(client.read({ note: { store: "live", path: "one.md" } }), code("CONFIG_VERSION_UNSUPPORTED"));
-	await assert.rejects(client.status({}), code("CONFIG_VERSION_UNSUPPORTED"));
+	await writeFile(f.hostConfig, "{}", { mode: 0o600 });
+	await assert.rejects(client.read({ note: { store: "remote", path: "one.md" } }), code("STORE_UNAVAILABLE"));
+	await assert.rejects(client.read({ note: { store: "live", path: "one.md" } }), code("STORE_UNAVAILABLE"));
+	await assert.rejects(client.status({}), code("STORE_UNAVAILABLE"));
+	await writeFile(f.hostConfig, "{}", { mode: 0o600 });
+	await assert.rejects(f.load(), code("CONFIG_INVALID"));
 });
 
 test("a bound root returns with the same inode but a replacement is never adopted", async t => {
@@ -133,21 +149,23 @@ test("a bound root returns with the same inode but a replacement is never adopte
 	assert.match(String((await service.read({ note: { store: "live", path: "one.md" } })).data.content), /Healthy source/);
 });
 
-test("missing catalog authority defers only its references and binds once the catalog can first be read", async t => {
-	const f = await fixture(t); await rename(f.catalog, `${f.catalog}-away`);
-	f.raw.stores.remote = { shared: { catalog: f.catalog, store: "remote" } }; await f.save();
+test("missing host settings fail a declaration closed and do not disable a private-only config", async t => {
+	const f = await fixture(t); await rename(f.hostConfig, `${f.hostConfig}-away`);
+	f.raw.stores = { live: f.definition(f.live, "live") }; await f.save();
 	const { client } = await extension(t, f);
 	assert.match(String((await client.read({ note: { store: "live", path: "one.md" } })).data.content), /Healthy source/);
-	await assert.rejects(client.read({ note: { store: "remote", path: "one.md" } }), code("STORE_UNAVAILABLE"));
-	await rename(`${f.catalog}-away`, f.catalog);
-	assert.match(String((await client.read({ note: { store: "remote", path: "one.md" } })).data.content), /Returned source/);
+	f.raw.stores.remote = { shared: { root: f.remote, include: ["**/*.md"], exclude: [] } }; await f.save();
+	await assert.rejects(f.load(), code("STORE_UNAVAILABLE"));
+	await rename(`${f.hostConfig}-away`, f.hostConfig);
+	const restored = await f.load();
+	assert.equal(restored.stores.get("remote")?.root, f.remote);
 });
 
 test("shared host admits healthy members, then single-flights a returned member without a restart", async t => {
 	const f = await fixture(t); await rename(f.remote, `${f.remote}-away`);
-	const host = await startSharedHost(f.catalog); f.cleanup.push(() => host.close());
+	const host = await startSharedHost(f.hostConfig); f.cleanup.push(() => host.close());
 	assert.equal(host.coordinators.size, 1);
-	f.raw.stores = { live: { shared: { catalog: f.catalog, store: "live" } }, remote: { shared: { catalog: f.catalog, store: "remote" } } }; await f.save();
+	f.raw.stores = { live: { shared: { root: f.live, include: ["**/*.md"], exclude: [] } }, remote: { shared: { root: f.remote, include: ["**/*.md"], exclude: [] } } }; await f.save();
 	const { client } = await extension(t, f);
 	const healthy = await client.refresh({ store: "live", mode: "metadata" }); assert.ok(healthy.data.qmd);
 	await assert.rejects(client.refresh({ store: "remote", mode: "metadata" }), code("STORE_UNAVAILABLE"));
@@ -156,16 +174,16 @@ test("shared host admits healthy members, then single-flights a returned member 
 	assert.ok(statuses.every(result => (result.data.stores as any[])[0].capabilities.direct.state === "ready"));
 	assert.equal(host.coordinators.size, 2);
 	assert.ok((await client.refresh({ store: "remote", mode: "metadata" })).data.qmd);
-	const captured = host.catalog.stores.get("remote")!;
+	const captured = host.state.stores.get(declarationId(f.remote))!;
 	await rename(f.remote, `${f.remote}-away`); await mkdir(f.remote);
 	await assert.rejects(client.refresh({ store: "remote", mode: "metadata" }), code("STORE_UNAVAILABLE"));
-	assert.equal(host.catalog.stores.get("remote")!.rootIno, captured.rootIno);
+	assert.equal(host.state.stores.get(declarationId(f.remote))!.rootIno, captured.rootIno);
 });
 
 test("a rejected first hello can discard only provisional capture and heals when the host's original root returns", async t => {
-	const f = await fixture(t), host = await startSharedHost(f.catalog); f.cleanup.push(() => host.close());
+	const f = await fixture(t), host = await startSharedHost(f.hostConfig); f.cleanup.push(() => host.close());
 	await rename(f.remote, `${f.remote}-away`);
-	f.raw.stores.remote = { shared: { catalog: f.catalog, store: "remote" } };
+	f.raw.stores.remote = { shared: { root: f.remote, include: ["**/*.md"], exclude: [] } };
 	f.raw.stores.blocked = f.definition(join(f.base, "missing"), "blocked"); await f.save();
 	const { client } = await extension(t, f);
 	await mkdir(f.remote); await writeFile(join(f.remote, "one.md"), "Replacement\n");
@@ -179,7 +197,7 @@ test("a rejected first hello can discard only provisional capture and heals when
 test("failed policy and direct refresh leave no sticky shared identity when no host can reject it", async t => {
 	for (const operation of ["policy", "refresh"] as const) {
 		const f = await fixture(t);
-		f.raw.stores.remote = { shared: { catalog: f.catalog, store: "remote" } };
+		f.raw.stores.remote = { shared: { root: f.remote, include: ["**/*.md"], exclude: [] } };
 		f.raw.stores.blocked = f.definition(join(f.base, "missing"), "blocked"); await f.save();
 		const { client } = await extension(t, f);
 		if (operation === "policy") await assert.rejects(client.roots({}), code("STORE_UNAVAILABLE"));
@@ -190,7 +208,7 @@ test("failed policy and direct refresh leave no sticky shared identity when no h
 });
 
 test("a failed observation cannot discard the exact root another in-flight observation successfully returns", async t => {
-	const f = await fixture(t); f.raw.stores.remote = { shared: { catalog: f.catalog, store: "remote" } }; await f.save();
+	const f = await fixture(t); f.raw.stores.remote = { shared: { root: f.remote, include: ["**/*.md"], exclude: [] } }; await f.save();
 	const config = await f.load(), store = config.stores.get("remote")!;
 	const failed = observeSource(store), successful = observeSource(store);
 	failed(false); assert.equal(config.stores.get("remote"), store);
@@ -200,7 +218,7 @@ test("a failed observation cannot discard the exact root another in-flight obser
 
 test("successful direct shared reads commit their own source identity without needing a live host", async t => {
 	const f = await fixture(t); await rename(f.remote, `${f.remote}-away`);
-	f.raw.stores.remote = { shared: { catalog: f.catalog, store: "remote" } }; await f.save();
+	f.raw.stores.remote = { shared: { root: f.remote, include: ["**/*.md"], exclude: [] } }; await f.save();
 	const { client } = await extension(t, f);
 	await mkdir(f.remote); await writeFile(join(f.remote, "one.md"), "Replacement served directly\n");
 	assert.match(String((await client.read({ note: { store: "remote", path: "one.md" } })).data.content), /Replacement served directly/);
@@ -210,7 +228,7 @@ test("successful direct shared reads commit their own source identity without ne
 });
 
 test("a successful complete policy commits shared roots even when the shared service is down", async t => {
-	const f = await fixture(t); f.raw.stores.remote = { shared: { catalog: f.catalog, store: "remote" } }; await f.save();
+	const f = await fixture(t); f.raw.stores.remote = { shared: { root: f.remote, include: ["**/*.md"], exclude: [] } }; await f.save();
 	const { client } = await extension(t, f); assert.equal((await client.roots({})).data.roots.length, 2);
 	await assert.rejects(client.refresh({ store: "remote", mode: "metadata" }), code("STORE_UNAVAILABLE"));
 	await rename(f.remote, `${f.remote}-away`); await mkdir(f.remote); await writeFile(join(f.remote, "one.md"), "Replacement\n");
@@ -218,7 +236,7 @@ test("a successful complete policy commits shared roots even when the shared ser
 });
 
 test("an in-flight source observation wins over provisional discard only if that exact observation succeeds", async t => {
-	const f = await fixture(t); f.raw.stores.remote = { shared: { catalog: f.catalog, store: "remote" } }; await f.save();
+	const f = await fixture(t); f.raw.stores.remote = { shared: { root: f.remote, include: ["**/*.md"], exclude: [] } }; await f.save();
 	const config = await f.load(), store = config.stores.get("remote")!;
 	const finish = observeSource(store); rejectSharedStore(store);
 	assert.equal(config.stores.get("remote"), store); finish(true);
@@ -233,17 +251,17 @@ test("an in-flight source observation wins over provisional discard only if that
 
 test("failed lazy shared admission releases ownership and never publishes a half-loaded coordinator", async t => {
 	const f = await fixture(t); await rename(f.remote, `${f.remote}-away`);
-	const host = await startSharedHost(f.catalog); f.cleanup.push(() => host.close());
-	const state = join(f.base, "state/remote"); await mkdir(state, { mode: 0o700 });
+	const host = await startSharedHost(f.hostConfig); f.cleanup.push(() => host.close());
+	const state = join(f.base, "state", declarationId(f.remote)); await mkdir(state, { mode: 0o700 });
 	await writeFile(join(state, "jobs.json"), "bad ledger", { mode: 0o600 });
-	f.raw.stores.remote = { shared: { catalog: f.catalog, store: "remote" } }; await f.save();
+	f.raw.stores.remote = { shared: { root: f.remote, include: ["**/*.md"], exclude: [] } }; await f.save();
 	const { client } = await extension(t, f); await rename(`${f.remote}-away`, f.remote);
 	await assert.rejects(client.refresh({ store: "remote", mode: "metadata" }), code("INDEX_CORRUPT"));
-	assert.equal(host.coordinators.has("remote"), false);
+	assert.equal(host.coordinators.has(declarationId(f.remote)), false);
 	assert.match(String((await client.read({ note: { store: "live", path: "one.md" } })).data.content), /Healthy source/);
 	await writeFile(join(state, "jobs.json"), JSON.stringify({ version: 1, jobs: [] }), { mode: 0o600 });
 	assert.ok((await client.refresh({ store: "remote", mode: "metadata" })).data.qmd);
-	assert.equal(host.coordinators.has("remote"), true);
+	assert.equal(host.coordinators.has(declarationId(f.remote)), true);
 });
 
 test("an unsafe returning root stays unbound and can later bind only after full validation", async t => {
@@ -262,9 +280,10 @@ test("structural errors still fail load even beside unavailable members", async 
 	f.raw.stores.remote = f.definition(f.remote, "remote");
 	await symlink(f.remote, join(f.base, "dangling")); f.raw.stores.remote.root = join(f.base, "dangling"); await f.save();
 	await assert.rejects(f.load(), code("SYMLINK_REJECTED"));
-	f.catalogRaw.stores.remote.root = join(f.base, "dangling"); await f.saveCatalog();
-	f.raw.stores.remote = { shared: { catalog: f.catalog, store: "live" } }; await f.save();
-	await assert.rejects(f.load(), code("CONFIG_INVALID"));
+	f.hostSettings.stores.remote.root = join(f.base, "dangling"); await f.saveHost();
+	f.raw.stores.remote = { shared: { root: f.live, include: ["**/*.md"], exclude: [] } }; await f.save();
+	const loaded = await f.load();
+	assert.equal(loaded.stores.get("remote")?.root, f.live);
 	f.raw.stores.remote = f.definition(f.live, "remote"); await f.save(); await assert.rejects(f.load(), code("CONFIG_INVALID"));
 });
 

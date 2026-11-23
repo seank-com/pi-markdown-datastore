@@ -49,7 +49,7 @@ async function fixture(t: TestContext, packageRoot?: string) {
 		clients.push(client);
 		return client;
 	};
-	return { base, settings, snapshot, stateRoot, socketPath, source, attach, start: async () => host = await startSharedHost(settings, { declarations: true }), stop: async () => { await host?.close(); host = undefined; } };
+	return { base, settings, snapshot, stateRoot, socketPath, source, attach, start: async () => host = await startSharedHost(settings), stop: async () => { await host?.close(); host = undefined; } };
 }
 
 test("registration reconstructs with zero clients, then from any matching declaration after snapshot loss", async t => {
@@ -60,7 +60,7 @@ test("registration reconstructs with zero clients, then from any matching declar
 	const second = await f.attach("second", "other", root, ["a", "b", "b"], ["**/*.md"]);
 	const host = await f.start();
 	assert.equal(host.coordinators.size, 0);
-	await assert.rejects(startSharedHost(f.settings, { declarations: true }), { code: "STORE_UNAVAILABLE" });
+	await assert.rejects(startSharedHost(f.settings), { code: "STORE_UNAVAILABLE" });
 	await Promise.all([first.status(), second.status()]);
 	assert.equal(host.coordinators.size, 1);
 	assert.deepEqual(JSON.parse(await readFile(f.snapshot, "utf8")), { schemaVersion: 1, registrations: { [root]: { include: ["**/*.md"], exclude: ["a", "b", "b"] } } });
@@ -122,7 +122,7 @@ test("host reloads a generated registration snapshot larger than an authored con
 	await f.stop();
 	const restored = await f.start();
 	assert.deepEqual([...restored.coordinators.keys()].sort(), roots.map(declarationId).sort());
-	for (const root of roots) assert.deepEqual(restored.catalog.stores.get(declarationId(root))?.exclude, exclude);
+	for (const root of roots) assert.deepEqual(restored.state.stores.get(declarationId(root))?.exclude, exclude);
 });
 
 const nativePackage = process.env.DATASTORE_QMD_PACKAGE;
@@ -179,7 +179,7 @@ test("overlapping admissions serialize and failed publication leaves no partial 
 	const first = await f.attach("first", "notes", parent);
 	await mkdir(f.snapshot);
 	await assert.rejects(first.status(), { code: "STORE_UNAVAILABLE" });
-	assert.equal(host.catalog.stores.size, 0);
+	assert.equal(host.state.stores.size, 0);
 	assert.equal(host.coordinators.size, 0);
 	await rm(f.snapshot, { recursive: true });
 	const second = await f.attach("second", "notes", child);
