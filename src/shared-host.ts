@@ -1,5 +1,5 @@
 import type { Server, Socket } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { discoverQmdBinding, prepareQmdStateDirectory, qmdApplicationDirectory, QmdAdapter } from "./qmd-adapter.ts";
 import { acquireIndexOwnership, type IndexOwnership } from "./index-ownership.ts";
 import { adoptLegacyApplicationJobs, MaintenanceCoordinator, sourceDefinition } from "./maintenance-coordinator.ts";
@@ -8,34 +8,42 @@ import type { MarkdownDatastoreConfig, StoreConfig } from "./config.ts";
 import { clampReadBudget } from "./config-common.ts";
 import { assertRootIdentity, validateRelativeContainedPath } from "./containment.ts";
 import { DatastoreError } from "./errors.ts";
-import { loadSharedCatalog, type SharedCatalog, type SharedStoreDefinition } from "./shared-catalog.ts";
-import { attachSharedParser, encodeSharedMessage, generationId, listenOwnedSocket, parseSharedRequest, type SharedCall, type SharedHello, type SharedReply } from "./shared-ipc.ts";
+import type { SharedHostState, SharedStoreDefinition } from "./shared-config.ts";
+import { loadDeclarationHostSettings, loadRegistrations } from "./shared-registrations.ts";
+import { attachSharedParser, encodeSharedMessage, generationId, listenOwnedSocket, parseSharedRequest, type SharedCall, type SharedReply } from "./shared-ipc.ts";
 
 export interface SharedHost {
 	generation: string;
-	catalog: SharedCatalog;
+	state: SharedHostState;
 	adapters: ReadonlyMap<string, QmdAdapter>;
 	coordinators: ReadonlyMap<string, MaintenanceCoordinator>;
 	close: () => Promise<void>;
 }
 
-function storeConfig(catalog: SharedCatalog, definition: SharedStoreDefinition): MarkdownDatastoreConfig {
+export function sharedStoreConfig(host: SharedHostState, definition: SharedStoreDefinition): MarkdownDatastoreConfig {
 	const store: StoreConfig = {
 		name: definition.id, configuredRoot: definition.root, root: definition.root, rootWasSymlink: false,
 		rootDev: definition.rootDev, rootIno: definition.rootIno, include: definition.include, exclude: definition.exclude,
 		maxFileBytes: definition.maxFileBytes, search: definition.search,
 	};
 	return {
-		schemaVersion: 1, projectRoot: catalog.stateRoot, configPath: catalog.path, stateRoot: `${catalog.stateRoot}/${definition.id}`,
-		defaults: catalog.defaults,
-		qmd: catalog.qmd, stores: new Map([[definition.id, store]]),
+		schemaVersion: 1, projectRoot: host.stateRoot, configPath: host.path, stateRoot: `${host.stateRoot}/${definition.id}`,
+		defaults: host.defaults,
+		qmd: host.qmd, stores: new Map([[definition.id, store]]),
 	};
 }
 
-export async function startSharedHost(catalogPath: string, options: { schedule?: typeof setTimeout } = {}): Promise<SharedHost> {
-	const catalog = await loadSharedCatalog(catalogPath);
+export async function startSharedHost(hostConfigPath: string, options: { schedule?: typeof setTimeout } = {}): Promise<SharedHost> {
+	const settings = await loadDeclarationHostSettings(hostConfigPath);
+	const registryOwner = await acquireIndexOwnership(dirname(settings.path));
+	const { registry, state } = await (async () => {
+		try {
+			const registry = await loadRegistrations(settings);
+			await prepareQmdStateDirectory(registry.state.stateRoot);
+			return { registry, state: registry.state };
+		} catch (error) { await registryOwner?.release(); throw error; }
+	})();
 	const generation = generationId();
-	await prepareQmdStateDirectory(catalog.stateRoot);
 	const adapters = new Map<string, QmdAdapter>();
 	const metadata = new Map<string, MetadataIndex>();
 	const coordinators = new Map<string, MaintenanceCoordinator>();
@@ -47,11 +55,13 @@ export async function startSharedHost(catalogPath: string, options: { schedule?:
 		const currentServer = server;
 		const stopped = currentServer ? new Promise<void>((resolve, reject) => currentServer.close(error => error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING" ? reject(error) : resolve())) : Promise.resolve();
 		for (const socket of sockets) socket.destroy();
+		await registry?.settled();
 		await Promise.allSettled(initializing.values());
 		for (const coordinator of coordinators.values()) coordinator.shutdown();
 		await Promise.all([...coordinators.values()].map((coordinator) => coordinator.settled()));
 		await Promise.all([...ownerships.values()].map((ownership) => ownership.release()));
-		await Promise.all([stopped, ...[...adapters.values()].map(adapter => adapter.shutdown())]);
+		try { await Promise.all([stopped, ...[...adapters.values()].map(adapter => adapter.shutdown())]); }
+		finally { await registryOwner?.release(); }
 	})();
 	const initializing = new Map<string, Promise<void>>();
 	const configs = new Map<string, MarkdownDatastoreConfig>();
@@ -59,16 +69,17 @@ export async function startSharedHost(catalogPath: string, options: { schedule?:
 		if (closing) throw new DatastoreError("STORE_UNAVAILABLE");
 		const pending = initializing.get(id); if (pending) return pending;
 		const operation = (async () => {
-			const definition = catalog.stores.get(id) ?? await catalog.unavailableStores.get(id)?.();
+			const definition = state.stores.get(id) ?? await state.unavailableStores.get(id)?.();
 			if (!definition) throw new DatastoreError("STORE_UNKNOWN");
 			let config = configs.get(id);
-			if (!config) { config = storeConfig(catalog, definition); configs.set(id, config); }
+			if (!config) { config = sharedStoreConfig(state, definition); configs.set(id, config); }
 			await assertRootIdentity(config.stores.get(id)!).catch(() => { throw new DatastoreError("STORE_UNAVAILABLE", { sourceRoot: true }); });
 			if (coordinators.has(id)) return;
 			if (closing) throw new DatastoreError("STORE_UNAVAILABLE");
 			let coordinator!: MaintenanceCoordinator;
 			try {
-			const stateDirectory = `${catalog.stateRoot}/${definition.id}`;
+			const stateDirectory = `${state.stateRoot}/${definition.id}`;
+
 			await prepareQmdStateDirectory(stateDirectory);
 			ownerships.set(definition.id, await acquireIndexOwnership(stateDirectory));
 			await adoptLegacyApplicationJobs(stateDirectory, `${stateDirectory}/jobs.json`, new Set([definition.id]), (version) => qmdApplicationDirectory(config, version), (job, version) => sourceDefinition(job.stores.map((name) => config.stores.get(name)!), job.mode === "metadata" ? undefined : { version }));
@@ -102,10 +113,10 @@ export async function startSharedHost(catalogPath: string, options: { schedule?:
 	};
 	try {
 		// Admit only bound members before endpoint publication. Missing members are admitted on demand.
-		for (const definition of catalog.stores.values()) {
+		for (const definition of state.stores.values()) {
 			try { await admit(definition.id); } catch (error) { if (!(error instanceof DatastoreError) || error.code !== "STORE_UNAVAILABLE" || error.details?.sourceRoot !== true) throw error; }
 		}
-		server = await listenOwnedSocket(catalog.socketPath, (socket) => {
+		server = await listenOwnedSocket(state.socketPath, (socket) => {
 		sockets.add(socket);
 		const waiters = new Map<string, AbortController>();
 		const send = (reply: SharedReply) => { if (!socket.destroyed) socket.write(encodeSharedMessage(reply)); };
@@ -113,26 +124,35 @@ export async function startSharedHost(catalogPath: string, options: { schedule?:
 			const code = error instanceof DatastoreError ? error.code : "STORE_UNAVAILABLE";
 			const applied = error instanceof DatastoreError && error.details?.operationApplied === true;
 			const refreshIds = applied && Array.isArray(error.details?.refreshIds) ? error.details.refreshIds.filter((id): id is string => typeof id === "string" && /^[0-9a-f]{32}$/.test(id)) : [];
-			send({ version: 1, requestId, generation, definitionRevision, ok: false, error: { code, ...(applied ? { details: { operationApplied: true, refreshIds } } : {}) } });
+			const conflicts = error instanceof DatastoreError && Array.isArray(error.details?.conflictingFields) ? error.details.conflictingFields : undefined;
+			send({ version: 1, requestId, generation, definitionRevision, ok: false, error: { code, ...(applied ? { details: { operationApplied: true, refreshIds } } : conflicts ? { details: { conflictingFields: conflicts } } : {}) } });
 		};
 		attachSharedParser(socket, (message) => {
 			let request;
 			try { request = parseSharedRequest(message); } catch (error) { fail(undefined, "", error); socket.destroy(); return; }
 			if (request.operation === "drop") { waiters.get(request.requestId)?.abort(new DatastoreError("CANCELLED")); return; }
+			if (request.operation === "helloDeclaration") {
+				const hello = request;
+				void (async () => {
+					if (!registry) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
+					if (closing) throw new DatastoreError("STORE_UNAVAILABLE");
+					const definition = await registry.register(hello.declaration, hello);
+					await admit(definition.id);
+					const version = adapters.get(definition.id)?.binding.version ?? "metadata";
+					send({ version: 1, requestId: hello.requestId, generation, definitionRevision: definition.definitionRevision, ok: true, result: { generation, version, resultBudgetVersion: 1, store: definition.id } });
+				})().catch(error => fail(hello.requestId, "", error));
+				return;
+			}
 			void handle(request).catch((error) => fail(request.requestId, request.definitionRevision, error));
 		}, () => socket.destroy());
-		const handle = async (message: SharedHello | SharedCall): Promise<void> => {
+		const handle = async (message: SharedCall): Promise<void> => {
 			if (message.version !== 1 || typeof message.store !== "string" || typeof message.definitionRevision !== "string") throw new DatastoreError("CONFIG_INVALID");
 			await admit(message.store);
-			const definition = catalog.stores.get(message.store);
+			const definition = state.stores.get(message.store);
 			const adapter = adapters.get(message.store);
 			const index = metadata.get(message.store);
 			const coordinator = coordinators.get(message.store);
 			if (!definition || !index || !coordinator || message.definitionRevision !== definition.definitionRevision) throw new DatastoreError("STORE_UNAVAILABLE");
-			if (message.operation === "hello") {
-				send({ version: 1, requestId: message.requestId, generation, definitionRevision: definition.definitionRevision, ok: true, result: { generation, version: adapter?.binding.version ?? "metadata", resultBudgetVersion: 1 } });
-				return;
-			}
 			const call = message as SharedCall;
 			if (call.generation !== generation) throw new DatastoreError("STORE_UNAVAILABLE");
 			const controller = new AbortController();
@@ -145,13 +165,13 @@ export async function startSharedHost(catalogPath: string, options: { schedule?:
 					const paths = Array.isArray(call.input?.paths) ? call.input.paths.map((path) => validateRelativeContainedPath(path as string)) : [];
 					if (call.input?.rebuild === true && paths.length) throw new DatastoreError("INVALID_NOTE_REF");
 					if (paths.length) coordinator.notePaths(message.store, paths);
-					result = await coordinator.enqueue("metadata", [message.store], "explicit-maintenance", sourceDefinition([storeConfig(catalog, definition).stores.get(message.store)!]), call.input?.rebuild === true || call.input?.paths === undefined ? "rebuild" : undefined);
+					result = await coordinator.enqueue("metadata", [message.store], "explicit-maintenance", sourceDefinition([sharedStoreConfig(state, definition).stores.get(message.store)!]), call.input?.rebuild === true || call.input?.paths === undefined ? "rebuild" : undefined);
 				}
 				else if (call.operation === "links" || call.operation === "backlinks" || call.operation === "tagPages" || call.operation === "tags") {
-					const store = storeConfig(catalog, definition).stores.get(message.store);
+					const store = sharedStoreConfig(state, definition).stores.get(message.store);
 					if (!store) throw new DatastoreError("STORE_UNAVAILABLE");
 					const snapshot = await index.requireSnapshot();
-					const budget = clampReadBudget({ maxBytes: call.input?.maxBytes, maxLines: call.input?.maxLines }, { maxBytes: catalog.defaults.maxResultBytes, maxLines: catalog.defaults.maxResultLines });
+					const budget = clampReadBudget({ maxBytes: call.input?.maxBytes, maxLines: call.input?.maxLines }, { maxBytes: state.defaults.maxResultBytes, maxLines: state.defaults.maxResultLines });
 					const responseStore = typeof call.input?.responseStore === "string" ? call.input.responseStore : message.store;
 					if (call.operation === "tags") {
 						const offset = continuationOffset(typeof call.input?.continuation === "string" ? call.input.continuation : undefined, responseStore, snapshot.revision, "catalog");
@@ -221,5 +241,5 @@ export async function startSharedHost(catalogPath: string, options: { schedule?:
 		await close();
 		throw error;
 	}
-	return { generation, catalog, adapters, coordinators, close };
+	return { generation, state, adapters, coordinators, close };
 }

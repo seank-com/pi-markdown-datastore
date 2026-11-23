@@ -6,15 +6,10 @@ import { DatastoreError, datastoreError, throwIfAborted } from "./errors.ts";
 import type { SearchMode } from "./contract.ts";
 import type { QmdRefreshJob, QmdSearchResult } from "./qmd-adapter.ts";
 
+import { parseDeclaration, type Declaration } from "./shared-registrations.ts";
+
 export const SHARED_IPC_VERSION = 1;
 
-export interface SharedHello {
-	version: 1;
-	operation: "hello";
-	requestId?: string;
-	store: string;
-	definitionRevision: string;
-}
 export interface SharedCall {
 	version: 1;
 	operation: "search" | "status" | "startLexical" | "startSemantic" | "startMetadata" | "links" | "backlinks" | "tagPages" | "tags" | "cancel" | "activity" | "current";
@@ -25,7 +20,15 @@ export interface SharedCall {
 	input?: Record<string, unknown>;
 }
 export interface SharedDrop { version: 1; operation: "drop"; requestId: string }
-export type SharedRequest = SharedHello | SharedCall | SharedDrop;
+export interface DeclarationHello {
+	version: 1;
+	operation: "helloDeclaration";
+	requestId: string;
+	declaration: Declaration;
+	rootDev: number;
+	rootIno: number;
+}
+export type SharedRequest = SharedCall | SharedDrop | DeclarationHello;
 export interface SharedReply {
 	version: 1;
 	requestId?: string;
@@ -33,14 +36,14 @@ export interface SharedReply {
 	definitionRevision: string;
 	ok: boolean;
 	result?: unknown;
-	error?: { code: string; details?: { operationApplied: true; refreshIds: string[] } };
+	error?: { code: string; details?: { operationApplied: true; refreshIds: string[] } | { conflictingFields: string[] } };
 }
 
 export function encodeSharedMessage(value: unknown): string {
 	return `${JSON.stringify(value)}\n`;
 }
 
-const STORE_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
+export const SHARED_STORE_ID = /^s-[0-9a-f]{64}$/;
 const ID = /^[0-9a-f]{32}$/;
 const REVISION = /^[0-9a-f]{64}$/;
 const GENERATION = /^gen-[0-9a-f]{32}$/;
@@ -57,8 +60,12 @@ export function parseSharedRequest(value: unknown): SharedRequest {
 		if (typeof message.requestId !== "string" || !ID.test(message.requestId) || Object.keys(message).some((key) => !["version", "operation", "requestId"].includes(key))) throw new DatastoreError("CONFIG_INVALID");
 		return { version: 1, operation: "drop", requestId: message.requestId };
 	}
-	if (typeof message.store !== "string" || !STORE_NAME.test(message.store) || typeof message.definitionRevision !== "string" || !REVISION.test(message.definitionRevision)) throw new DatastoreError("CONFIG_INVALID");
-	if (message.operation === "hello") return { version: 1, operation: "hello", requestId: typeof message.requestId === "string" ? message.requestId : undefined, store: message.store, definitionRevision: message.definitionRevision };
+	if (message.operation === "helloDeclaration") {
+		const { requestId, rootDev, rootIno } = message;
+		if (typeof requestId !== "string" || !ID.test(requestId) || typeof rootDev !== "number" || !Number.isInteger(rootDev) || typeof rootIno !== "number" || !Number.isInteger(rootIno) || Object.keys(message).some(key => !["version", "operation", "requestId", "declaration", "rootDev", "rootIno"].includes(key))) throw new DatastoreError("CONFIG_INVALID");
+		return { version: 1, operation: "helloDeclaration", requestId, declaration: parseDeclaration(message.declaration), rootDev, rootIno };
+	}
+	if (typeof message.store !== "string" || !SHARED_STORE_ID.test(message.store) || typeof message.definitionRevision !== "string" || !REVISION.test(message.definitionRevision)) throw new DatastoreError("CONFIG_INVALID");
 	if (!CALLS.has(message.operation) || typeof message.requestId !== "string" || !ID.test(message.requestId) || typeof message.generation !== "string" || !GENERATION.test(message.generation)) throw new DatastoreError("CONFIG_INVALID");
 	return { version: 1, operation: message.operation as SharedCall["operation"], requestId: message.requestId, generation: message.generation, store: message.store, definitionRevision: message.definitionRevision, input: message.input && typeof message.input === "object" ? message.input as Record<string, unknown> : undefined };
 }
@@ -142,6 +149,9 @@ export function sharedError(error: unknown): DatastoreError {
 			const ids = (details as { refreshIds?: unknown }).refreshIds;
 			if (!Array.isArray(ids) || !ids.every(id => typeof id === "string" && /^[0-9a-f]{32}$/.test(id))) return new DatastoreError("BACKEND_OUTPUT_INVALID");
 			return new DatastoreError(error.code as DatastoreError["code"], { operationApplied: true, refreshIds: [...ids] });
+		}
+		if (details && typeof details === "object" && "conflictingFields" in details && Array.isArray(details.conflictingFields) && details.conflictingFields.every(field => ["root", "include", "exclude"].includes(field))) {
+			return new DatastoreError(error.code as DatastoreError["code"], { conflictingFields: details.conflictingFields });
 		}
 		return new DatastoreError(error.code as DatastoreError["code"]);
 	}

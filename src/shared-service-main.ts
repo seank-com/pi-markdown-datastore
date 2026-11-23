@@ -1,12 +1,11 @@
 import { startSharedHost } from "./shared-host.ts";
 
-const catalogFlag = process.argv.indexOf("--catalog");
-const catalog = catalogFlag >= 0 ? process.argv[catalogFlag + 1] : undefined;
-if (!catalog) {
-	process.stderr.write("shared datastore service requires --catalog\n");
+const [flag, path, ...extra] = process.argv.slice(2);
+if (!path || extra.length || flag !== "--host-config") {
+	process.stderr.write("shared datastore service requires --host-config and a path\n");
 	process.exit(2);
 }
-const host = await startSharedHost(catalog);
+const host = await startSharedHost(path);
 const stop = () => { void host.close().finally(() => process.exit(0)); };
 process.on("SIGINT", stop);
 process.on("SIGTERM", stop);

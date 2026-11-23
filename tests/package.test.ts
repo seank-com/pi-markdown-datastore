@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -44,16 +44,18 @@ void policy.roots({}); void policy.validateDestination({ path: "/example/new.md"
     stores: { notes: { root: "notes", include: ["**/*.md"], exclude: [], maxFileBytes: 4096, search: { defaultMode: "lexical", qmdCollection: "notes" } } },
   };
   await writeFile(join(configDir, "config.json"), JSON.stringify(config), { mode: 0o600 });
-  await t.test("foreground shared CLI starts and stops without installed Pi peers", async () => {
+  await t.test("foreground --host-config CLI starts and stops without installed Pi peers", async () => {
     const run = await realpath(await mkdtemp("/tmp/datastore-cli-"));
     const catalog = join(run, "catalog.json"), socketPath = join(run, "owner.sock");
-    await writeFile(catalog, JSON.stringify({ ...config, socketPath, stateRoot: join(run, "state"),
-      stores: { notes: { ...config.stores.notes, root: await realpath(join(consumer, "notes")) } },
-    }), { mode: 0o600 });
+    const root = await realpath(join(consumer, "notes"));
+    const { defaults, qmd } = config;
+    const settings = { schemaVersion: 1, defaults, qmd, socketPath, stateRoot: join(run, "state") };
+    await writeFile(catalog, JSON.stringify({ ...settings, reader: { maxFileBytes: 4096, defaultMode: "lexical" } }), { mode: 0o600 });
+    await writeFile(join(run, "registrations.json"), JSON.stringify({ schemaVersion: 1, registrations: { [root]: { include: ["**/*.md"], exclude: [] } } }), { mode: 0o600 });
     for (const name of ["@earendil-works", "typebox"]) {
       await assert.rejects(stat(join(consumer, "node_modules", name)), { code: "ENOENT" });
     }
-    const child = spawn(process.execPath, [join(consumer, "node_modules/@seank/pi-markdown-datastore/dist/shared-service-main.js"), "--catalog", catalog], {
+    const child = spawn(process.execPath, [join(consumer, "node_modules/@seank/pi-markdown-datastore/dist/shared-service-main.js"), "--host-config", catalog], {
       cwd: consumer, stdio: ["ignore", "pipe", "pipe"],
     });
     let stderr = "", stdout = "";
@@ -110,6 +112,16 @@ void policy.roots({}); void policy.validateDestination({ path: "/example/new.md"
       assert.equal(JSON.parse(await invoke(["--initialize-terminal-history"])).initialized, false);
       for (const name of ["@earendil-works", "typebox"]) await assert.rejects(stat(join(consumer, "node_modules", name)), { code: "ENOENT" });
     } finally { await rm(state, { recursive: true, force: true }); }
+  });
+  await t.test("removed catalog cutover CLI is not packed and old host entry is refused", async () => {
+    await assert.rejects(stat(join(consumer, "node_modules/@seank/pi-markdown-datastore/dist/shared-cutover-main.js")), { code: "ENOENT" });
+    await assert.rejects(stat(join(consumer, "node_modules/@seank/pi-markdown-datastore/dist/shared-cutover.js")), { code: "ENOENT" });
+    const cli = join(consumer, "node_modules/@seank/pi-markdown-datastore/dist/shared-service-main.js");
+    for (const args of [[], ["--catalog", "/tmp/catalog.json"], ["/tmp/catalog.json"]]) {
+      const result = spawnSync(process.execPath, [cli, ...args], { cwd: consumer, encoding: "utf8" });
+      assert.equal(result.status, 2, result.stderr);
+      assert.match(result.stderr, /requires --host-config/);
+    }
   });
   const sdkRoot = await createQmdFixture(consumer);
   await writeFile(join(consumer, "probe.ts"), `

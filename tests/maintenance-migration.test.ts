@@ -10,6 +10,8 @@ import { EventEmitter } from "node:events";
 import { createMarkdownDatastoreExtension } from "../src/index.ts";
 import { createMarkdownDatastoreClient, queryMarkdownDatastoreCapability } from "../src/client.ts";
 import { startSharedHost } from "../src/shared-host.ts";
+import { declarationId } from "../src/shared-registrations.ts";
+import { writeDeclarationHost } from "./fixtures/declaration-host.ts";
 
 type Context = import("node:test").TestContext;
 async function fixture(t: Context) {
@@ -111,11 +113,12 @@ test("unchanged extension startup recovers private and shared operations after e
  await writeFile(join(groupNotes, "group.md"), "---\ntags: [shared]\n---\nGroup fixture.\n");
  const defaults = { operationTimeoutMs: 30000 }, qmd = { enabled: false, installation: { executable: "qmd" }, minimumVersion: "2.8.3" };
  const definition = (path: string, collection: string) => ({ root: path, include: ["**/*.md"], exclude: [], maxFileBytes: 200000, search: { defaultMode: "lexical", qmdCollection: collection } });
- const catalog = join(root, "catalog.json");
- await writeFile(catalog, JSON.stringify({ schemaVersion: 1, defaults, qmd, socketPath: join(root, "shared.sock"), stateRoot: join(root, "shared-state"), stores: { sisterhood: definition(groupNotes, "group") } }), { mode: 0o600 });
- const host = await startSharedHost(catalog); t.after(() => host.close());
- await host.coordinators.get("sisterhood")!.enqueue("metadata", ["sisterhood"], "explicit-maintenance"); await host.coordinators.get("sisterhood")!.settled();
- await writeFile(join(configDir, "config.json"), JSON.stringify({ schemaVersion: 1, defaults, qmd, stores: { telegram: definition(privateNotes, "private"), "telegram-group": { shared: { catalog, store: "sisterhood" } } } }), { mode: 0o600 });
+ const previousHome = process.env.HOME; process.env.HOME = root; t.after(() => { if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome; });
+ const hostPath = await writeDeclarationHost(join(root, ".pi", "markdown-datastore"), { socketPath: join(root, "shared.sock"), stateRoot: join(root, "shared-state"), defaults, qmd, reader: { maxFileBytes: 200000, defaultMode: "lexical" }, stores: [{ root: groupNotes }] });
+ const host = await startSharedHost(hostPath); t.after(() => host.close());
+ const id = declarationId(groupNotes);
+ await host.coordinators.get(id)!.enqueue("metadata", [id], "explicit-maintenance"); await host.coordinators.get(id)!.settled();
+ await writeFile(join(configDir, "config.json"), JSON.stringify({ schemaVersion: 1, defaults, qmd, stores: { telegram: definition(privateNotes, "private"), "telegram-group": { shared: { root: groupNotes, include: ["**/*.md"], exclude: [] } } } }), { mode: 0o600 });
  for (let n = 1; n <= 7; n += 1) await legacy(state, n);
  const emitter = new EventEmitter(), handlers = new Map<string, Function[]>();
  const api: any = { events: { emit: (name: string, payload: unknown) => emitter.emit(name, payload), on: (name: string, fn: any) => { emitter.on(name, fn); return () => emitter.off(name, fn); } }, on: (name: string, fn: Function) => handlers.set(name, [...(handlers.get(name) ?? []), fn]), registerTool() {}, appendEntry() {} };

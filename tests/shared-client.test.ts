@@ -4,11 +4,12 @@ import { join } from "node:path";
 import type { Socket } from "node:net";
 import test from "node:test";
 import { SharedIndexClient } from "../src/shared-client.ts";
-import { attachSharedParser, encodeSharedMessage, listenOwnedSocket } from "../src/shared-ipc.ts";
+import { attachSharedParser, encodeSharedMessage, listenOwnedSocket, parseSharedRequest } from "../src/shared-ipc.ts";
 
 async function fixture(t: import("node:test").TestContext, options: { holdHello?: boolean; invalid?: "generation" | "definition" } = {}) {
 	const directory = await mkdtemp("/tmp/d4-client-");
-	const path = join(directory, "s.sock"), generation = "gen-" + "e".repeat(32), definitionRevision = "f".repeat(64);
+	const path = join(directory, "s.sock"), generation = "gen-" + "e".repeat(32), definitionRevision = "f".repeat(64), store = "s-" + "c".repeat(64);
+	const declaration = { root: join(directory, "notes"), include: ["**/*.md"], exclude: [], rootDev: 1, rootIno: 2 };
 	const seen: string[] = [], sockets = new Set<Socket>();
 	let helloSeen!: () => void, releaseHello!: () => void, peerClosed!: () => void;
 	const hello = new Promise<void>(resolve => { helloSeen = resolve; });
@@ -20,11 +21,11 @@ async function fixture(t: import("node:test").TestContext, options: { holdHello?
 		attachSharedParser(socket, (message: any) => {
 			seen.push(message.operation);
 			const send = (result: unknown, invalid = false) => { if (!socket.destroyed) socket.write(encodeSharedMessage({ version: 1, requestId: message.requestId, generation: invalid && options.invalid === "generation" ? "gen-" + "a".repeat(32) : generation, definitionRevision: invalid && options.invalid === "definition" ? "b".repeat(64) : definitionRevision, ok: true, result })); };
-			if (message.operation === "hello") { helloSeen(); void held.then(() => send({ generation, version: "fixture", resultBudgetVersion: 1 })); }
+			if (message.operation === "helloDeclaration") { helloSeen(); void held.then(() => send({ generation, version: "fixture", resultBudgetVersion: 1, store })); }
 			if (message.operation === "activity") send({ state: "idle", active: false, queued: false, embeddingActive: false, jobs: [] }, true);
 		}, () => socket.destroy());
 	});
-	const client = new SharedIndexClient({ socketPath: path, store: "notebook", definitionRevision });
+	const client = new SharedIndexClient({ socketPath: path, store, definitionRevision, declaration });
 	t.after(async () => { releaseHello(); await client.shutdown(); for (const socket of sockets) socket.destroy(); await new Promise<void>(resolve => server.close(() => resolve())); await rm(directory, { recursive: true, force: true }); });
 	return { client, hello, releaseHello, closed, seen };
 }
@@ -37,7 +38,7 @@ test("one cancelled attachment waiter does not cancel the other caller's handsha
 	controller.abort(); await cancelled;
 	f.releaseHello();
 	assert.equal((await second).state, "idle");
-	assert.deepEqual(f.seen, ["hello", "activity"]);
+	assert.deepEqual(f.seen, ["helloDeclaration", "activity"]);
 });
 
 test("shutdown cancels and closes a handshake that has not published its ready socket", async t => {
@@ -46,6 +47,16 @@ test("shutdown cancels and closes a handshake that has not published its ready s
 	await f.hello; await f.client.shutdown(); await cancelled; await f.closed;
 	f.releaseHello();
 	await assert.rejects(f.client.activity(), { code: "CANCELLED" });
+});
+
+test("a missing declaration fails before any socket connection", async () => {
+	const client = new SharedIndexClient({ socketPath: "/tmp/datastore-missing-declaration.sock", store: "s-" + "a".repeat(64), definitionRevision: "b".repeat(64) } as never);
+	await assert.rejects(client.activity(), { code: "CONFIG_INVALID" });
+	await client.shutdown();
+});
+
+test("legacy hello is not a shared request", () => {
+	assert.throws(() => parseSharedRequest({ version: 1, operation: "hello", requestId: "a".repeat(32), store: "s-" + "a".repeat(64), definitionRevision: "b".repeat(64) }), { code: "CONFIG_INVALID" });
 });
 
 for (const invalid of ["generation", "definition"] as const) test(`a mismatched ${invalid} reply cannot satisfy an attached call`, async t => {

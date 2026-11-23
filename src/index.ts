@@ -130,9 +130,9 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 			const capability: MarkdownDatastoreCapability = {
 				version: 1, contractVersion: MARKDOWN_DATASTORE_CONTRACT_VERSION, policyVersion: 1, resultBudgetVersion: 1 as const,
 				get instanceId() { return generation === ownGeneration ? instanceId : undefined; },
-				get ready() { return generation === ownGeneration && service !== undefined && !service.config.structuralError; },
-				get stores() { return generation === ownGeneration && service && !service.config.structuralError ? configuredStoreNames(service.config) : []; },
-				get metadata() { return generation === ownGeneration && service && !service.config.structuralError ? { links: true as const, backlinks: true as const, tags: true as const } : undefined; },
+				get ready() { return generation === ownGeneration && service !== undefined; },
+				get stores() { return generation === ownGeneration && service ? configuredStoreNames(service.config) : []; },
+				get metadata() { return generation === ownGeneration && service ? { links: true as const, backlinks: true as const, tags: true as const } : undefined; },
 			};
 			pi.events.emit(MARKDOWN_DATASTORE_CAPABILITY_REPLY, { version: 1, requestId: request.requestId, capability });
 		});
@@ -152,7 +152,6 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 		};
 		const dispatch = async (request: MarkdownDatastoreRequest, signal?: AbortSignal): Promise<MarkdownDatastoreResult> => {
 			if (!service) throw unavailable;
-			if (service.config.structuralError) throw service.config.structuralError;
 			switch (request.operation) {
 				case "roots": return service.roots(request.input, signal);
 				case "validateDestination": return service.validateDestination(request.input, signal);
@@ -241,7 +240,6 @@ export function createMarkdownDatastoreExtension(options: MarkdownDatastoreExten
 					(job, version) => sourceDefinition(job.stores.map(name => qmdConfig.stores.get(name)!), job.mode === "metadata" ? undefined : { version }));
 			};
 			const coordinator = new MaintenanceCoordinator(jobsPath, () => new Set(configuredStoreNames(config)), (job) => {
-				if (config.structuralError) return undefined;
 				const stores = job.stores.map(name => config.stores.get(name));
 				if (stores.some(store => !store)) return undefined;
 				const version = job.mode === "metadata" ? undefined : backends.get(job.stores[0])?.binding.version;

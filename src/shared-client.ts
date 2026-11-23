@@ -4,13 +4,17 @@ import { abortError, DatastoreError, throwIfAborted } from "./errors.ts";
 import type { QmdSearchResult } from "./qmd-adapter.ts";
 import { attachSharedParser, connectSharedSocket, encodeSharedMessage, parseSharedReply, requestId, sharedError, type SharedActivity, type SharedReply } from "./shared-ipc.ts";
 
-export interface SharedAttachment { socketPath: string; store: string; definitionRevision: string }
+import type { Declaration } from "./shared-registrations.ts";
+import { SHARED_STORE_ID } from "./shared-ipc.ts";
+
+export interface SharedAttachment { socketPath: string; store: string; definitionRevision: string; declaration: Declaration & { rootDev: number; rootIno: number } }
 interface Waiter { resolve(value: unknown): void; reject(error: unknown): void }
 
 export class SharedIndexClient {
 	readonly attachment: SharedAttachment;
 	#socket?: Socket;
 	#connecting?: Socket;
+	#attachedDefinition?: { store: string; definitionRevision: string };
 	#generation?: string;
 	version = "";
 	#pending = new Map<string, Waiter>();
@@ -38,24 +42,28 @@ export class SharedIndexClient {
 	private async open(): Promise<Socket> {
 		const signal = this.#lifecycle.signal;
 		throwIfAborted(signal);
+		const observed = this.attachment.declaration;
+		if (!observed) throw new DatastoreError("CONFIG_INVALID");
 		let socket: Socket;
 		try { socket = await connectSharedSocket(this.attachment.socketPath, signal); }
 		catch { this.observation?.rejected(); throw signal.aborted ? abortError(signal) : new DatastoreError("STORE_UNAVAILABLE"); }
 		this.#connecting = socket;
 		const pending = new Map<string, Waiter>();
 		let boundGeneration: string | undefined;
+		let boundRevision: string | undefined;
 		const retire = (error: unknown) => { socket.destroy(); for (const waiter of pending.values()) waiter.reject(error); pending.clear(); };
 		attachSharedParser(socket, message => {
 			let reply: SharedReply;
 			try {
 				reply = parseSharedReply(message);
-				if (reply.definitionRevision !== this.attachment.definitionRevision || (boundGeneration && reply.generation !== boundGeneration)) throw new DatastoreError("BACKEND_OUTPUT_INVALID");
+				if ((boundRevision !== undefined && reply.definitionRevision !== boundRevision) || (boundGeneration && reply.generation !== boundGeneration)) throw new DatastoreError("BACKEND_OUTPUT_INVALID");
 			} catch (error) { retire(error); return; }
 			const waiter = reply.requestId ? pending.get(reply.requestId) : undefined;
 			if (!waiter) return;
 			pending.delete(reply.requestId!);
 			boundGeneration ??= reply.generation;
-			if (!reply.ok) waiter.reject(sharedError(reply.error)); else waiter.resolve(reply.result);
+			if (!reply.ok) waiter.reject(sharedError(reply.error));
+			else { boundRevision ??= reply.definitionRevision; waiter.resolve(reply.result); }
 		}, () => retire(new DatastoreError("BACKEND_OUTPUT_INVALID")));
 		socket.on("close", () => {
 			if (this.#socket === socket) { this.#socket = undefined; this.#generation = undefined; }
@@ -63,8 +71,11 @@ export class SharedIndexClient {
 			pending.clear();
 		});
 		try {
-			const hello = await this.send(socket, pending, "hello", undefined, signal) as { generation?: string; version?: string; resultBudgetVersion?: number };
+			const hello = await this.send(socket, pending, "hello", undefined, signal) as { generation?: string; version?: string; resultBudgetVersion?: number; store?: string };
 			if (typeof hello?.generation !== "string" || hello.generation !== boundGeneration || typeof hello.version !== "string") throw new DatastoreError("BACKEND_OUTPUT_INVALID");
+			if (!hello.store || !SHARED_STORE_ID.test(hello.store) || !boundRevision || !/^[0-9a-f]{64}$/.test(boundRevision)) throw new DatastoreError("BACKEND_OUTPUT_INVALID");
+			if (this.#attachedDefinition && (this.#attachedDefinition.store !== hello.store || this.#attachedDefinition.definitionRevision !== boundRevision)) throw new DatastoreError("STORE_UNAVAILABLE");
+			this.#attachedDefinition = { store: hello.store, definitionRevision: boundRevision };
 			if (hello.resultBudgetVersion !== 1) throw new DatastoreError("CAPABILITY_UNAVAILABLE");
 			throwIfAborted(signal);
 			if (socket.destroyed) throw new DatastoreError("STORE_UNAVAILABLE");
@@ -78,9 +89,12 @@ export class SharedIndexClient {
 	private send(socket: Socket, pending: Map<string, Waiter>, operation: string, input: Record<string, unknown> | undefined, signal?: AbortSignal): Promise<unknown> {
 		throwIfAborted(signal);
 		const id = requestId();
-		const payload = operation === "hello"
-			? { version: 1, operation, requestId: id, store: this.attachment.store, definitionRevision: this.attachment.definitionRevision }
-			: { version: 1, operation, requestId: id, generation: this.#generation, store: this.attachment.store, definitionRevision: this.attachment.definitionRevision, input };
+		const binding = this.#attachedDefinition ?? { store: this.attachment.store, definitionRevision: this.attachment.definitionRevision };
+		const observed = this.attachment.declaration;
+		if (!observed) throw new DatastoreError("CONFIG_INVALID");
+		const payload = operation !== "hello"
+			? { version: 1, operation, requestId: id, generation: this.#generation, ...binding, input }
+			: { version: 1, operation: "helloDeclaration", requestId: id, rootDev: observed.rootDev, rootIno: observed.rootIno, declaration: { root: observed.root, include: observed.include, exclude: observed.exclude } };
 		return new Promise((resolve, reject) => {
 			const finish = (error?: unknown, value?: unknown) => { signal?.removeEventListener("abort", abort); if (error) reject(error); else resolve(value); };
 			const abort = () => { pending.delete(id); if (!socket.destroyed) socket.write(encodeSharedMessage({ version: 1, operation: "drop", requestId: id })); finish(abortError(signal)); };

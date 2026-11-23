@@ -12,6 +12,7 @@ import { MarkdownDatastoreService } from "../src/service.ts";
 import { SharedIndexClient } from "../src/shared-client.ts";
 import { attachSharedParser, encodeSharedMessage, listenOwnedSocket } from "../src/shared-ipc.ts";
 import { createQmdFixture } from "./fixtures/qmd-fixture.ts";
+import { writeDeclarationHost } from "./fixtures/declaration-host.ts";
 
 async function owned(path: string): Promise<void> {
 	await mkdir(path, { recursive: true, mode: 0o700 });
@@ -49,13 +50,16 @@ test("foreground shared service preserves aliases, accepted receipts and direct 
 	await writeFile(join(notes, "alpha.md"), "Copper shared note.\n");
 	const state = join(root, "service-state");
 	await owned(state);
-	const catalogPath = join(root, "catalog.json");
-	await writeFile(catalogPath, JSON.stringify({
-		schemaVersion: 1, socketPath, stateRoot: state,
+	const previousHome = process.env.HOME;
+	process.env.HOME = root;
+	t.after(() => { if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome; });
+	const hostPath = await writeDeclarationHost(join(root, ".pi", "markdown-datastore"), {
+		socketPath, stateRoot: state,
 		defaults: { maxResultBytes: 8192, maxResultLines: 100, operationTimeoutMs: 3000 },
 		qmd: { enabled: true, installation: { packageRoot }, minimumVersion: "2.8.3" },
-		stores: { notebook: { root: notes, include: ["**/*.md"], exclude: [], maxFileBytes: 4096, search: { defaultMode: "lexical", qmdCollection: "notebook" } } },
-	}), { mode: 0o600 });
+		reader: { maxFileBytes: 4096, defaultMode: "lexical" },
+		stores: [{ root: notes }],
+	});
 	const privateProject = join(root, "private-project");
 	await owned(join(privateProject, ".pi", "markdown-datastore"));
 	await owned(join(privateProject, "notes"));
@@ -72,7 +76,7 @@ test("foreground shared service preserves aliases, accepted receipts and direct 
 	assert.equal(second.coalesced, true);
 	await writeFile(join(privateAdapter.root, "private-coalescing.release"), "", { mode: 0o600 });
 
-	child = spawn(process.execPath, ["--experimental-strip-types", "src/shared-service-main.ts", "--catalog", catalogPath], { cwd: new URL("..", import.meta.url).pathname, stdio: ["ignore", "pipe", "pipe"] });
+	child = spawn(process.execPath, ["--experimental-strip-types", "src/shared-service-main.ts", "--host-config", hostPath], { cwd: new URL("..", import.meta.url).pathname, stdio: ["ignore", "pipe", "pipe"] });
 	let err = "";
 	child.stderr.on("data", (chunk) => { err += chunk; });
 	const generation = await new Promise<string>((resolve, reject) => {
@@ -86,7 +90,7 @@ test("foreground shared service preserves aliases, accepted receipts and direct 
 		const dir = join(root, name);
 		await owned(join(dir, ".pi", "markdown-datastore"));
 		const configPath = join(dir, ".pi", "markdown-datastore", "config.json");
-		await writeFile(configPath, JSON.stringify({ schemaVersion: 1, defaults: { maxResultBytes: 8192, maxResultLines: 100, operationTimeoutMs: 3000 }, qmd: { enabled: false, installation: { executable: "qmd" }, minimumVersion: "2.8.3" }, stores: { [alias]: { shared: { catalog: catalogPath, store: "notebook" } } } }), { mode: 0o600 });
+		await writeFile(configPath, JSON.stringify({ schemaVersion: 1, defaults: { maxResultBytes: 8192, maxResultLines: 100, operationTimeoutMs: 3000 }, qmd: { enabled: false, installation: { executable: "qmd" }, minimumVersion: "2.8.3" }, stores: { [alias]: { shared: { root: notes, include: ["**/*.md"], exclude: [] } } } }), { mode: 0o600 });
 		const config = await loadMarkdownDatastoreConfig(dir, configPath);
 		const client = new SharedIndexClient(config.stores.get(alias)!.shared!);
 		const service = new MarkdownDatastoreService(config, undefined, undefined, new Map([[alias, client]]));
@@ -106,8 +110,9 @@ test("foreground shared service preserves aliases, accepted receipts and direct 
 	const read = await right.service.read({ store: right.alias, note: { store: right.alias, path: "alpha.md" } });
 	assert.match(read.data.content, /Copper shared note/);
 	await right.client.shutdown();
-	const stale = new SharedIndexClient({ ...right.config.stores.get(right.alias)!.shared!, definitionRevision: "0".repeat(64) });
-	await assert.rejects(stale.activity(), { code: "STORE_UNAVAILABLE" });
+	const shared = right.config.stores.get(right.alias)!.shared!;
+	const stale = new SharedIndexClient({ ...shared, declaration: { ...shared.declaration!, exclude: ["nope"] } });
+	await assert.rejects(stale.activity(), { code: "CONFIG_INVALID" });
 	await stale.shutdown();
 	child.kill("SIGTERM");
 	await new Promise((resolve) => child.once("exit", resolve));
@@ -158,7 +163,7 @@ test("private and shared search validation emit the same warnings", async () => 
 	const backend = { candidates: [], rejectedCandidates: 1, manifest: { stores: {}, pendingEmbeddings: 0, semanticAt: undefined, hasVectorIndex: false }, generation: "gen-" + "a".repeat(32), requestedMode: "hybrid", effectiveMode: "lexical", embeddingActive: true, queueMs: 0, operationMs: 0 };
 	const local: any = { binding: { version: "fixture" }, activity: () => ({ embeddingActive: true }), isLexicallyCurrent: () => false, search: async () => backend, shutdown: async () => undefined };
 	const remote: any = { version: "fixture", activity: async () => ({ embeddingActive: true }), isLexicallyCurrent: async () => false, search: async () => backend, shutdown: async () => undefined };
-	const sharedStore = { ...store, shared: { catalog: "fixture", store: "notes", socketPath: "/tmp/unused.sock", definitionRevision: "a".repeat(64) } };
+	const sharedStore = { ...store, shared: { store: "s-" + "a".repeat(64), socketPath: "/tmp/unused.sock", definitionRevision: "a".repeat(64), declaration: { root, include: ["**/*.md"], exclude: [], rootDev: identity.dev, rootIno: identity.ino } } };
 	const privateService = new MarkdownDatastoreService(config, undefined, local);
 	const sharedService = new MarkdownDatastoreService({ ...config, stores: new Map([["notes", sharedStore]]) }, undefined, undefined, new Map([["notes", remote]]));
 	const privateResult = await privateService.search({ store: "notes", query: "copper", mode: "hybrid" });
@@ -198,18 +203,18 @@ test("concurrent calls wait for one completed attachment", async (t) => {
 		socket.once("close", () => sockets.delete(socket));
 		attachSharedParser(socket, (message: any) => {
 			seen.push(message.operation);
-			if (message.operation === "hello") { helloSeen(); void held.then(() => socket.write(encodeSharedMessage({ version: 1, requestId: message.requestId, generation, definitionRevision: "c".repeat(64), ok: true, result: { generation, version: "fixture", resultBudgetVersion: 1 } }))); }
+			if (message.operation === "helloDeclaration") { helloSeen(); void held.then(() => socket.write(encodeSharedMessage({ version: 1, requestId: message.requestId, generation, definitionRevision: "c".repeat(64), ok: true, result: { generation, version: "fixture", resultBudgetVersion: 1, store: "s-" + "c".repeat(64) } }))); }
 			if (message.operation === "activity") socket.write(encodeSharedMessage({ version: 1, requestId: message.requestId, generation, definitionRevision: "c".repeat(64), ok: true, result: { state: "idle", active: false, queued: false, embeddingActive: false, jobs: [] } }));
 		}, () => socket.destroy());
 	});
-	client = new SharedIndexClient({ socketPath, store: "notebook", definitionRevision: "c".repeat(64) });
+	client = new SharedIndexClient({ socketPath, store: "s-" + "c".repeat(64), definitionRevision: "c".repeat(64), declaration: { root: socketDir, include: ["**/*.md"], exclude: [], rootDev: 1, rootIno: 2 } });
 	const first = client.activity();
 	await sawHello;
 	const second = client.activity();
 	await Promise.resolve();
-	assert.deepEqual(seen, ["hello"]);
+	assert.deepEqual(seen, ["helloDeclaration"]);
 	release();
 	assert.equal((await first).state, "idle");
 	assert.equal((await second).state, "idle");
-	assert.deepEqual(seen, ["hello", "activity", "activity"]);
+	assert.deepEqual(seen, ["helloDeclaration", "activity", "activity"]);
 });
