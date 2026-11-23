@@ -18,7 +18,7 @@ Write `.pi/markdown-datastore/config.json`:
 ```json
 {
   "schemaVersion": 1,
-  "defaults": { "operationTimeoutMs": 10000 },
+  "defaults": { "operationTimeoutMs": 30000 },
   "qmd": {
     "enabled": false,
     "installation": { "executable": "qmd" },
@@ -95,7 +95,7 @@ parents; the socket parent is owner-only. For example:
   "schemaVersion": 1,
   "socketPath": "/Users/example/.local/run/markdown-datastore/host.sock",
   "stateRoot": "/Users/example/.local/state/markdown-datastore",
-  "defaults": { "operationTimeoutMs": 10000 },
+  "defaults": { "operationTimeoutMs": 30000 },
   "qmd": {
     "enabled": false,
     "installation": { "executable": "qmd" },
